@@ -293,7 +293,17 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
 .hmeta{flex:none;margin-left:auto;font-size:11.5px;color:var(--dimmer);white-space:nowrap}
 .hplaceholder{color:var(--dimmer);font-size:14px}
 /* ---------- conversation cards ---------- */
-#content{flex:1;overflow-y:auto;padding:20px 26px 24px}
+#conv{flex:1;min-height:0;display:flex}
+#content{flex:1;position:relative;overflow-y:auto;padding:20px 26px 24px}
+#rail{flex:none;width:18px;position:relative}
+#rail::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:1px;
+  background:var(--border)}
+.mark{position:absolute;top:0;left:4px;width:10px;min-height:3px;padding:0;
+  border:0;border-radius:2px;background:var(--dimmer);opacity:.65;cursor:pointer}
+.mark::after{content:"";position:absolute;inset:-5px -4px}
+.mark:hover{opacity:1}
+.mark.cur{background:var(--accent);opacity:1}
+.mark:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .block{margin:0 0 14px;max-width:960px}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;
   padding:13px 16px}
@@ -304,6 +314,7 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
 .card.prompt.user{background:var(--accent-tint);border-left:3px solid var(--accent)}
 .card pre.ptext{white-space:pre-wrap;word-break:break-word;margin:0;
   font:inherit;font-size:14px}
+.card:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .msg-body{font-size:14px}
 .msg-body pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;
   padding:10px;overflow-x:auto;font:12.5px/1.5 var(--font-mono)}
@@ -396,6 +407,8 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
   #sesshead{padding:12px 16px;min-height:0}
   #content{padding:14px 16px}
   #chatbar{padding:10px 16px}
+  #rail{width:14px}
+  .mark{left:2px;width:8px}
 }
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
@@ -432,7 +445,10 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
         stroke-linecap="round" aria-hidden="true" focusable="false"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></button>
       <div id="hwrap"><div class="hplaceholder">Select a session</div></div>
     </header>
-    <div id="content"><div class="empty">Select a session</div></div>
+    <div id="conv">
+      <nav id="rail" aria-label="Message positions" hidden></nav>
+      <div id="content"><div class="empty">Select a session</div></div>
+    </div>
     <div id="chatbar">
       <textarea id="chatinput" rows="1" disabled
         placeholder="Send an instruction… (Enter to send, Shift+Enter for newline)"
@@ -954,6 +970,135 @@ function applyEvents(evs){
   $("#backtop").style.display=nearBottom?"none":"flex";
 }
 
+/* ---------- conversation nav rail ----------
+   Codex-style proportional marks for rendered message cards. The mark list
+   is re-derived from the live DOM on each rAF-coalesced layout pass, so
+   incremental appends, chunked replay, transcript resets, pane
+   stash/restore, fold toggles, prompt expansion and resizes all self-heal
+   with no bookkeeping in the render path. */
+const rail=$("#rail");
+const MARK_SEL=".block.card.msg,.block.card.prompt:not(.user)";
+/* MARK_SEL's predicate in classList form — used to filter content.children
+   (keeps the node-vm tests independent of a CSS selector engine); keep in
+   sync with MARK_SEL. */
+const markable=el=>{const c=el.classList;
+  return c.contains("block")&&c.contains("card")&&
+    (c.contains("msg")||(c.contains("prompt")&&!c.contains("user")))};
+const MARK_GAP=6;                    // px: nearer marks merge into one cluster
+let railQueued=false,railBtns=[],curIdx=-1;
+const rmo=matchMedia("(prefers-reduced-motion: reduce)");
+
+/* Groups sorted mark tops into clusters: each top joins the open cluster
+   when it is within `gap` of the cluster's last member. A zero gap never
+   clusters — the fallback for unmeasurable layouts (no offsetTop metrics). */
+function clusterYs(ys,gap){
+  const groups=[];
+  ys.forEach((y,i)=>{
+    const g=groups[groups.length-1];
+    if(g&&y-g.y1<gap){g.idx.push(i);g.y1=y}
+    else groups.push({y,y1:y,idx:[i]});
+  });
+  return groups;
+}
+
+function scheduleRail(){
+  if(railQueued)return;railQueued=true;
+  requestAnimationFrame(()=>{railQueued=false;layoutRail()});
+}
+
+function layoutRail(){
+  const els=[...content.children].filter(markable);
+  if(!selected||!els.length){
+    rail.hidden=true;railBtns=[];curIdx=-1;
+    if(rail.replaceChildren)rail.replaceChildren();else rail.innerHTML="";
+    return;
+  }
+  rail.hidden=false;
+  const doc=content.scrollHeight,RH=rail.clientHeight;
+  // Read phase: batch every offsetTop before the write phase below.
+  const ys=els.map(el=>Math.max(0,Math.min(RH-3,el.offsetTop/doc*RH))||0);
+  const groups=clusterYs(ys,doc&&RH?MARK_GAP:0);
+  while(railBtns.length>groups.length)railBtns.pop().remove();
+  groups.forEach((g,i)=>{
+    let b=railBtns[i];
+    if(!b){b=document.createElement("button");b.type="button";b.className="mark";
+      // Keyboard-activated clicks (detail 0) also move focus to the card.
+      b.onclick=e=>jumpToMark(b,e&&e.detail===0);
+      rail.appendChild(b);railBtns.push(b)}
+    b._els=g.idx.map(j=>els[j]);
+    b.style.transform=`translateY(${g.y.toFixed(1)}px)`;
+    b.style.height=(g.idx.length>1?Math.min(3+g.idx.length*1.5,9):3)+"px";
+    const first=b._els[0];
+    const kind=first.classList.contains("msg")?"Agent message":"Dispatched message";
+    const t=(first.querySelector(".ctime")||{}).textContent||"";
+    const lbl=g.idx.length>1?`${g.idx.length} messages · ${t}`:`${kind} · ${t}`;
+    b.setAttribute("aria-label",lbl);b.title=lbl;
+  });
+  curIdx=-2;                    // force the aria-current/tab-stop sync below
+  updateCurMark();
+}
+
+function jumpToMark(b,toCard){
+  const el=b._els&&b._els[0];if(!el||!el.isConnected)return;
+  const top=Math.max(0,el.offsetTop-8);
+  if(content.scrollTo)content.scrollTo({top,behavior:rmo.matches?"auto":"smooth"});
+  else content.scrollTop=top;
+  if(toCard){el.tabIndex=-1;if(el.focus)el.focus({preventScroll:true})}
+}
+
+function updateCurMark(){
+  const y=content.scrollTop+8;let idx=-1;
+  for(let i=0;i<railBtns.length;i++){
+    const el=railBtns[i]._els&&railBtns[i]._els[0];
+    if(el&&el.isConnected&&el.offsetTop<=y)idx=i;else break;   // tops are monotonic
+  }
+  if(idx===curIdx)return;
+  curIdx=idx;
+  // Exactly one tabbable mark: the focused one while the rail is in use,
+  // otherwise the current mark (or the first when nothing is current yet).
+  const focused=railBtns.indexOf(document.activeElement);
+  const tab=focused>=0?focused:(idx<0?0:idx);
+  railBtns.forEach((b,i)=>{
+    b.classList.toggle("cur",i===idx);
+    if(i===idx)b.setAttribute("aria-current","true");else b.removeAttribute("aria-current");
+    b.tabIndex=i===tab?0:-1;
+  });
+}
+
+/* Roving tabindex: one tab stop total; arrows/Home/End move it, Enter/Space
+   activate natively (button click -> jumpToMark). */
+rail.addEventListener("keydown",e=>{
+  const i=railBtns.indexOf(document.activeElement);
+  if(i<0)return;
+  let n;
+  if(e.key==="ArrowDown")n=Math.min(i+1,railBtns.length-1);
+  else if(e.key==="ArrowUp")n=Math.max(i-1,0);
+  else if(e.key==="Home")n=0;
+  else if(e.key==="End")n=railBtns.length-1;
+  else return;
+  e.preventDefault();
+  if(n===i)return;
+  railBtns[n].tabIndex=0;railBtns[i].tabIndex=-1;
+  railBtns[n].focus();
+});
+/* Bare-track click seeks proportionally down the transcript. */
+rail.addEventListener("click",e=>{
+  if(e.target!==rail)return;
+  const doc=content.scrollHeight,vh=content.clientHeight,RH=rail.clientHeight;
+  if(!doc||!RH||doc<=vh)return;
+  const top=Math.max(0,Math.min(doc-vh,e.offsetY/RH*(doc-vh)));
+  if(content.scrollTo)content.scrollTo({top,behavior:rmo.matches?"auto":"smooth"});
+  else content.scrollTop=top;
+});
+
+/* Any DOM/geometry change re-derives the marks next frame. Feature-detected:
+   without them the rail simply shows the marks computed at select() time. */
+if(window.MutationObserver)
+  new MutationObserver(scheduleRail).observe(content,
+    {childList:true,subtree:true,characterData:true,
+     attributes:true,attributeFilter:["open","class"]});
+if(window.ResizeObserver)new ResizeObserver(scheduleRail).observe(content);
+
 /* Chunked cold/backlog replay: render the cached event stream in short
    requestAnimationFrame slices so switching stays responsive. Aborts via the
    replayGen token when the user switches away or the transcript resets. */
@@ -1235,12 +1380,14 @@ function select(id){
     pollEvents();
   }
   renderSidebar();renderSessionHeader();closeSidebar();
+  scheduleRail();
 }
 
 $("#backtop").onclick=()=>{content.scrollTop=content.scrollHeight};
 content.addEventListener("scroll",()=>{
   const nb=content.scrollHeight-content.scrollTop-content.clientHeight<120;
   $("#backtop").style.display=nb?"none":"flex";
+  updateCurMark();
 });
 
 pollOverview();

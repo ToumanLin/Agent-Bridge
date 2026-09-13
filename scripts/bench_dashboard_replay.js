@@ -259,12 +259,21 @@ async function waitStable() {
   const nodes = await waitStable();
   const coldMs = performance.now() - t;
   const expected = streams.find((s) => s.id === coldId).stream.events.length;
+  // Nav rail: jsdom has no layout metrics, so layoutRail takes the
+  // unclustered fallback — one .mark button per markable card. This also
+  // cross-checks the classList markable predicate against MARK_SEL.
+  const markCount = () => w.document.querySelectorAll("#rail .mark").length;
+  const cardCount = () => w.document.querySelectorAll(
+    "#content .block.card.msg,#content .block.card.prompt:not(.user)").length;
+  const railShown = () => !w.document.querySelector("#rail").hidden;
   results.push({
     session: coldId, events: expected, elements: nodes,
     coldSelectWallMs: +coldMs.toFixed(0), syncSelectMs: +selectSyncMs.toFixed(0),
     rafSlices: stats.raf, msgBodySets: stats.msgBodySets,
     maxTimerGapMs: +stats.maxTaskGap.toFixed(1),
     maxInnerHTMLParseMs: +(stats.maxParseMs || 0).toFixed(1),
+    railMarks: markCount(), markableCards: cardCount(),
+    railOk: railShown() && markCount() === cardCount() && cardCount() > 0,
   });
 
   // ---- warm re-select of the first session: stash restore, no rebuild ----
@@ -279,6 +288,9 @@ async function waitStable() {
     sameDomNode: warmNode === after, rafDuringWarm: stats.raf,
     openFoldsKept:
       w.document.querySelectorAll("#content details[open]").length >= openCount,
+    // Warm stash/restore re-derives the same marks from the moved DOM nodes.
+    railMarks: markCount(), markableCards: cardCount(),
+    railOk: railShown() && markCount() === cardCount() && cardCount() > 0,
   });
 
   // ---- regression: a stale session's reset must not cancel a live replay ----
@@ -318,6 +330,10 @@ async function waitStable() {
     raceProgressed,
     raceCompletedOnce: raceFinal === raceElements,
     raceFinalElements: raceFinal, raceExpectedElements: raceElements,
+    // Marks reflect the completed replay of race_b — no stale marks survive
+    // the stale session's mid-flight reset.
+    railMarks: markCount(), markableCards: cardCount(),
+    railOk: railShown() && markCount() === cardCount() && cardCount() > 0,
   });
 
   // ---- sidebar signature: identical polls must not rewrite #sesslist ----
@@ -373,6 +389,8 @@ async function waitStable() {
     (r.raceBSlices === undefined || r.raceBSlices > 1) &&
     (r.raceProgressed === undefined || r.raceProgressed) &&
     (r.raceCompletedOnce === undefined || r.raceCompletedOnce) &&
+    // One rail mark per markable card, rail visible, after every render path.
+    (r.railOk === undefined || r.railOk) &&
     (r.doneFrozen === undefined || r.doneFrozen) &&
     (r.runAdvanced === undefined || r.runAdvanced) &&
     (r.statusLabels === undefined || r.statusLabels) &&

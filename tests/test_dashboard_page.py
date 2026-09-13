@@ -171,6 +171,8 @@ def test_page_dom_ids_and_endpoints():
         "sidebar",
         "sesslist",
         "sesshead",
+        "conv",
+        "rail",
         "content",
         "chatinput",
         "chatsend",
@@ -568,6 +570,77 @@ def test_perf_architecture_hooks():
     # Contracts kept
     for needle in ("eventsCache", "offsets", "applyEvents", "renderSidebar"):
         assert needle in PAGE
+
+
+def test_nav_rail():
+    # Codex-style proportional nav rail: a semantic landmark left of the
+    # scroller with one native <button> mark per rendered message card.
+    assert '<nav id="rail" aria-label="Message positions" hidden></nav>' in PAGE
+    # The landmark label must not redundantly contain the role name.
+    assert "Message positions" in PAGE and "navigation" not in re.search(
+        r'<nav id="rail"[^>]*>', PAGE).group(0).lower()
+    # Marks only for Agent cards and non-user Dispatched cards — the classList
+    # predicate is the applied half; MARK_SEL is the selector form pinned for
+    # tests/benchmarks (kept in sync by contract).
+    sel = re.search(r'const MARK_SEL="([^"]+)"', PAGE)
+    assert sel, "MARK_SEL selector missing"
+    assert ".block.card.msg" in sel.group(1)
+    assert ".block.card.prompt:not(.user)" in sel.group(1)
+    pred = re.search(r"const markable=el=>\{([\s\S]*?)\};", PAGE)
+    assert pred, "markable predicate missing"
+    body = pred.group(1)
+    for needle in ('contains("block")', 'contains("card")', 'contains("msg")',
+                   'contains("prompt")', '!c.contains("user")'):
+        assert needle in body
+    # Layout, clustering and interaction machinery.
+    for needle in (
+        "MARK_GAP",
+        "clusterYs",
+        "scheduleRail",
+        "layoutRail",
+        "jumpToMark",
+        "updateCurMark",
+        "railBtns",
+        "requestAnimationFrame",
+        "MutationObserver",
+        "ResizeObserver",
+        "attributeFilter",
+        "childList:true",
+        "subtree:true",
+        "characterData:true",
+        "aria-current",
+        "aria-label",
+        "tabIndex",
+        '"ArrowDown"',
+        '"ArrowUp"',
+        '"Home"',
+        '"End"',
+        "scrollTo",
+        "scrollTop",
+        "prefers-reduced-motion",
+        "rail.hidden",
+    ):
+        assert needle in PAGE
+    # Theme-aware CSS: token colors only, focus ring, current-mark accent,
+    # mobile narrowing inside the existing 900px media block.
+    rail_css = re.search(r"#rail\{([^}]*)\}", PAGE).group(1)
+    assert "width:18px" in rail_css and "position:relative" in rail_css
+    mark_css = re.search(r"\.mark\{([^}]*)\}", PAGE).group(1)
+    assert "var(--dimmer)" in mark_css and "cursor:pointer" in mark_css
+    assert re.search(r"\.mark\.cur\{[^}]*var\(--accent\)", PAGE)
+    assert re.search(r"\.mark:focus-visible\{[^}]*outline:2px", PAGE)
+    narrow = re.search(r"@media \(max-width:900px\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert "#rail{width:14px}" in narrow and ".mark{left:2px;width:8px}" in narrow
+    # #conv wraps the scroller; #content stays the positioned offset parent so
+    # card.offsetTop maps proportionally onto the rail.
+    assert re.search(r"#conv\{[^}]*display:flex", PAGE)
+    content_css = re.search(r"#content\{([^}]*)\}", PAGE).group(1)
+    assert "position:relative" in content_css and "overflow-y:auto" in content_css
+    # Scroll and session-switch hooks keep the current mark live.
+    scroll = re.search(r'content\.addEventListener\("scroll",\(\)=>\{([\s\S]*?)\}\)', PAGE)
+    assert "updateCurMark" in scroll.group(1)
+    sel_body = re.search(r"function select\(id\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert "scheduleRail()" in sel_body
 
 
 def _jsdom_available():

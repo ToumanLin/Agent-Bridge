@@ -24,12 +24,14 @@ const code = (page.match(/<script>([\s\S]*?)<\/script>/g) || [])
    Enough surface for the page script's top-level wiring; every fetch is left
    pending so no poll mutates `tasks` between assertions. */
 const el = () => ({
-  innerHTML: "", textContent: "", style: {},
+  innerHTML: "", textContent: "", style: {}, title: "", type: "",
   classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
   dataset: {}, disabled: false, value: "", placeholder: "", tabIndex: 0,
-  open: false, children: [], firstChild: null, firstElementChild: null,
+  open: false, hidden: false, isConnected: true, offsetTop: 0,
+  children: [], firstChild: null, firstElementChild: null,
   scrollTop: 0, scrollHeight: 0, clientHeight: 0,
   appendChild() {}, insertAdjacentHTML() {}, setAttribute() {},
+  removeAttribute() {}, replaceChildren() {},
   addEventListener() {}, querySelector: () => el(), querySelectorAll: () => [],
   focus() {}, remove() {},
 });
@@ -55,6 +57,9 @@ const sandbox = {
   setTimeout: () => 0, clearTimeout() {},
   requestAnimationFrame: () => 0,
   performance: { now: () => 0 },
+  // Observer no-ops: the rail wiring runs but never fires a layout pass.
+  MutationObserver: function () { return { observe() {}, disconnect() {} }; },
+  ResizeObserver: function () { return { observe() {}, disconnect() {} }; },
   console,
 };
 sandbox.window = sandbox;
@@ -64,7 +69,9 @@ vm.runInContext(
     "\n;globalThis.__x = { statusOf, latestTask, taskDur, fmtDur, durText," +
     " durSpan, PROC_STATUS, subSeed, agentAvatar, statusGlyph, icon," +
     " usageNums, tokCount, runTok, tokTitle, fmtTok, tokSpan, turnDurMs," +
-    " addTurn, addPrompt, _setTasks: (v) => { tasks = v; } };",
+    " addTurn, addPrompt, clusterYs, markable, MARK_SEL, MARK_GAP," +
+    " scheduleRail, layoutRail, jumpToMark, updateCurMark," +
+    " _setTasks: (v) => { tasks = v; } };",
   sandbox);
 const X = sandbox.__x;
 
@@ -329,6 +336,46 @@ const task = (over) =>
     src: null });
   X.addTurn({ t: "turn", ts: "2026-01-01T00:00:45Z", stop_reason: "end_turn" });
   eq(spanText(), "turn ended · 40s", "legacy prompt-pair fallback in text");
+
+  // --- nav rail: mark predicate mirrors MARK_SEL (user cards excluded) ---
+  const fakeEl = (cls) => ({ classList: { contains: (c) => cls.includes(c) } });
+  eq(X.markable(fakeEl(["block", "card", "msg"])), true,
+    "agent message card is marked");
+  eq(X.markable(fakeEl(["block", "card", "prompt"])), true,
+    "dispatched prompt card is marked");
+  eq(X.markable(fakeEl(["block", "card", "prompt", "user"])), false,
+    "dashboard-authored User Message card is excluded");
+  eq(X.markable(fakeEl(["block", "think"])), false, "think fold excluded");
+  eq(X.markable(fakeEl(["block", "toolgroup"])), false, "tool group excluded");
+  eq(X.markable(fakeEl(["block", "card", "toolgroup"])), false,
+    "card without msg/prompt kind excluded");
+  eq(X.markable(fakeEl(["turnend"])), false, "turn divider excluded");
+  eq(X.markable(fakeEl(["turnend", "err"])), false, "error divider excluded");
+  eq(X.markable(fakeEl(["card", "msg"])), false, "non-block card excluded");
+  eq(X.markable(fakeEl(["empty"])), false, "empty placeholder excluded");
+  eq(X.MARK_SEL.includes(".block.card.msg"), true, "MARK_SEL marks msg cards");
+  eq(X.MARK_SEL.includes(":not(.user)"), true, "MARK_SEL excludes user cards");
+  eq(X.MARK_GAP, 6, "cluster gap is 6px");
+
+  // --- nav rail: clusterYs single-linkage clustering within `gap` px ---
+  let g = X.clusterYs([0, 5, 20, 24, 50], 6);
+  eq(g.length, 3, "clusters: [0,5] [20,24] [50]");
+  eq(g[0].idx.length, 2, "first cluster holds two marks");
+  eq(g[0].y, 0, "cluster anchored at its first mark");
+  eq(g[2].idx[0], 4, "lonely last mark stays single");
+  eq(X.clusterYs([0, 5, 9], 6).length, 1,
+    "chained proximity merges (5-0<6, 9-5<6)");
+  eq(X.clusterYs([0, 6, 12], 6).length, 3,
+    "exactly-gap marks stay separate (boundary is exclusive)");
+  eq(X.clusterYs([10], 6).length, 1, "single mark -> single cluster");
+  eq(X.clusterYs([], 6).length, 0, "no marks -> no clusters");
+  eq(X.clusterYs([0, 0, 0], 0).length, 3,
+    "zero gap never clusters (unmeasurable-layout fallback)");
+  // rail wiring degrades safely: helpers callable with an empty DOM stub.
+  X.layoutRail();
+  X.updateCurMark();
+  X.scheduleRail();
+  eq(true, true, "rail helpers run on the DOM stub without throwing");
 
   console.log(failed ? `\n${failed} FAILED` : "\nall assertions passed");
   process.exit(failed ? 1 : 0);
