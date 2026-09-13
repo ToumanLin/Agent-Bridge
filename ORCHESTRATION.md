@@ -14,7 +14,7 @@ Call `list_agents` first and re-read `coordinator` before every dispatch.
 
 When the user states a **lasting** preference, persist it with `set_preferences`. Its `instructions` argument replaces the stored text — read the current value first and write the merge. One-off wishes are not preferences.
 
-Workers are reached **only** through Agent Bridge MCP tools (`list_agents`, `dispatch_task`, `wait_task`, `check_task`, `get_result`, `get_transcript`, `cancel_task`, `list_sessions`, `end_session`). If those tools are missing, stop and say so. Do **not** run `kimi`, `grok`, `agy`, `dsh`, `opencode`, `claude`, `claude-agent-acp`, `codex`, or `devin` yourself. `git` / `pytest` after a turn is review, not a substitute for dispatch.
+Workers are reached **only** through Agent Bridge MCP tools (`list_agents`, `dispatch_task`, `wait_task`, `check_task`, `get_result`, `get_transcript`, `cancel_task`, `list_sessions`, `list_tasks`, `end_session`). If those tools are missing, stop and say so. Do **not** run `kimi`, `grok`, `agy`, `dsh`, `opencode`, `claude`, `claude-agent-acp`, `codex`, or `devin` yourself. `git` / `pytest` after a turn is review, not a substitute for dispatch.
 
 ## Step 1 — dispatch, or do it yourself?
 
@@ -71,4 +71,6 @@ In `auto`/`eager`, tell the user after the fact. In `manual`, their explicit req
 
 Do not drive worker GUIs or CLIs. Session resume is Bridge's job.
 
-For optional retry deduplication, generate a UUID `request_id` before the first `dispatch_task` call and include it on that call. Retry with the same ID and original arguments; if `session_id` was omitted, keep it omitted. Adding an ID only on retry cannot deduplicate the first call. Identical arguments reuse the task (`reused=true`); different arguments are rejected. Deduplication lasts only in the same Bridge instance while the task is retained. Normal dispatch validation still applies. Restarting Bridge, switching instances, or pruning the task loses the binding; worker side effects are not exactly-once.
+For retry deduplication, generate a UUID `request_id` and include it on the first `dispatch_task` call. Retry with the same ID and original arguments (`session_id` omitted if it was). An ID added only on retry cannot deduplicate the first call. Identical arguments reuse the task (`reused=true`) while retained in this instance; different arguments are rejected, and normal dispatch validation still applies. Restarting Bridge, switching instances, or pruning the task loses the binding; worker side effects are not exactly-once.
+
+After a coordinator restart, `list_tasks` rediscovers tasks a live sibling still owns (`remote: true`); `check_task` / `wait_task` / `get_result` follow them — never cancel or re-dispatch. `owner_lost: true` means the owner died mid-run.

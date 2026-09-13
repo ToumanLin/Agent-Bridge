@@ -168,6 +168,44 @@ idle_exit_sec = 0
     assert cfg.server.idle_exit_sec == 0
 
 
+def test_server_lifecycle_policy_defaults(tmp_path):
+    # Backward compatible: orderly shutdown cancels in-flight work, sibling
+    # task rows are readable, and the linger bound defaults to 24h.
+    cfg = load_config(tmp_path)
+    assert cfg.server.shutdown_policy == "cancel"
+    assert cfg.server.linger_max_sec == 86400
+    assert cfg.server.remote_tasks is True
+
+
+def test_server_lifecycle_policy_overlay(tmp_path):
+    (tmp_path / "agents.toml").write_text(
+        """
+[server]
+shutdown_policy = "linger"
+linger_max_sec = 600
+remote_tasks = false
+""",
+        encoding="utf-8",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.server.shutdown_policy == "linger"
+    assert cfg.server.linger_max_sec == 600
+    assert cfg.server.remote_tasks is False
+
+
+def test_server_lifecycle_policy_rejects_bad_values(tmp_path):
+    (tmp_path / "agents.toml").write_text(
+        '[server]\nshutdown_policy = "detach"\n', encoding="utf-8"
+    )
+    with pytest.raises(ValidationError):
+        load_config(tmp_path)
+    (tmp_path / "agents.toml").write_text(
+        "[server]\nlinger_max_sec = -1\n", encoding="utf-8"
+    )
+    with pytest.raises(ValidationError):
+        load_config(tmp_path)
+
+
 def test_coordinator_defaults(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENT_BRIDGE_MODE", raising=False)
     cfg = load_config(tmp_path)

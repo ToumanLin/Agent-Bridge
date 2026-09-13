@@ -92,6 +92,18 @@ discover_proxy = true
 [server]
 # Self-exit for abandoned MCP server instances whose host never closed stdin.
 idle_exit_sec = 7200
+# What an orderly host shutdown (MCP stdio closed / stdin EOF) does to
+# in-flight tasks: "cancel" kills worker turns at once (default), "linger"
+# lets them finish first — transcripts, results, and state land exactly as
+# if the host had stayed — bounded by linger_max_sec, then workers shut
+# down normally. A force-killed Bridge still loses the worker pipes;
+# linger only covers orderly shutdown, and there is no pause/resume.
+# shutdown_policy = "cancel"
+# linger_max_sec = 86400
+# Let check_task / wait_task / get_result / list_tasks read task rows owned
+# by other live Bridge instances sharing this data directory (read-only;
+# never executed here). Default true.
+# remote_tasks = true
 
 [coordinator]
 # How eagerly the coordinator should dispatch to workers.

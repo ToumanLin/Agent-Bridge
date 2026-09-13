@@ -9,8 +9,17 @@
 
 # Self-exit for abandoned MCP server instances whose host never closed stdin.
 # 7200 is already the default; set 0 to disable.
+# shutdown_policy: "cancel" (default) kills in-flight turns when the host
+# closes the MCP transport; "linger" lets them finish first, bounded by
+# linger_max_sec (default 86400 = 24 h). Orderly shutdown only — a
+# force-killed Bridge still loses live worker pipes.
+# remote_tasks (default true) lets check_task / wait_task / get_result /
+# list_tasks see tasks a sibling Bridge instance still owns (read-only).
 # [server]
 # idle_exit_sec = 7200
+# shutdown_policy = "cancel"
+# linger_max_sec = 86400
+# remote_tasks = true
 
 # Cancel a turn whose worker has produced no output for this long (seconds).
 # Default 1800; 0 disables. Raise it for a worker that runs long silent

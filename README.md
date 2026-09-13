@@ -110,6 +110,7 @@ Close coordinators that are holding Bridge, then `agent-bridge upgrade`, then re
 | `get_transcript` | Paged session log |
 | `cancel_task` | Cancel the in-flight turn |
 | `list_sessions` | Known sessions |
+| `list_tasks` | This instance's tasks plus sibling-owned ones (`remote` / `owner` metadata) |
 | `end_session` | Shut down a worker process |
 
 `get_result` returns up to 60,000 characters per call. Continue with
@@ -122,6 +123,15 @@ turn ends; a normal stop flushes everything, so only a crash or a hard kill can
 lose that last window. A turn whose worker stays silent past `stall_timeout_sec`
 (default 1800 s, per worker) ends `failed` / `stalled`; `check_task` shows
 `silent_for_sec`.
+
+Tasks keep their owning Bridge instance. After a coordinator restart, a task a
+live sibling still owns shows `remote: true` in `list_tasks` / `check_task` /
+`wait_task` / `get_result` — the new instance can poll it and read its result,
+but never runs or cancels it; `owner_lost: true` marks one whose owner died
+mid-run. With opt-in `[server] shutdown_policy = "linger"`, an orderly host
+shutdown (stdin EOF) lets in-flight turns finish first, bounded by
+`linger_max_sec` (default 86400 s); force-killing the Bridge still loses the
+worker pipes, and pausing a turn is not supported.
 
 ### Remaining quota
 
@@ -261,6 +271,7 @@ revivable = true
 | `get_transcript` | 分页会话日志 |
 | `cancel_task` | 取消进行中的回合 |
 | `list_sessions` | 已知会话 |
+| `list_tasks` | 本实例任务 + 兄弟实例持有的任务（`remote` / `owner` 元数据） |
 | `end_session` | 关掉 worker 进程 |
 
 `get_result` 每次最多返回 60,000 个字符；`has_more` 为 true 时，用
@@ -270,6 +281,13 @@ revivable = true
 缓冲事件在累计 64 KB、间隔 30 秒或一轮结束时落盘；正常停止会全部刷出，只有崩溃或被强杀才可能丢掉最后这一窗口。
 Worker 静默超过 `stall_timeout_sec`（默认 1800 秒，可按 Worker 设置）的一轮会以
 `failed` / `stalled` 结束；`check_task` 会给出 `silent_for_sec`。
+
+任务始终归属创建它的 Bridge 实例。协调者重启后，仍由其他存活实例持有的任务在
+`list_tasks` / `check_task` / `wait_task` / `get_result` 中显示 `remote: true`
+——新实例可以继续跟踪并读取其结果，但不会运行或取消它；`owner_lost: true`
+表示持有方已中途退出。开启 `[server] shutdown_policy = "linger"` 后，正常关闭
+宿主（stdin EOF）会先等在途回合跑完，上限为 `linger_max_sec`（默认 86400 秒）；
+强杀 Bridge 仍会丢失 worker 管道，也不支持暂停某个回合。
 
 ### 剩余额度
 

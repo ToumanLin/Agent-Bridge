@@ -14,7 +14,7 @@
 
 用户在对话里表达**长期**偏好时（「以后调研都给 antigravity」），你自己调 `set_preferences` 存下来。它的 `instructions` 参数是整体替换，所以先读当前的 `coordinator.instructions`，把合并后的全文写回去。本实例立即生效，其它实例下次启动生效。只针对当前任务的一次性要求不算偏好——照做即可，不要存。
 
-Worker **只能**通过 Agent Bridge 的 MCP 工具调用（`list_agents`、`dispatch_task`、`wait_task` 等）。这一轮的工具列表里如果没有这些工具，停下来告诉用户。**不要**退回去自己跑 `kimi`、`kimi acp`、`grok`、`agy`、`dsh`、`opencode`、`claude`、`claude-agent-acp`、`codex`、`devin`，或对它们 `python -c`。工具列表缺失是主机 / MCP 的问题，不是准许你直连 Worker。「测一下 Kimi / 协调 Kimi / 试试这个 Worker」仍然是 `dispatch_task`，不是 shell 拉起 CLI。Worker 跑完后你自己跑 `git` / `pytest` 是验收，不能代替派发。
+Worker **只能**通过 Agent Bridge 的 MCP 工具调用（`list_agents`、`dispatch_task`、`wait_task`、`list_tasks` 等）。这一轮的工具列表里如果没有这些工具，停下来告诉用户。**不要**退回去自己跑 `kimi`、`kimi acp`、`grok`、`agy`、`dsh`、`opencode`、`claude`、`claude-agent-acp`、`codex`、`devin`，或对它们 `python -c`。工具列表缺失是主机 / MCP 的问题，不是准许你直连 Worker。「测一下 Kimi / 协调 Kimi / 试试这个 Worker」仍然是 `dispatch_task`，不是 shell 拉起 CLI。Worker 跑完后你自己跑 `git` / `pytest` 是验收，不能代替派发。
 
 ## 第一步——派出去，还是自己做？
 
@@ -78,3 +78,5 @@ Claude 的 `quota.status` 只汇总通用的 `5h` / `weekly` 额度。派发前�
 不要去操作 Worker 的图形界面。已经打开的 Grok TUI 不会跟着 ACP 回合实时刷新；用户重启 Grok Build 即可看到同一会话。会话续上是 Bridge 的事。
 
 需要重试去重时，在首次调用 `dispatch_task` 前生成 UUID `request_id`，首次调用就传入。重试须使用同一 ID 和原始参数；首次省略了 `session_id`，重试也保持省略。只在重试时补 ID 无法对首次调用去重。相同参数复用原任务（`reused=true`），不同参数直接拒绝。去重只在同一 Bridge 实例内、原任务仍保留时有效，仍须通过正常派发校验。重启 Bridge、切换实例或清理原任务后不再保留绑定；Worker 的外部副作用不保证 exactly-once。
+
+协调者重启后，`list_tasks` 能找回仍由其他存活 Bridge 实例持有的任务（`remote: true`）；用 `check_task` / `wait_task` / `get_result` 继续跟踪和读取——不要取消或重新派发。`owner_lost: true` 表示持有方已中途退出。

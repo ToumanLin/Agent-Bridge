@@ -5,7 +5,7 @@ import os
 import re
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -110,9 +110,22 @@ class EnvConfig(BaseModel):
 
 
 class ServerConfig(BaseModel):
-    """Process-level server behavior (idle self-exit for abandoned MCP instances)."""
+    """Process-level server behavior (idle self-exit for abandoned MCP instances).
+
+    ``shutdown_policy`` applies when the host closes the MCP stdio transport
+    (orderly stdin EOF / lifespan shutdown): ``cancel`` kills in-flight worker
+    turns at once; ``linger`` keeps the process alive until they finish,
+    bounded by ``linger_max_sec``, then shuts workers down normally. A
+    force-killed Bridge still loses the worker pipes — linger only covers
+    orderly shutdown. ``remote_tasks`` lets check_task / wait_task /
+    get_result / list_tasks read task rows owned by other live Bridge
+    instances sharing this data directory (read-only; never executed here).
+    """
 
     idle_exit_sec: int = 7200
+    shutdown_policy: Literal["cancel", "linger"] = "cancel"
+    linger_max_sec: float = Field(default=86400, ge=0)
+    remote_tasks: bool = True
 
 
 class DashboardConfig(BaseModel):
@@ -274,6 +287,12 @@ def _coerce_server(raw: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "idle_exit_sec" in block and block["idle_exit_sec"] is not None:
         out["idle_exit_sec"] = int(block["idle_exit_sec"])
+    if "shutdown_policy" in block and block["shutdown_policy"] is not None:
+        out["shutdown_policy"] = str(block["shutdown_policy"]).strip().lower()
+    if "linger_max_sec" in block and block["linger_max_sec"] is not None:
+        out["linger_max_sec"] = float(block["linger_max_sec"])
+    if "remote_tasks" in block and block["remote_tasks"] is not None:
+        out["remote_tasks"] = bool(block["remote_tasks"])
     return out
 
 

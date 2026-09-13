@@ -329,9 +329,15 @@ If you still launch from a checkout, use `uv --directory … run --no-sync agent
 
 Instances share the `~/.agent-bridge` state directory but not sessions: every session and task record carries the identity of the Bridge instance that owns it. `list_sessions` shows only the calling instance's records, saves leave a live sibling's records untouched on disk, and records whose owning instance has exited are adopted at the next boot — their in-flight tasks surface as `failed` / `bridge_restarted`. A session started from one host is continued from that host; it does not appear in another host's `list_sessions` while its owner is alive.
 
+Its task rows stay visible though: with `server.remote_tasks` on (the default), `list_tasks`, `check_task`, `wait_task`, and `get_result` resolve a task a live sibling still owns as `remote: true` with `owner` (`pid` / `create_time` / `alive`) metadata — a restarted coordinator can rediscover a task by id, keep polling it, and read the finished result, but it can never run or cancel it (`cancel_task` on a remote task is rejected; `owner_lost: true` marks a queued/running task whose owner already died). Set `remote_tasks = false` to restore the old local-only behavior where such ids answer `unknown task`.
+
 ## Server lifecycle
 
 Abandoned server instances self-exit: after `server.idle_exit_sec` (default 7200 s) with no MCP requests and no queued or running tasks, the process shuts its workers down and exits. Configure in `[server]` (repo `agents.toml` or `%USERPROFILE%\.agent-bridge\agents.toml`); `idle_exit_sec = 0` disables it. `list_agents` also warns when other Bridge instances are running on this machine — one per coordinator host is normal, a pile-up means a host keeps abandoning spawns.
+
+`server.shutdown_policy` decides what an orderly host close (MCP stdio transport EOF / lifespan shutdown) does to in-flight turns. The default `cancel` cancels them at once, unchanged from before. Opt-in `linger` instead keeps the Bridge process alive until they finish — transcript, result artifact, and `state.json` all land as usual — bounded by `server.linger_max_sec` (default 86400 s); whatever is still running at the deadline is cancelled and normal teardown proceeds, so shutdown never hangs unbounded. `list_agents` reports both values in its `server` block.
+
+Linger only covers an orderly close while the Bridge process itself stays alive and keeps owning the worker pipes. Force-killing it (`taskkill /f`, `kill -9`) loses the live turn regardless of policy, and there is no turn pause: a cancelled turn can only be re-dispatched, not resumed mid-flight. Stronger guarantees would need a persistent daemon, which Bridge deliberately is not.
 
 ## Remaining quota in `list_agents`
 

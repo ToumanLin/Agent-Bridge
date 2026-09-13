@@ -100,6 +100,49 @@ OUTBOX_MAX_AGE_SEC = 24 * 3600.0
 # A *.claim file older than this is a stranded rename left by a dead bridge;
 # the outbox loop restores it to a plain message so it can be delivered.
 OUTBOX_CLAIM_STALE_SEC = 60.0
+# How often the running outbox loop re-sweeps for stranded claims — the
+# startup-only rescue used to miss siblings that crashed mid-claim later.
+OUTBOX_CLAIM_SWEEP_SEC = 60.0
+# Poll cadence for wait_task on a sibling-owned (remote) task row.
+REMOTE_TASK_POLL_SEC = 1.5
+
+
+def _parse_outbox_claim(name: str) -> tuple[str, int | None, float | None]:
+    """Split ``name.<pid>[.<create_time>].claim`` into (base, pid, create_time).
+
+    New claims carry the owner bridge's pid + process create time so a
+    recycled pid cannot pass for a live owner; legacy ``name.<pid>.claim``
+    parses with create_time None and falls back to pid-only liveness.
+    """
+    stem = name[: -len(".claim")] if name.endswith(".claim") else name
+    # create_time is a float whose repr itself contains a dot, so the new
+    # shape ends in THREE numeric tail segments; try the widest parse first.
+    parts = stem.rsplit(".", 3)
+    if len(parts) == 4:
+        try:
+            return parts[0], int(parts[1]), float(f"{parts[2]}.{parts[3]}")
+        except ValueError:
+            pass
+    parts = stem.rsplit(".", 2)
+    if len(parts) == 3:
+        try:
+            return parts[0], int(parts[1]), float(parts[2])
+        except ValueError:
+            pass
+    head, _, pid_text = stem.rpartition(".")
+    try:
+        return head, int(pid_text), None
+    except ValueError:
+        pass
+    return stem, None, None
+
+
+def _read_file_tail(path: Path, limit: int = RESULT_TAIL) -> str:
+    """Last ``limit`` bytes of a UTF-8 file, decoded — mirrors ``_tail``."""
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        fh.seek(max(0, fh.tell() - limit))
+        return fh.read().decode("utf-8", errors="ignore")
 
 
 def _new_id(prefix: str) -> str:
@@ -182,6 +225,8 @@ class Registry:
         self._sibling_cache: tuple[float, int] | None = None
         self._quota_cache = QuotaCache(config.quota.cache_sec)
         self._stopping = False
+        self._stop_started = False
+        self._stop_done = asyncio.Event()
         self._pending_state: dict[str, list[dict]] | None = None
         self._flush_task: asyncio.Task[None] | None = None
 
@@ -345,10 +390,16 @@ class Registry:
         outbox = self.home / "outbox"
         outbox.mkdir(exist_ok=True)
         self._outbox_rescue_claims(outbox)
+        last_sweep = time.monotonic()
         cooldown: dict[str, float] = {}
         while True:
             await asyncio.sleep(OUTBOX_POLL_SEC)
             now = time.monotonic()
+            if now - last_sweep >= OUTBOX_CLAIM_SWEEP_SEC:
+                # A sibling can crash mid-claim at any time, not only before
+                # this instance started — rescue stale claims periodically.
+                last_sweep = now
+                self._outbox_rescue_claims(outbox)
             for name, until in list(cooldown.items()):
                 if until <= now:
                     del cooldown[name]
@@ -361,7 +412,7 @@ class Registry:
             except OSError:
                 continue
             for name in names:
-                claimed = outbox / f"{name}.{os.getpid()}.claim"
+                claimed = outbox / self._outbox_claim_name(name)
                 try:
                     os.replace(outbox / name, claimed)
                 except OSError:
@@ -384,14 +435,28 @@ class Registry:
         with contextlib.suppress(OSError):
             atomic_write_json(done_dir / name, payload)
 
+    def _outbox_claim_name(self, name: str) -> str:
+        """Claim file name encoding this instance's owner identity.
+
+        ``name.<pid>.<create_time>.claim`` lets a rescuer detect a recycled
+        pid (create_time mismatch ⇒ dead owner); the dashboard glob
+        ``name.*.claim`` still matches. Without a known create time the
+        legacy ``name.<pid>.claim`` shape keeps pid-only liveness.
+        """
+        if self._owner_create_time is None:
+            return f"{name}.{self._owner_pid}.claim"
+        return f"{name}.{self._owner_pid}.{self._owner_create_time}.claim"
+
     def _outbox_rescue_claims(self, outbox: Path) -> None:
         """Restore stranded ``*.claim`` renames left by a crashed bridge.
 
-        A crash between the atomic ``name -> name.<pid>.claim`` rename and the
-        requeue/done step used to drop the message silently: the scan filters
-        on ``*.json`` and never looks back. At startup, stale claims whose
-        owning pid is dead are renamed back to ``msg_*.json`` (or deleted when
-        a ``done/`` result was already recorded).
+        A crash between the atomic ``name -> name.<pid>[.<ctime>].claim``
+        rename and the requeue/done step used to drop the message silently:
+        the scan filters on ``*.json`` and never looks back. Stale claims
+        whose owning pid (+ create time, when encoded) is dead are renamed
+        back to ``msg_*.json`` — or deleted when a ``done/`` result was
+        already recorded. Runs at outbox-loop start and periodically
+        afterwards; a claim whose owner is verifiably alive is never taken.
         """
         cutoff = time.time() - OUTBOX_CLAIM_STALE_SEC
         try:
@@ -404,15 +469,11 @@ class Registry:
                     continue
             except OSError:
                 continue
-            base = claim.name[: -len(".claim")].rsplit(".", 1)[0]
+            base, pid, create_time = _parse_outbox_claim(claim.name)
             if (outbox / "done" / base).exists() or (outbox / base).exists():
                 claim.unlink(missing_ok=True)
                 continue
-            try:
-                pid = int(claim.name[: -len(".claim")].rsplit(".", 1)[1])
-            except (IndexError, ValueError):
-                pid = 0
-            if pid and owner_alive(pid, None):
+            if pid and owner_alive(pid, create_time):
                 continue  # another live bridge still holds this claim
             try:
                 os.replace(claim, outbox / base)
@@ -537,6 +598,8 @@ class Registry:
 
     async def start(self) -> None:
         self._stopping = False
+        self._stop_started = False
+        self._stop_done = asyncio.Event()
         install_host_env(self.config.env)
         reap_orphans(self.home)
         payload = read_json(state_path(self.home), {})
@@ -579,46 +642,75 @@ class Registry:
             self._outbox_task = asyncio.create_task(self._outbox_loop(), name="outbox")
 
     async def stop(self) -> None:
+        # Idempotent and safe under a concurrent caller (idle watchdog vs.
+        # lifespan shutdown): the second caller waits for the first stop to
+        # finish instead of re-running the teardown.
+        if self._stop_started:
+            await self._stop_done.wait()
+            return
+        self._stop_started = True
         self._stopping = True
-        await self._quota_cache.close()
-        watchdog = self._watchdog
-        self._watchdog = None
-        if watchdog is not None:
-            watchdog.cancel()
-        outbox_task = self._outbox_task
-        self._outbox_task = None
-        if outbox_task is not None:
-            outbox_task.cancel()
-        for idle in list(self._idle.values()):
-            idle.cancel()
-        self._idle.clear()
-        bgs = [task for task in self._bg.values() if not task.done()]
-        for bg in bgs:
-            bg.cancel()
-        if bgs:
-            _done, pending = await asyncio.wait(bgs, timeout=STOP_TASK_GRACE_SEC)
-            if pending:
-                log.warning(
-                    "%d task(s) did not finish cancelling within %ss",
-                    len(pending),
-                    STOP_TASK_GRACE_SEC,
-                )
-        for session_id, adapter in list(self._adapters.items()):
-            session = self.sessions.get(session_id)
-            if session is not None:
-                try:
-                    await adapter.shutdown(session)
-                except Exception:
-                    log.exception("shutdown failed for %s", session_id)
-                if session.proc_state != ProcState.dead:
-                    session.proc_state = ProcState.idle_unloaded
-        self._adapters.clear()
         try:
-            flush_pending(self.home)
-        except OSError:
-            log.exception("could not flush transcripts during shutdown")
-        self.save()
-        await self.flush_state()
+            await self._quota_cache.close()
+            watchdog = self._watchdog
+            self._watchdog = None
+            if watchdog is not None:
+                watchdog.cancel()
+            outbox_task = self._outbox_task
+            self._outbox_task = None
+            if outbox_task is not None:
+                outbox_task.cancel()
+            for idle in list(self._idle.values()):
+                idle.cancel()
+            self._idle.clear()
+            bgs = [task for task in self._bg.values() if not task.done()]
+            linger_max = self.config.server.linger_max_sec
+            if bgs and self.config.server.shutdown_policy == "linger" and linger_max > 0:
+                # Opt-in: the host went away orderly (stdin EOF / lifespan),
+                # but in-flight turns keep their pipes and run to completion
+                # — transcript, result, and state all land as usual — up to
+                # the linger deadline, which cancels what is left.
+                log.info(
+                    "shutdown_policy=linger: holding shutdown up to %ss for %d in-flight task(s)",
+                    linger_max,
+                    len(bgs),
+                )
+                _finished, pending = await asyncio.wait(bgs, timeout=linger_max)
+                bgs = list(pending)
+                if bgs:
+                    log.warning(
+                        "linger deadline %ss reached with %d task(s) still in flight; cancelling",
+                        linger_max,
+                        len(bgs),
+                    )
+            for bg in bgs:
+                bg.cancel()
+            if bgs:
+                _done, pending = await asyncio.wait(bgs, timeout=STOP_TASK_GRACE_SEC)
+                if pending:
+                    log.warning(
+                        "%d task(s) did not finish cancelling within %ss",
+                        len(pending),
+                        STOP_TASK_GRACE_SEC,
+                    )
+            for session_id, adapter in list(self._adapters.items()):
+                session = self.sessions.get(session_id)
+                if session is not None:
+                    try:
+                        await adapter.shutdown(session)
+                    except Exception:
+                        log.exception("shutdown failed for %s", session_id)
+                    if session.proc_state != ProcState.dead:
+                        session.proc_state = ProcState.idle_unloaded
+            self._adapters.clear()
+            try:
+                flush_pending(self.home)
+            except OSError:
+                log.exception("could not flush transcripts during shutdown")
+            self.save()
+            await self.flush_state()
+        finally:
+            self._stop_done.set()
 
     def _adapter_for(self, session: Session) -> Adapter:
         existing = self._adapters.get(session.session_id)
@@ -746,6 +838,8 @@ class Registry:
     ) -> dict:
         if not self.dispatch_enabled:
             raise RuntimeError(NESTED_DISPATCH_ERROR)
+        if self._stopping:
+            raise RuntimeError("bridge is shutting down; not accepting new tasks")
         if self.config.coordinator.mode == "manual" and not user_requested:
             raise RuntimeError(
                 "coordinator mode is manual: dispatch only when the user explicitly "
@@ -779,6 +873,10 @@ class Registry:
             source,
         )
         async with self._lock:
+            # stop() can interleave while this dispatch waited on the lock;
+            # a task created now would outlive the _bg teardown.
+            if self._stopping:
+                raise RuntimeError("bridge is shutting down; not accepting new tasks")
             if request_id is not None and request_id in self._requests:
                 previous, task_id = self._requests[request_id]
                 if previous != request:
@@ -1153,11 +1251,189 @@ class Registry:
 
         self._idle[session_id] = asyncio.create_task(_idle(), name=f"idle-{session_id}")
 
-    def _require_task(self, task_id: str) -> Task:
-        task = self.tasks.get(task_id)
-        if task is None:
+    def _disk_task_rows(self) -> list[dict]:
+        """Task rows as persisted in ``state.json`` right now (all owners)."""
+        payload = read_json(state_path(self.home), {})
+        if not isinstance(payload, dict):
+            return []
+        return [row for row in payload.get("tasks") or [] if isinstance(row, dict)]
+
+    def _remote_task(self, task_id: str) -> Task | None:
+        """Resolve a task row owned by another Bridge instance, read-only.
+
+        Only consulted after ``self.tasks`` misses: live siblings' rows are
+        skipped at start() and never enter memory. Rows owned by *this*
+        instance (or dead-owner rows already adopted) are deliberately not
+        remote — adoption happens once, at start().
+        """
+        if not self.config.server.remote_tasks:
+            return None
+        if not is_safe_id(task_id):
+            return None
+        for raw in self._disk_task_rows():
+            if raw.get("task_id") != task_id:
+                continue
+            if self._is_mine(raw.get("owner_pid"), raw.get("owner_create_time")):
+                return None
+            try:
+                task = Task.model_validate(raw)
+            except Exception:
+                return None
+            # session_id becomes a transcript path component downstream.
+            if not is_safe_id(task.session_id):
+                return None
+            return task
+        return None
+
+    def _remote_task_snapshot(self, task: Task, include_result: bool = False) -> dict:
+        payload = self._task_snapshot(task)
+        alive = owner_alive(task.owner_pid, task.owner_create_time)
+        payload["remote"] = True
+        payload["owner"] = {
+            "pid": task.owner_pid,
+            "create_time": task.owner_create_time,
+            "alive": alive,
+        }
+        # Worker-silence bookkeeping lives in the owning process; nothing
+        # truthful to report for a sibling's turn.
+        payload["silent_for_sec"] = None
+        if task.status in {TaskStatus.queued, TaskStatus.running} and not alive:
+            payload["owner_lost"] = True
+            payload["hint"] = (
+                "The Bridge instance owning this task is gone; it cannot finish. "
+                "Any partial work is in get_transcript / get_result."
+            )
+        if include_result:
+            artifact = result_path(task.task_id, self.home)
+            if artifact.is_file():
+                try:
+                    preview = _read_file_tail(artifact)
+                except OSError:
+                    preview = _tail(task.result_text)
+                total = task.result_chars or len(artifact.read_text(encoding="utf-8", errors="replace"))
+            else:
+                preview = _tail(task.result_text)
+                total = task.result_chars or len(task.result_text)
+            payload["result_text"] = preview
+            payload["result_total_chars"] = total
+            payload["result_truncated"] = total > len(preview)
+            if "hint" not in payload:
+                payload["hint"] = self._result_hint(
+                    task,
+                    "Sibling-owned task (remote): the owning Bridge instance ran it; "
+                    "this is a read-only view. Use get_result for the complete "
+                    "final result and get_transcript for the detailed turn log.",
+                )
+        return payload
+
+    async def _wait_remote_task(self, task_id: str, timeout_sec: float) -> dict:
+        """Poll a sibling-owned task's state.json row until it resolves.
+
+        The owning instance keeps executing; this only watches the disk row
+        until it turns terminal, the owner process dies mid-flight
+        (``owner_lost``), the result artifact lands, or the caller's timeout
+        elapses. Foreign rows are never mutated or executed here.
+        """
+        deadline = time.monotonic() + timeout_sec
+        task = self._remote_task(task_id)
+        if task is None and not result_path(task_id, self.home).is_file():
             raise KeyError(f"unknown task {task_id}")
-        return task
+        last: Task | None = task
+        while True:
+            if task is not None:
+                last = task
+                done = task.status in TERMINAL_STATUSES or result_path(task_id, self.home).is_file()
+                if done or not owner_alive(task.owner_pid, task.owner_create_time):
+                    return {
+                        "timed_out": False,
+                        **self._remote_task_snapshot(task, include_result=True),
+                    }
+            elif last is not None and result_path(task_id, self.home).is_file():
+                # The row vanished (owner pruned/rewrote it) but its final
+                # artifact landed — report the last row we saw.
+                return {
+                    "timed_out": False,
+                    **self._remote_task_snapshot(last, include_result=True),
+                }
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if last is None:
+                    raise KeyError(f"unknown task {task_id}")
+                return {"timed_out": True, **self._remote_task_snapshot(last)}
+            await asyncio.sleep(min(REMOTE_TASK_POLL_SEC, remaining))
+            task = self._remote_task(task_id)
+
+    def list_tasks(self, active_only: bool = False) -> list[dict]:
+        """Stable task rows: this instance's tasks plus sibling-owned ones.
+
+        Remote rows are read-only views of other live Bridge instances' work
+        (and rows whose owner already died, marked ``owner_lost`` when still
+        queued/running). De-duplicated by task_id; result bodies stay out of
+        the listing — get_result pages them on demand.
+        """
+        rows: list[dict] = []
+
+        def row_for(task: Task, *, remote: bool) -> dict:
+            if remote:
+                alive = owner_alive(task.owner_pid, task.owner_create_time)
+                owner = {"pid": task.owner_pid, "create_time": task.owner_create_time, "alive": alive}
+            else:
+                alive = True
+                owner = {"pid": self._owner_pid, "create_time": self._owner_create_time, "alive": True}
+            return {
+                "task_id": task.task_id,
+                "session_id": task.session_id,
+                "agent": task.agent,
+                "status": task.status.value,
+                "stop_reason": task.stop_reason,
+                "error": task.error,
+                "source": task.source,
+                "model": task.model,
+                "effort": task.effort,
+                "created_at": task.created_at,
+                "started_at": task.started_at,
+                "finished_at": task.finished_at,
+                "remote": remote,
+                "owner": owner,
+                "owner_lost": (
+                    not alive and task.status in {TaskStatus.queued, TaskStatus.running}
+                ),
+            }
+
+        for task in self.tasks.values():
+            if active_only and task.status in TERMINAL_STATUSES:
+                continue
+            rows.append(row_for(task, remote=False))
+        if self.config.server.remote_tasks:
+            seen = set(self.tasks)
+            for raw in self._disk_task_rows():
+                task_id = raw.get("task_id")
+                if not isinstance(task_id, str) or task_id in seen:
+                    continue
+                if self._is_mine(raw.get("owner_pid"), raw.get("owner_create_time")):
+                    continue
+                try:
+                    task = Task.model_validate(raw)
+                except Exception:
+                    continue
+                if not is_safe_id(task.task_id) or not is_safe_id(task.session_id):
+                    continue
+                if active_only and task.status in TERMINAL_STATUSES:
+                    continue
+                rows.append(row_for(task, remote=True))
+                seen.add(task_id)
+        rows.sort(key=lambda row: str(row.get("created_at") or ""))
+        return rows
+
+    def server_status(self) -> dict:
+        """Lifecycle policy block surfaced through ``list_agents``."""
+        cfg = self.config.server
+        return {
+            "idle_exit_sec": cfg.idle_exit_sec,
+            "shutdown_policy": cfg.shutdown_policy,
+            "linger_max_sec": cfg.linger_max_sec,
+            "remote_tasks": cfg.remote_tasks,
+        }
 
     @staticmethod
     def _result_hint(task: Task, prefix: str) -> str:
@@ -1212,6 +1488,12 @@ class Registry:
         payload: dict[str, Any] = {
             "task_id": task.task_id,
             "session_id": task.session_id,
+            "remote": False,
+            "owner": {
+                "pid": self._owner_pid,
+                "create_time": self._owner_create_time,
+                "alive": True,
+            },
             "agent": task.agent,
             "status": task.status.value,
             "stop_reason": task.stop_reason,
@@ -1273,7 +1555,9 @@ class Registry:
         return payload
 
     async def wait_task(self, task_id: str, timeout_sec: float = DEFAULT_WAIT_SEC) -> dict:
-        task = self._require_task(task_id)
+        task = self.tasks.get(task_id)
+        if task is None:
+            return await self._wait_remote_task(task_id, timeout_sec)
         event = self._done.setdefault(task_id, asyncio.Event())
         if task.status not in TERMINAL_STATUSES:
             try:
@@ -1285,7 +1569,13 @@ class Registry:
         return {"timed_out": False, **self._task_snapshot(task, include_result=True)}
 
     def check_task(self, task_id: str) -> dict:
-        return self._task_snapshot(self._require_task(task_id))
+        task = self.tasks.get(task_id)
+        if task is not None:
+            return self._task_snapshot(task)
+        remote = self._remote_task(task_id)
+        if remote is None:
+            raise KeyError(f"unknown task {task_id}")
+        return self._remote_task_snapshot(remote)
 
     def get_result(
         self,
@@ -1297,7 +1587,13 @@ class Registry:
             raise ValueError("cursor must be non-negative")
         if not 1 <= max_chars <= RESULT_PAGE_MAX_CHARS:
             raise ValueError(f"max_chars must be between 1 and {RESULT_PAGE_MAX_CHARS}")
-        task = self._require_task(task_id)
+        task = self.tasks.get(task_id)
+        remote = False
+        if task is None:
+            task = self._remote_task(task_id)
+            if task is None:
+                raise KeyError(f"unknown task {task_id}")
+            remote = True
         path = result_path(task.task_id, self.home)
         artifact = path.is_file()
         if artifact:
@@ -1324,7 +1620,7 @@ class Registry:
         bound = total if artifact else len(text)
         end = min(bound, cursor + max_chars)
         has_more = end < bound
-        payload = self._task_snapshot(task)
+        payload = self._remote_task_snapshot(task) if remote else self._task_snapshot(task)
         payload.update(
             {
                 "result_text": page,
@@ -1355,7 +1651,14 @@ class Registry:
     async def cancel_task(self, task_id: str) -> dict:
         if not self.dispatch_enabled:
             raise RuntimeError(NESTED_CANCEL_ERROR)
-        task = self._require_task(task_id)
+        task = self.tasks.get(task_id)
+        if task is None:
+            if self._remote_task(task_id) is not None:
+                raise RuntimeError(
+                    f"task {task_id} is owned by another Bridge instance and "
+                    "cannot be cancelled from here (remote tasks are read-only)"
+                )
+            raise KeyError(f"unknown task {task_id}")
         if task.status in TERMINAL_STATUSES:
             return self._task_snapshot(task)
         session = self.sessions[task.session_id]
