@@ -428,7 +428,9 @@ async function pollEvents(){
     offsets[id]=j.offset;
     if(id!==selected)return;          // user switched away mid-flight: keep cache, skip DOM
     if(j.reset){content.innerHTML="";closeBlocks();for(const k in tools)delete tools[k];}
+    const ph=content.querySelector(".empty");if(ph)ph.remove();
     if(j.events.length)applyEvents(j.events);
+    else if(!content.children.length)content.innerHTML='<div class="empty">No events</div>';
   }catch(e){}
 }
 
