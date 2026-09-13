@@ -448,7 +448,11 @@ class Registry:
         session_id = str(rec.get("session_id") or "")
         text = str(rec.get("message") or "").strip()
         if not session_id or not text:
-            self._outbox_done(outbox, name, {"ok": False, "state": "error", "error": "missing session_id or message"})
+            self._outbox_done(
+                outbox,
+                name,
+                {"ok": False, "state": "error", "error": "missing session_id or message", "error_code": "invalid_record"},
+            )
             return None
         # Queue age counts from the dashboard's enqueue timestamp. Senders that
         # omit it get stamped once here so the wall-clock deadline still applies.
@@ -464,6 +468,7 @@ class Registry:
                     "ok": False,
                     "state": "error",
                     "error": "message expired in queue (24h limit); nothing was delivered",
+                    "error_code": "expired",
                 },
             )
             return None
@@ -479,7 +484,11 @@ class Registry:
                 with contextlib.suppress(OSError):
                     atomic_write_json(claimed, rec)
                 return OUTBOX_FOREIGN_RETRY_SEC
-            self._outbox_done(outbox, name, {"ok": False, "state": "error", "error": f"unknown session {session_id}"})
+            self._outbox_done(
+                outbox,
+                name,
+                {"ok": False, "state": "error", "error": f"unknown session {session_id}", "error_code": "unknown_session"},
+            )
             return None
         try:
             result = await self.dispatch_task(
@@ -492,7 +501,9 @@ class Registry:
             )
         except RuntimeError as exc:
             if "is busy with" not in str(exc):
-                self._outbox_done(outbox, name, {"ok": False, "state": "error", "error": str(exc)})
+                self._outbox_done(
+                    outbox, name, {"ok": False, "state": "error", "error": str(exc), "error_code": "dispatch_failed"}
+                )
                 return None
             rec["attempts"] = int(rec.get("attempts") or 0) + 1
             rec["state"] = "waiting_busy"
@@ -500,7 +511,11 @@ class Registry:
                 atomic_write_json(claimed, rec)
             return OUTBOX_BUSY_RETRY_SEC
         except Exception as exc:
-            self._outbox_done(outbox, name, {"ok": False, "state": "error", "error": f"{type(exc).__name__}: {exc}"})
+            self._outbox_done(
+                outbox,
+                name,
+                {"ok": False, "state": "error", "error": f"{type(exc).__name__}: {exc}", "error_code": "dispatch_error"},
+            )
             return None
         self._outbox_done(
             outbox,

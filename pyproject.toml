@@ -69,6 +69,9 @@ ignore = [
 "scripts/install_dsh_acp.py" = ["E402"]
 "tests/test_setup_lab.py" = ["E402"]
 "tests/test_smoke_claude_coordinator.py" = ["E402"]
+# The embedded dashboard dictionary intentionally uses CJK punctuation
+# (、，——) — it is localized UI prose, not a typo for ASCII.
+"src/agent_bridge/share/dashboard.py" = ["RUF001", "RUF002", "RUF003"]
 
 [tool.mypy]
 python_version = "3.11"

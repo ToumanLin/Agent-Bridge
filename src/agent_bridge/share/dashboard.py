@@ -170,11 +170,20 @@ PAGE = r"""<!DOCTYPE html>
 <title>Agent Bridge Dashboard</title>
 <script>try{var p=localStorage.getItem("ab-theme");
 document.documentElement.setAttribute("data-theme",
-  p==="light"||p==="dark"?p:(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"))}catch(e){}</script>
+  p==="light"||p==="dark"?p:(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"))}catch(e){}
+try{var _l=localStorage.getItem("ab-locale"),_lang="en";
+if(_l==="en"||_l==="zh-CN"||_l==="zh-TW")_lang=_l;
+else{var _ls=(navigator.languages&&navigator.languages.length?navigator.languages:[navigator.language])||[];
+for(var _i=0;_i<_ls.length;_i++){var _t=String(_ls[_i]||"").toLowerCase();
+if(/^zh/.test(_t)){_lang=/hant|tw|hk|mo/.test(_t)?"zh-TW":"zh-CN";break}
+if(/^en/.test(_t)){_lang="en";break}}}
+document.documentElement.lang=_lang}catch(e){}</script>
 <style>
 :root{
   color-scheme:light;
-  --font-sans:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif;
+  --font-sans:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC",
+    "PingFang TC","Microsoft YaHei","Microsoft JhengHei","Noto Sans SC",
+    "Noto Sans TC",sans-serif;
   --font-mono:"Source Code Pro",Consolas,Menlo,monospace;
   --text:#1a1a1a; --dim:#666666; --dimmer:#909090;
   --panel:#ffffff; --panel2:#f8f9fa; --panel3:#f1f3f4;
@@ -231,6 +240,10 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
 .theme-options [role="radio"][aria-checked="true"]{background:var(--panel3);
   border-color:var(--dim);color:var(--text)}
 .theme-options [role="radio"]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#langsel{flex:1;min-width:0;font:inherit;font-size:11px;color:var(--dim);
+  background:var(--panel);border:1px solid var(--border);border-radius:7px;
+  padding:3px 4px;cursor:pointer}
+#langsel:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .sess{display:flex;gap:10px;align-items:flex-start;width:100%;text-align:left;
   font:inherit;color:var(--text);background:none;border:none;border-radius:8px;
   padding:9px 10px;cursor:pointer;position:relative}
@@ -420,40 +433,60 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
 <div class="app">
   <aside id="sidebar">
     <div class="side-head">
-      <h2>Sub Agents</h2>
+      <h2 data-i18n="nav.subagents">Sub Agents</h2>
       <span id="live" aria-live="polite"><span class="ldot"></span><span class="lt">connecting…</span></span>
     </div>
-    <div id="sesslist" role="listbox" aria-label="Sessions"></div>
+    <div id="sesslist" role="listbox" aria-label="Sessions"
+      data-i18n-aria-label="a11y.sessions"></div>
     <div class="side-foot">
-      <span id="themelbl" class="side-foot-label">Theme</span>
+      <span id="themelbl" class="side-foot-label" data-i18n="theme.label">Theme</span>
       <div class="theme-options" role="radiogroup" aria-labelledby="themelbl">
         <button type="button" role="radio" data-theme-pref="system" aria-checked="true"
-          tabindex="0" title="Follow system">System</button>
+          tabindex="0" title="Follow system"
+          data-i18n-title="theme.follow_system"><span data-i18n="theme.system">System</span></button>
         <button type="button" role="radio" data-theme-pref="light" aria-checked="false"
-          tabindex="-1">Light</button>
+          tabindex="-1"><span data-i18n="theme.light">Light</span></button>
         <button type="button" role="radio" data-theme-pref="dark" aria-checked="false"
-          tabindex="-1">Dark</button>
+          tabindex="-1"><span data-i18n="theme.dark">Dark</span></button>
       </div>
+    </div>
+    <div class="side-foot">
+      <label id="langlbl" class="side-foot-label" for="langsel"
+        data-i18n="language.label">Language</label>
+      <select id="langsel">
+        <option value="system" data-i18n="language.system">Follow system</option>
+        <option value="en">English</option>
+        <option value="zh-CN">简体中文</option>
+        <option value="zh-TW">繁體中文</option>
+      </select>
     </div>
   </aside>
   <div id="backdrop"></div>
   <div id="pane">
     <header id="sesshead">
       <button id="menubtn" type="button" aria-label="Show session list"
+        data-i18n-aria-label="a11y.show_session_list"
         aria-controls="sidebar" aria-expanded="false"><svg class="ic" width="16" height="16"
         viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
         stroke-linecap="round" aria-hidden="true" focusable="false"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></button>
-      <div id="hwrap"><div class="hplaceholder">Select a session</div></div>
+      <div id="hwrap"><div class="hplaceholder"
+        data-i18n="session.select">Select a session</div></div>
     </header>
     <div id="conv">
-      <nav id="rail" aria-label="Message positions" hidden></nav>
-      <div id="content"><div class="empty">Select a session</div></div>
+      <nav id="rail" aria-label="Message positions"
+        data-i18n-aria-label="rail.label" hidden></nav>
+      <div id="content"><div class="empty"
+        data-i18n="session.select">Select a session</div></div>
     </div>
     <div id="chatbar">
       <textarea id="chatinput" rows="1" disabled
         placeholder="Send an instruction… (Enter to send, Shift+Enter for newline)"
-        aria-label="Message the selected session"></textarea>
-      <button id="chatsend" type="button" disabled aria-label="Send message" title="Send"><svg class="ic"
+        data-i18n-placeholder="chat.placeholder.default"
+        aria-label="Message the selected session"
+        data-i18n-aria-label="a11y.message_selected_session"></textarea>
+      <button id="chatsend" type="button" disabled aria-label="Send message"
+        data-i18n-aria-label="a11y.send_message" title="Send"
+        data-i18n-title="chat.send"><svg class="ic"
         width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
         stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
         focusable="false"><path d="M3 12h18m-9-9l9 9-9 9"/></svg></button>
@@ -463,7 +496,7 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
 </div>
 <button id="backtop" type="button"><svg class="ic" width="13" height="13" viewBox="0 0 24 24"
   fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
-  stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="6 9 12 15 18 9"/></svg> latest</button>
+  stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="6 9 12 15 18 9"/></svg> <span data-i18n="nav.latest">latest</span></button>
 <script>
 "use strict";
 const $=s=>document.querySelector(s);
@@ -485,10 +518,358 @@ ping(0);setInterval(()=>ping(0),4000);
 addEventListener("pagehide",()=>ping(1));
 
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const fmtTs=t=>{try{return new Date(t).toLocaleTimeString()}catch(e){return""}};
-const ago=t=>{const s=(Date.now()-new Date(t))/1e3;
-  if(s<60)return Math.floor(s)+"s ago"; if(s<3600)return Math.floor(s/60)+"m ago";
-  if(s<86400)return Math.floor(s/3600)+"h ago"; return Math.floor(s/86400)+"d ago"};
+
+/* ---------- i18n: bundled dictionaries (en / zh-CN / zh-TW) ----------
+   All dashboard chrome comes from these checked-in dictionaries — never from
+   runtime machine translation. User content (prompts, agent/thinking text,
+   paths, titles, ids, provider errors) is data and is never localized.
+   `ab-locale` stores the preference: "system" (default) resolves
+   navigator.languages; explicit locales override it. Missing keys fall back
+   to English. Values are plain text templates with {named} placeholders —
+   the JSON-compatible literal is parsed by tests for completeness. */
+const LOCALES=Object.freeze({
+"en":{
+"app.title":"Agent Bridge Dashboard",
+"nav.subagents":"Sub Agents",
+"nav.latest":"latest",
+"rail.label":"Message positions",
+"rail.agent_message":"Agent message",
+"rail.dispatched_message":"Dispatched message",
+"rail.messages":"{n} messages",
+"a11y.sessions":"Sessions",
+"a11y.show_session_list":"Show session list",
+"a11y.message_selected_session":"Message the selected session",
+"a11y.send_message":"Send message",
+"theme.label":"Theme",
+"theme.follow_system":"Follow system",
+"theme.system":"System",
+"theme.light":"Light",
+"theme.dark":"Dark",
+"language.label":"Language",
+"language.system":"Follow system",
+"session.select":"Select a session",
+"session.working_repo":"Working repo · {repo}",
+"session.turns":{"one":"{n} turn","other":"{n} turns"},
+"empty.no_sessions":"No sessions",
+"empty.no_events":"No events",
+"empty.loading":"Loading…",
+"status.connecting":"connecting…",
+"status.live":"live",
+"status.disconnected":"disconnected",
+"status.proc.running":"Running",
+"status.proc.starting":"Starting",
+"status.proc.ready":"Ready",
+"status.proc.idle":"Idle",
+"status.proc.done":"Done",
+"status.proc.failed":"Failed",
+"status.proc.unknown":"Unknown",
+"chat.placeholder.default":"Send an instruction… (Enter to send, Shift+Enter for newline)",
+"chat.placeholder.session":"Send an instruction to {session}…",
+"chat.placeholder.short":"Send an instruction…",
+"chat.send":"Send",
+"send.sending":"sending…",
+"send.queued":"queued…",
+"send.waiting_busy":"waiting for agent — session busy…",
+"send.waiting_owner":"waiting for agent's bridge…",
+"send.delivering":"delivering…",
+"send.dispatched":"dispatched",
+"send.dispatched_task":"dispatched · {task}",
+"send.failed":"send failed",
+"send.err_expired":"message expired in queue",
+"send.err_unknown_session":"unknown session",
+"send.err_missing":"message is no longer queued",
+"send.err_empty_or_too_long":"message empty or too long",
+"send.err_bad_session":"bad session",
+"send.err_bad_request":"bad request",
+"transcript.user_message":"User Message",
+"transcript.dispatched_message":"Dispatched Message",
+"transcript.agent":"Agent",
+"transcript.thinking":"Thinking",
+"transcript.thinking_words":"Thinking · {n} words",
+"transcript.show_more":"show more",
+"transcript.turn_ended":"turn ended",
+"transcript.error":"error",
+"tool.kind.tool":"Tool",
+"tool.kind.execute":"Execute",
+"tool.kind.read":"Read",
+"tool.kind.search":"Search",
+"tool.kind.edit":"Edit",
+"tool.kind.fetch":"Fetch",
+"tool.input":"input",
+"tool.status.in_progress":"in progress",
+"tool.status.completed":"completed",
+"tool.status.failed":"failed",
+"tool.status.error":"error",
+"stop.stalled":"stalled",
+"stop.cancelled":"cancelled",
+"stop.error":"error",
+"time.dur_sec":"{n}s",
+"time.dur_min_sec":"{m}m {s}s",
+"time.dur_min":"{m}m",
+"time.dur_hour_min":"{h}h {m}m",
+"time.dur_hour":"{h}h",
+"time.dur_ms":"{n}ms",
+"time.ago_sec":"{n}s ago",
+"time.ago_min":"{n}m ago",
+"time.ago_hour":"{n}h ago",
+"time.ago_day":"{n}d ago",
+"tokens.run":"Run tokens {n}",
+"tokens.ctx_only":"Context in use ~{n} — last snapshot only, not a run total",
+"tokens.in":"in {n}",
+"tokens.cached":"cached {n}",
+"tokens.out":"out {n}",
+"tokens.context":"context {n}",
+"tokens.conversation":"conversation {n}",
+"tokens.live":"live",
+"tokens.estimate":"estimate"
+},
+"zh-CN":{
+"app.title":"Agent Bridge 仪表板",
+"nav.subagents":"子 Agent",
+"nav.latest":"最新",
+"rail.label":"消息位置",
+"rail.agent_message":"Agent 消息",
+"rail.dispatched_message":"已派发消息",
+"rail.messages":"{n} 条消息",
+"a11y.sessions":"会话",
+"a11y.show_session_list":"显示会话列表",
+"a11y.message_selected_session":"向所选会话发送消息",
+"a11y.send_message":"发送消息",
+"theme.label":"主题",
+"theme.follow_system":"跟随系统",
+"theme.system":"系统",
+"theme.light":"浅色",
+"theme.dark":"深色",
+"language.label":"语言",
+"language.system":"跟随系统",
+"session.select":"选择一个会话",
+"session.working_repo":"工作仓库 · {repo}",
+"session.turns":{"other":"{n} 回合"},
+"empty.no_sessions":"暂无会话",
+"empty.no_events":"暂无事件",
+"empty.loading":"加载中…",
+"status.connecting":"连接中…",
+"status.live":"实时",
+"status.disconnected":"已断开",
+"status.proc.running":"运行中",
+"status.proc.starting":"启动中",
+"status.proc.ready":"就绪",
+"status.proc.idle":"空闲",
+"status.proc.done":"已完成",
+"status.proc.failed":"失败",
+"status.proc.unknown":"未知",
+"chat.placeholder.default":"发送指令…（Enter 发送，Shift+Enter 换行）",
+"chat.placeholder.session":"向 {session} 发送指令…",
+"chat.placeholder.short":"发送指令…",
+"chat.send":"发送",
+"send.sending":"发送中…",
+"send.queued":"已排队…",
+"send.waiting_busy":"等待 Agent——会话正忙…",
+"send.waiting_owner":"等待 Agent 的 Bridge…",
+"send.delivering":"投递中…",
+"send.dispatched":"已派发",
+"send.dispatched_task":"已派发 · {task}",
+"send.failed":"发送失败",
+"send.err_expired":"消息已在队列中过期",
+"send.err_unknown_session":"未知会话",
+"send.err_missing":"消息已不在队列中",
+"send.err_empty_or_too_long":"消息为空或过长",
+"send.err_bad_session":"无效会话",
+"send.err_bad_request":"无效请求",
+"transcript.user_message":"用户消息",
+"transcript.dispatched_message":"已派发消息",
+"transcript.agent":"Agent 消息",
+"transcript.thinking":"思考中",
+"transcript.thinking_words":"思考中 · {n} 词",
+"transcript.show_more":"显示更多",
+"transcript.turn_ended":"回合已结束",
+"transcript.error":"错误",
+"tool.kind.tool":"工具",
+"tool.kind.execute":"执行",
+"tool.kind.read":"读取",
+"tool.kind.search":"搜索",
+"tool.kind.edit":"编辑",
+"tool.kind.fetch":"获取",
+"tool.input":"输入",
+"tool.status.in_progress":"进行中",
+"tool.status.completed":"已完成",
+"tool.status.failed":"失败",
+"tool.status.error":"错误",
+"stop.stalled":"已停滞",
+"stop.cancelled":"已取消",
+"stop.error":"错误",
+"time.dur_sec":"{n} 秒",
+"time.dur_min_sec":"{m} 分 {s} 秒",
+"time.dur_min":"{m} 分",
+"time.dur_hour_min":"{h} 小时 {m} 分",
+"time.dur_hour":"{h} 小时",
+"time.dur_ms":"{n} 毫秒",
+"time.ago_sec":"{n} 秒前",
+"time.ago_min":"{n} 分钟前",
+"time.ago_hour":"{n} 小时前",
+"time.ago_day":"{n} 天前",
+"tokens.run":"运行 token {n}",
+"tokens.ctx_only":"上下文占用 ~{n}——仅为最近快照，不是单次运行总量",
+"tokens.in":"输入 {n}",
+"tokens.cached":"已缓存 {n}",
+"tokens.out":"输出 {n}",
+"tokens.context":"上下文 {n}",
+"tokens.conversation":"会话累计 {n}",
+"tokens.live":"实时",
+"tokens.estimate":"估算"
+},
+"zh-TW":{
+"app.title":"Agent Bridge 儀表板",
+"nav.subagents":"子 Agent",
+"nav.latest":"最新",
+"rail.label":"訊息位置",
+"rail.agent_message":"Agent 訊息",
+"rail.dispatched_message":"已派發訊息",
+"rail.messages":"{n} 則訊息",
+"a11y.sessions":"工作階段",
+"a11y.show_session_list":"顯示工作階段清單",
+"a11y.message_selected_session":"傳送訊息給所選工作階段",
+"a11y.send_message":"傳送訊息",
+"theme.label":"主題",
+"theme.follow_system":"跟隨系統",
+"theme.system":"系統",
+"theme.light":"淺色",
+"theme.dark":"深色",
+"language.label":"語言",
+"language.system":"跟隨系統",
+"session.select":"選擇一個工作階段",
+"session.working_repo":"工作儲存庫 · {repo}",
+"session.turns":{"other":"{n} 回合"},
+"empty.no_sessions":"暫無工作階段",
+"empty.no_events":"暫無事件",
+"empty.loading":"載入中…",
+"status.connecting":"連線中…",
+"status.live":"即時",
+"status.disconnected":"已中斷",
+"status.proc.running":"執行中",
+"status.proc.starting":"啟動中",
+"status.proc.ready":"就緒",
+"status.proc.idle":"閒置",
+"status.proc.done":"已完成",
+"status.proc.failed":"失敗",
+"status.proc.unknown":"未知",
+"chat.placeholder.default":"傳送指令…（Enter 傳送，Shift+Enter 換行）",
+"chat.placeholder.session":"向 {session} 傳送指令…",
+"chat.placeholder.short":"傳送指令…",
+"chat.send":"傳送",
+"send.sending":"傳送中…",
+"send.queued":"已排隊…",
+"send.waiting_busy":"等待 Agent——工作階段忙碌中…",
+"send.waiting_owner":"等待 Agent 的 Bridge…",
+"send.delivering":"傳遞中…",
+"send.dispatched":"已派發",
+"send.dispatched_task":"已派發 · {task}",
+"send.failed":"傳送失敗",
+"send.err_expired":"訊息已在佇列中過期",
+"send.err_unknown_session":"未知工作階段",
+"send.err_missing":"訊息已不在佇列中",
+"send.err_empty_or_too_long":"訊息為空或過長",
+"send.err_bad_session":"無效工作階段",
+"send.err_bad_request":"無效請求",
+"transcript.user_message":"使用者訊息",
+"transcript.dispatched_message":"已派發訊息",
+"transcript.agent":"Agent 訊息",
+"transcript.thinking":"思考中",
+"transcript.thinking_words":"思考中 · {n} 詞",
+"transcript.show_more":"顯示更多",
+"transcript.turn_ended":"回合已結束",
+"transcript.error":"錯誤",
+"tool.kind.tool":"工具",
+"tool.kind.execute":"執行",
+"tool.kind.read":"讀取",
+"tool.kind.search":"搜尋",
+"tool.kind.edit":"編輯",
+"tool.kind.fetch":"擷取",
+"tool.input":"輸入",
+"tool.status.in_progress":"進行中",
+"tool.status.completed":"已完成",
+"tool.status.failed":"失敗",
+"tool.status.error":"錯誤",
+"stop.stalled":"已停滯",
+"stop.cancelled":"已取消",
+"stop.error":"錯誤",
+"time.dur_sec":"{n} 秒",
+"time.dur_min_sec":"{m} 分 {s} 秒",
+"time.dur_min":"{m} 分",
+"time.dur_hour_min":"{h} 小時 {m} 分",
+"time.dur_hour":"{h} 小時",
+"time.dur_ms":"{n} 毫秒",
+"time.ago_sec":"{n} 秒前",
+"time.ago_min":"{n} 分鐘前",
+"time.ago_hour":"{n} 小時前",
+"time.ago_day":"{n} 天前",
+"tokens.run":"執行 token {n}",
+"tokens.ctx_only":"內容使用量 ~{n}——僅為最近快照，不是單次執行總量",
+"tokens.in":"輸入 {n}",
+"tokens.cached":"已快取 {n}",
+"tokens.out":"輸出 {n}",
+"tokens.context":"上下文 {n}",
+"tokens.conversation":"工作階段累計 {n}",
+"tokens.live":"即時",
+"tokens.estimate":"估算"
+}
+});
+const LOCALE_KEY="ab-locale";
+const LOCALE_PREFS=["system","en","zh-CN","zh-TW"];
+function localePref(){
+  try{const p=localStorage.getItem(LOCALE_KEY);
+    return LOCALE_PREFS.includes(p)?p:"system"}catch(e){return"system"}
+}
+/* zh-Hant/TW/HK/MO -> zh-TW; zh/Hans/CN/SG/MY -> zh-CN; en-* -> en;
+   anything else -> en. First recognized tag in preference order wins. */
+function resolveSystemLocale(){
+  let ls=[];
+  try{ls=navigator.languages&&navigator.languages.length?[...navigator.languages]
+    :[navigator.language]}catch(e){}
+  for(const raw of ls){
+    const tag=String(raw||"").toLowerCase().replace(/_/g,"-");
+    if(/^zh/.test(tag))return/hant|tw|hk|mo/.test(tag)?"zh-TW":"zh-CN";
+    if(/^en/.test(tag))return"en";
+  }
+  return"en";
+}
+let langPref=localePref();
+let locale=langPref==="system"?resolveSystemLocale():langPref;
+function pluralForm(n){
+  try{return new Intl.PluralRules(locale).select(n)}catch(e){}
+  return n===1?"one":"other";
+}
+function t(key,params){
+  let m=(LOCALES[locale]||LOCALES.en)[key];
+  if(m===undefined)m=LOCALES.en[key];
+  if(m===undefined)return key;
+  if(m&&typeof m==="object"){
+    const n=params&&Number.isFinite(params.n)?params.n:0;
+    const f=n===1&&m.one!==undefined?"one":pluralForm(n);
+    m=m[f]!==undefined?m[f]:(m.other!==undefined?m.other:
+      m.one!==undefined?m.one:"");
+  }
+  return String(m).replace(/\{(\w+)\}/g,(s,k)=>
+    params&&params[k]!=null?String(params[k]):s);
+}
+const fmtNum=v=>{try{return Number(v).toLocaleString(locale)}catch(e){return String(v)}};
+const fmtTs=v=>{try{return new Date(v).toLocaleTimeString(locale)}catch(e){
+  try{return new Date(v).toLocaleTimeString()}catch(e2){return""}}};
+const ago=v=>{const s=(Date.now()-new Date(v))/1e3;
+  if(s<60)return t("time.ago_sec",{n:Math.floor(s)});
+  if(s<3600)return t("time.ago_min",{n:Math.floor(s/60)});
+  if(s<86400)return t("time.ago_hour",{n:Math.floor(s/3600)});
+  return t("time.ago_day",{n:Math.floor(s/86400)})};
+function applyStatic(){
+  document.querySelectorAll("[data-i18n]").forEach(el=>{
+    el.textContent=t(el.dataset.i18n)});
+  document.querySelectorAll("[data-i18n-title]").forEach(el=>{
+    el.title=t(el.dataset.i18nTitle)});
+  document.querySelectorAll("[data-i18n-aria-label]").forEach(el=>{
+    el.setAttribute("aria-label",t(el.dataset.i18nAriaLabel))});
+  document.querySelectorAll("[data-i18n-placeholder]").forEach(el=>{
+    el.setAttribute("placeholder",t(el.dataset.i18nPlaceholder))});
+}
 
 /* ---------- inline icons (showcase-style: stroke 24x24, filled glyphs, brand marks) ---------- */
 const STROKE='fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
@@ -609,20 +990,21 @@ function latestTask(sid){
   return best;
 }
 const PROC_STATUS=Object.freeze({
-  busy:{label:"Running",tone:"running"},
-  spawning:{label:"Starting",tone:"running"},
-  ready:{label:"Ready",tone:"neutral"},
-  idle_unloaded:{label:"Idle",tone:"neutral"},
+  busy:{key:"status.proc.running",tone:"running"},
+  spawning:{key:"status.proc.starting",tone:"running"},
+  ready:{key:"status.proc.ready",tone:"neutral"},
+  idle_unloaded:{key:"status.proc.idle",tone:"neutral"},
 });
 function statusOf(s){
   const st=s.proc_state;
   if(st==="dead"){
-    const t=latestTask(s.session_id);
-    if(t&&t.status==="failed")return{label:"Failed",tone:"error"};
-    return{label:"Done",tone:"success"};
+    const tk=latestTask(s.session_id);
+    if(tk&&tk.status==="failed")return{key:"status.proc.failed",tone:"error"};
+    return{key:"status.proc.done",tone:"success"};
   }
   const m=PROC_STATUS[st];
-  return m?{label:m.label,tone:m.tone}:{label:st||"Unknown",tone:"neutral"};
+  // Unrecognized proc_state: localized "Unknown", raw code kept as a detail.
+  return m?{key:m.key,tone:m.tone}:{key:"status.proc.unknown",tone:"neutral",raw:st||""};
 }
 function statusGlyph(tone,size=12){
   return tone==="running"?spin():icon(ST_ICON[tone]||"dot",size);
@@ -634,11 +1016,11 @@ function statusGlyph(tone,size=12){
 const fmtDur=ms=>{
   if(!Number.isFinite(ms))return"";
   const s=Math.max(0,Math.floor(ms/1e3));
-  if(s<60)return s+"s";
+  if(s<60)return t("time.dur_sec",{n:s});
   const m=Math.floor(s/60),rs=s%60;
-  if(m<60)return rs?m+"m "+rs+"s":m+"m";
+  if(m<60)return rs?t("time.dur_min_sec",{m,s:rs}):t("time.dur_min",{m});
   const h=Math.floor(m/60),rm=m%60;
-  return rm?h+"h "+rm+"m":h+"h"};
+  return rm?t("time.dur_hour_min",{h,m:rm}):t("time.dur_hour",{h})};
 function taskDur(t){
   if(!t)return null;
   const start=Date.parse(t.started_at);
@@ -711,20 +1093,23 @@ const fmtTok=n=>{
   if(n<1e6)return Math.floor(n/1000)+"k";
   const m=Math.floor(n/1e6),k=Math.floor(n%1e6/1e3);
   return k?m+"m"+k+"k":m+"m"};
-/* Single place composing the token tooltip/aria text (i18n-ready). */
+/* Single place composing the token tooltip/aria text. Compact counts stay
+   locale-stable ("1m100k"); labels come from the dictionary and numbers use
+   locale-aware grouping. */
 function tokTitle(o){
-  const nf=v=>v.toLocaleString("en-US");
   if(o.ctxOnly)
-    return `Context in use ~${nf(o.total)} — last snapshot only, not a run total`;
+    return t("tokens.ctx_only",{n:fmtNum(o.total)});
   const seg=[];
-  if(o.input!=null)seg.push(`in ${nf(o.input)}`);
-  if(o.cached)seg.push(`cached ${nf(o.cached)}`);
-  if(o.output!=null)seg.push(`out ${nf(o.output)}`);
-  const parts=[`Run tokens ${nf(o.total)}${seg.length?" ("+seg.join(", ")+")":""}`];
-  if(o.used!=null)parts.push(`context ${nf(o.used)}${o.size?"/"+nf(o.size):""}`);
-  if(o.conv!=null)parts.push(`conversation ${nf(o.conv)}`);
-  if(o.live)parts.push("live");
-  if(o.estimate)parts.push("estimate");
+  if(o.input!=null)seg.push(t("tokens.in",{n:fmtNum(o.input)}));
+  if(o.cached)seg.push(t("tokens.cached",{n:fmtNum(o.cached)}));
+  if(o.output!=null)seg.push(t("tokens.out",{n:fmtNum(o.output)}));
+  const parts=[t("tokens.run",{n:fmtNum(o.total)})+
+    (seg.length?" ("+seg.join(", ")+")":"")];
+  if(o.used!=null)parts.push(t("tokens.context",
+    {n:fmtNum(o.used)+(o.size?"/"+fmtNum(o.size):"")}));
+  if(o.conv!=null)parts.push(t("tokens.conversation",{n:fmtNum(o.conv)}));
+  if(o.live)parts.push(t("tokens.live"));
+  if(o.estimate)parts.push(t("tokens.estimate"));
   return parts.join(" · ");
 }
 /* Token span for the latest/current task. Priority while running: live
@@ -772,10 +1157,10 @@ function renderSidebar(){
   const sorted=[...sessions].sort((a,b)=>(order[a.proc_state]??4)-(order[b.proc_state]??4)
     || new Date(b.last_active_at)-new Date(a.last_active_at));
   const sig=(selected||"")+"|"+sorted.map(s=>{
-    const t=latestTask(s.session_id);
+    const tk=latestTask(s.session_id);
     return [s.session_id,s.proc_state,s.last_active_at,s.title,s.agent,s.cwd,
-      t?t.task_id:"",t?t.status:"",t?t.message:"",t?t.started_at:"",
-      t?t.finished_at:"",t?t.created_at:"",t?JSON.stringify(t.run_usage||t.usage||0):"",
+      tk?tk.task_id:"",tk?tk.status:"",tk?tk.message:"",tk?tk.started_at:"",
+      tk?tk.finished_at:"",tk?tk.created_at:"",tk?JSON.stringify(tk.run_usage||tk.usage||0):"",
       JSON.stringify(liveUsage[s.session_id]||0)].join(" ");
   }).join("|");
   if(sig===lastSidebarSig)return;
@@ -784,18 +1169,18 @@ function renderSidebar(){
     ?document.activeElement.dataset.id:null;
   el.innerHTML=sorted.map(s=>{
     const st=statusOf(s);
-    const t=latestTask(s.session_id);
-    const sub=t&&t.message?t.message.split("\n")[0].slice(0,80):baseName(s.cwd);
+    const tk=latestTask(s.session_id);
+    const sub=tk&&tk.message?tk.message.split("\n")[0].slice(0,80):baseName(s.cwd);
     const sel=s.session_id===selected;
     return `<button type="button" role="option" class="sess ${sel?"sel":""}" data-id="${esc(s.session_id)}"
         aria-selected="${sel}"${sel?' aria-current="true"':""} title="${esc(s.title||s.session_id)}">
       <span class="sicon">${agentAvatar(s,18)}</span>
       <span class="smeta">
         <span class="stitle">${esc(s.title||s.session_id)}</span>
-        <span class="sstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone)}</span><span>${esc(st.label)}</span>${durSpan(t,"sdur")}${tokSpan(t,"stok",liveUsage[s.session_id])}</span>
+        <span class="sstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone)}</span><span${st.raw?` title="${esc(st.raw)}"`:""}>${esc(t(st.key))}</span>${durSpan(tk,"sdur")}${tokSpan(tk,"stok",liveUsage[s.session_id])}</span>
         ${sub?`<span class="ssub">${esc(sub)}</span>`:""}
       </span>
-    </button>`}).join("")||'<div class="empty" style="margin-top:40px">No sessions</div>';
+    </button>`}).join("")||'<div class="empty" style="margin-top:40px">'+esc(t("empty.no_sessions"))+'</div>';
   el.querySelectorAll(".sess").forEach(d=>d.onclick=()=>select(d.dataset.id));
   if(focusId){
     const f=[...el.querySelectorAll(".sess")].find(d=>d.dataset.id===focusId);
@@ -815,21 +1200,21 @@ $("#sesslist").addEventListener("keydown",e=>{
 function renderSessionHeader(){
   const el=$("#hwrap");
   const s=sessions.find(x=>x.session_id===selected);
-  if(!s){el.innerHTML='<div class="hplaceholder">Select a session</div>';return}
+  if(!s){el.innerHTML='<div class="hplaceholder">'+esc(t("session.select"))+'</div>';return}
   const st=statusOf(s);
-  const t=latestTask(s.session_id);
+  const tk=latestTask(s.session_id);
   const repo=baseName(s.cwd);
   el.innerHTML=`<div class="avatar">${agentAvatar(s,26)}</div>
     <div class="hbody">
       <h2 class="htitle">${esc(s.title||s.session_id)}</h2>
       <div class="hsub">
-        <span class="hstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,13)}</span> ${esc(st.label)}${durSpan(t,"hdur")}${tokSpan(t,"htok",liveUsage[s.session_id])}</span>
+        <span class="hstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,13)}</span> <span${st.raw?` title="${esc(st.raw)}"`:""}>${esc(t(st.key))}</span>${durSpan(tk,"hdur")}${tokSpan(tk,"htok",liveUsage[s.session_id])}</span>
         <span class="badge">${esc(s.agent)}</span>
         ${s.model?`<span class="badge">${esc(s.model)}</span>`:""}
-        ${repo?`<span class="hsep">|</span><span class="hrepo" title="${esc(s.cwd||"")}">Working repo · ${esc(repo)}</span>`:""}
+        ${repo?`<span class="hsep">|</span><span class="hrepo" title="${esc(s.cwd||"")}">${esc(t("session.working_repo",{repo}))}</span>`:""}
       </div>
     </div>
-    <div class="hmeta">${s.turns??0} turn${s.turns===1?"":"s"}${s.last_active_at?" · "+ago(s.last_active_at):""}</div>`;
+    <div class="hmeta">${esc(t("session.turns",{n:s.turns??0}))}${s.last_active_at?" · "+ago(s.last_active_at):""}</div>`;
 }
 
 /* ---------- conversation rendering ---------- */
@@ -849,7 +1234,7 @@ function flushBlocks(){
     if(b.tagName==="DETAILS"){
       b.querySelector(".body").textContent=b._text;
       b.querySelector(".tlabel").textContent=
-        `Thinking · ${b._text.split(/\s+/).filter(Boolean).length} words`;
+        t("transcript.thinking_words",{n:b._text.split(/\s+/).filter(Boolean).length});
     }else b.querySelector(".msg-body").innerHTML=md(b._text);
   }
   dirty.clear();
@@ -866,15 +1251,15 @@ function addPrompt(e){
   const user=e.src==="dashboard";
   const d=document.createElement("div");d.className="block card prompt"+(user?" user":"");
   const long=e.text.length>900;
-  d.innerHTML=`<div class="chead">${icon(user?"msg":"doc",15)}<span>${user?"User Message":"Dispatched Message"}</span><span class="ctime">${fmtTs(e.ts)}</span></div>
+  d.innerHTML=`<div class="chead">${icon(user?"msg":"doc",15)}<span>${esc(t(user?"transcript.user_message":"transcript.dispatched_message"))}</span><span class="ctime">${esc(fmtTs(e.ts))}</span></div>
     <pre class="ptext ${long?"clamp":""}">${esc(e.text)}</pre>`;
-  if(long){const x=document.createElement("button");x.type="button";x.className="expand";x.textContent="show more";
+  if(long){const x=document.createElement("button");x.type="button";x.className="expand";x.textContent=t("transcript.show_more");
     x.onclick=()=>{d.querySelector("pre").classList.remove("clamp");x.remove()};d.appendChild(x)}
   content.appendChild(d);
 }
 function msgBlock(ts){
   if(!curMsg){curMsg=document.createElement("div");curMsg.className="block card msg";
-    curMsg.innerHTML=`<div class="chead">${icon("msg",15)}<span>Agent</span><span class="ctime">${fmtTs(ts)}</span></div><div class="msg-body"></div>`;
+    curMsg.innerHTML=`<div class="chead">${icon("msg",15)}<span>${esc(t("transcript.agent"))}</span><span class="ctime">${esc(fmtTs(ts))}</span></div><div class="msg-body"></div>`;
     content.appendChild(curMsg);curMsg._text=""}
   curThink=null;curToolGroup=null;
   return curMsg;
@@ -884,26 +1269,33 @@ function addMsg(e){
 }
 function addThink(e){
   if(!curThink){curThink=document.createElement("details");curThink.className="block think";
-    curThink.innerHTML=`<summary>${icon("sparkle",14)}<span class="tlabel">Thinking</span><span class="chev">${icon("chevron",13)}</span></summary><div class="body"></div>`;
+    curThink.innerHTML=`<summary>${icon("sparkle",14)}<span class="tlabel">${esc(t("transcript.thinking"))}</span><span class="chev">${icon("chevron",13)}</span></summary><div class="body"></div>`;
     content.appendChild(curThink);curThink._text=""}
   curMsg=null;curToolGroup=null;
   curThink._text+=e.text;dirty.add(curThink);
 }
 const TOOL_ICON={execute:"monitor",read:"doc",search:"search",edit:"edit",fetch:"external"};
+const TOOL_KINDS={tool:1,execute:1,read:1,search:1,edit:1,fetch:1};
+/* Known tool kinds localize; anything else stays an escaped technical value. */
+function toolKindLabel(kind){
+  return TOOL_KINDS[kind]?t("tool.kind."+kind)
+    :String(kind||"").charAt(0).toUpperCase()+String(kind||"").slice(1);
+}
+const TOOL_STATES={in_progress:1,completed:1,failed:1,error:1};
 function addTool(e){
   flushBlocks();
   const g=toolGroup();curMsg=null;curThink=null;
   const kind=String(e.kind||"tool").toLowerCase();
   const row=document.createElement("div");row.className="tool";
   row.innerHTML=`<span class="ticon">${icon(TOOL_ICON[kind]||"gear",15)}</span>
-    <span class="tmain"><span class="tcap">${esc(kind.charAt(0).toUpperCase()+kind.slice(1))}</span>
+    <span class="tmain"><span class="tcap">${esc(toolKindLabel(kind))}</span>
       <span class="ttitle" title="${esc(e.input||"")}">${esc(e.title||e.id)}</span></span>
-    <span class="tright"><span class="dur"></span><span class="st in_progress">${spin()}</span></span>`;
+    <span class="tright"><span class="dur"></span><span class="st in_progress" role="img" aria-label="${esc(t("tool.status.in_progress"))}">${spin()}</span></span>`;
   g.appendChild(row);
   const rec={el:row,start:e.ts,status:"in_progress"};
   tools[e.id]=rec;
   if(e.input){const det=document.createElement("details");det.className="tooldetail";
-    det.innerHTML=`<summary><span class="chev">${icon("chevron",11)}</span>input</summary><pre>${esc(e.input)}</pre>`;
+    det.innerHTML=`<summary><span class="chev">${icon("chevron",11)}</span>${esc(t("tool.input"))}</summary><pre>${esc(e.input)}</pre>`;
     row.after(det);
     row.style.cursor="pointer";row.onclick=()=>det.open=!det.open;}
 }
@@ -912,13 +1304,19 @@ function addToolStatus(e){
   r.status=e.status;
   const st=r.el.querySelector(".st");
   st.className="st "+e.status;
+  // Icons alone are ambiguous: known states get a localized accessible name;
+  // unknown wire values stay raw text (diagnostic, not chrome).
+  if(TOOL_STATES[e.status]){
+    st.setAttribute("role","img");
+    st.setAttribute("aria-label",t("tool.status."+e.status));
+  }else{st.removeAttribute("role");st.removeAttribute("aria-label")}
   st.innerHTML=e.status==="in_progress"?spin()
     :e.status==="completed"?icon("checkCircle",15)
     :(e.status==="failed"||e.status==="error")?icon("xCircle",15)
     :esc(e.status);
   if(e.status!=="in_progress"&&r.start){
     const s=(new Date(e.ts)-new Date(r.start))/1000;
-    r.el.querySelector(".dur").textContent=s>=1?s.toFixed(1)+"s":Math.round(s*1000)+"ms";
+    r.el.querySelector(".dur").textContent=s>=1?t("time.dur_sec",{n:s.toFixed(1)}):t("time.dur_ms",{n:Math.round(s*1000)});
   }
 }
 /* Turn duration: join on the task row via task_id (started_at→finished_at is
@@ -937,6 +1335,9 @@ function turnDurMs(e,promptTs){
   const a=Date.parse(e.ts),b=Date.parse(promptTs);
   return Number.isFinite(a)&&Number.isFinite(b)?a-b:null;
 }
+/* Known stop reasons localize; provider-specific values stay raw. */
+const STOP_REASONS={stalled:1,cancelled:1,error:1};
+function stopReasonLabel(r){return STOP_REASONS[r]?t("stop."+r):String(r)}
 function addTurn(e){
   closeBlocks();
   const d=document.createElement("div");d.className="turnend";
@@ -944,10 +1345,10 @@ function addTurn(e){
   // Visible text: "turn ended · <duration>" — plus the stop reason only when
   // it is not end_turn. The wall-clock timestamp (and any error detail) live
   // in the tooltip, not the text.
-  const parts=["turn ended"];
+  const parts=[t("transcript.turn_ended")];
   const dur=ms===null?"":fmtDur(ms);
   if(dur)parts.push(dur);
-  if(e.stop_reason&&e.stop_reason!=="end_turn")parts.push(e.stop_reason);
+  if(e.stop_reason&&e.stop_reason!=="end_turn")parts.push(stopReasonLabel(e.stop_reason));
   const tip=[fmtTs(e.ts),e.error].filter(Boolean).join(" · ");
   if(tip)d.title=tip;
   d.innerHTML=`${icon("dot",10)}<span>${esc(parts.join(" · "))}</span>`;
@@ -956,7 +1357,7 @@ function addTurn(e){
 function addErr(e){
   closeBlocks();
   const d=document.createElement("div");d.className="turnend err";
-  d.innerHTML=`${icon("xCircle",10)}<span>${esc(e.text||"error")} · ${fmtTs(e.ts)}</span>`;
+  d.innerHTML=`${icon("xCircle",10)}<span>${esc(e.text||t("transcript.error"))} · ${esc(fmtTs(e.ts))}</span>`;
   content.appendChild(d);
 }
 const handlers={prompt:addPrompt,msg:addMsg,think:addThink,tool:addTool,
@@ -1029,9 +1430,9 @@ function layoutRail(){
     b.style.transform=`translateY(${g.y.toFixed(1)}px)`;
     b.style.height=(g.idx.length>1?Math.min(3+g.idx.length*1.5,9):3)+"px";
     const first=b._els[0];
-    const kind=first.classList.contains("msg")?"Agent message":"Dispatched message";
-    const t=(first.querySelector(".ctime")||{}).textContent||"";
-    const lbl=g.idx.length>1?`${g.idx.length} messages · ${t}`:`${kind} · ${t}`;
+    const kind=first.classList.contains("msg")?t("rail.agent_message"):t("rail.dispatched_message");
+    const cts=(first.querySelector(".ctime")||{}).textContent||"";
+    const lbl=g.idx.length>1?`${t("rail.messages",{n:g.idx.length})} · ${cts}`:`${kind} · ${cts}`;
     b.setAttribute("aria-label",lbl);b.title=lbl;
   });
   curIdx=-2;                    // force the aria-current/tab-stop sync below
@@ -1152,9 +1553,13 @@ function touchCache(id){
     dropCache(cacheLru.splice(k,1)[0]);
   }
 }
+/* Whether /api/events has answered at least once for a session — lets an
+   empty transcript distinguish "Loading…" from "No events" after a locale
+   re-render. */
+const polled={};
 function dropCache(id){
   delete eventsCache[id];delete offsets[id];delete rendered[id];delete replayGen[id];
-  delete liveUsage[id];
+  delete liveUsage[id];delete polled[id];
   const i=cacheLru.indexOf(id);if(i>=0)cacheLru.splice(i,1);
   dropPane(id);
 }
@@ -1167,6 +1572,7 @@ async function pollEvents(){
     const r=await fetch(`/api/events?session=${id}&offset=${off}`);
     if(!r.ok)return;
     const j=await r.json();
+    polled[id]=true;
     if(j.reset)eventsCache[id]=[];
     eventsCache[id]=(eventsCache[id]||[]).concat(j.events);
     offsets[id]=j.offset;
@@ -1202,14 +1608,18 @@ async function pollEvents(){
         rendered[id]=eventsCache[id].length;
       }
     }
-    else if(!content.children.length)content.innerHTML='<div class="empty">No events</div>';
+    else if(!content.children.length)content.innerHTML='<div class="empty">'+esc(t("empty.no_events"))+'</div>';
   }catch(e){}
 }
 
-function setLive(on){
-  const l=$("#live");l.className=on?"on":"off";
-  l.querySelector(".lt").textContent=on?"live":"disconnected";
+/* connecting|live|disconnected — re-rendered in place on locale changes. */
+let liveState="connecting";
+function renderLive(){
+  const l=$("#live");
+  l.className=liveState==="live"?"on":liveState==="disconnected"?"off":"";
+  l.querySelector(".lt").textContent=t("status."+liveState);
 }
+function setLive(on){liveState=on?"live":"disconnected";renderLive()}
 
 async function pollOverview(){
   try{
@@ -1233,35 +1643,62 @@ async function pollOverview(){
    outbox enqueue. Acceptance by dispatch_task is reported as "dispatched ·
    <task_id>" — it is not called delivery: the adapter may still fail
    afterwards. Per-session status survives session switches. */
-const sendState={};  // session_id -> {name, text, final}
+const sendState={};  // session_id -> {name, key, params, detail, final}
 const sendPolls={};  // outbox name -> polling loop already running
-function setChatStatus(s){$("#chatstatus").textContent=s||""}
-function sendText(j){
-  const st=j&&j.state;
-  return st==="waiting_busy"?"waiting for agent — session busy…"
-    :st==="waiting_owner"?"waiting for agent's bridge…"
-    :st==="delivering"?"delivering…"
-    :"queued…";
+/* Status line keeps a dictionary key + params (never rendered text) so a
+   locale switch re-renders it without replaying network calls. `detail`
+   carries the untranslated raw diagnostic for the tooltip. */
+function renderSendStatus(){
+  const el=$("#chatstatus");
+  const st=selected?sendState[selected]:null;
+  el.textContent=st&&st.key?t(st.key,st.params||undefined):"";
+  el.title=st&&st.detail||"";
 }
-function setSendState(sid,text,final){
-  sendState[sid]=Object.assign(sendState[sid]||{},{text,final:!!final});
-  if(selected===sid)setChatStatus(text);
+function refreshComposer(){
+  renderSendStatus();
+  const s=selected&&sessions.find(x=>x.session_id===selected);
+  chatInput.placeholder=s?t("chat.placeholder.session",{session:s.title||s.session_id})
+    :selected?t("chat.placeholder.short"):t("chat.placeholder.default");
+}
+function sendKey(j){
+  const st=j&&j.state;
+  return st==="waiting_busy"?"send.waiting_busy"
+    :st==="waiting_owner"?"send.waiting_owner"
+    :st==="delivering"?"send.delivering"
+    :"send.queued";
+}
+/* error_code -> dictionary key for known bridge-reported failures; anything
+   else falls back to the generic failure with the raw error as detail. */
+const SEND_ERR={expired:"send.err_expired",
+  unknown_session:"send.err_unknown_session",
+  missing:"send.err_missing",
+  empty_or_too_long:"send.err_empty_or_too_long",
+  bad_session:"send.err_bad_session",
+  bad_request:"send.err_bad_request"};
+function sendErrState(j){
+  const k=j&&SEND_ERR[j.error_code];
+  return{key:k||"send.failed",detail:j&&j.error||"",final:true};
+}
+function setSendState(sid,st){
+  const cur=sendState[sid]||(sendState[sid]={});
+  cur.key=st.key;cur.params=st.params||null;cur.detail=st.detail||"";cur.final=!!st.final;
+  if(selected===sid)renderSendStatus();
 }
 async function sendChat(){
   const ta=$("#chatinput"),text=ta.value.trim();
   if(!text||!selected)return;
   const sid=selected;
-  ta.value="";ta.style.height="";setSendState(sid,"sending…");
+  ta.value="";ta.style.height="";setSendState(sid,{key:"send.sending"});
   try{
     const r=await fetch("/api/send",{method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({session:sid,text})});
     const j=await r.json();
-    if(!j.ok){setSendState(sid,j.error||"send failed",true);return}
-    setSendState(sid,"queued…");
+    if(!j.ok){setSendState(sid,sendErrState(j));return}
+    setSendState(sid,{key:"send.queued"});
     sendState[sid].name=j.name;
     pollSendStatus(j.name,sid);
-  }catch(e){setSendState(sid,"send failed",true)}
+  }catch(e){setSendState(sid,{key:"send.failed",final:true})}
 }
 async function pollSendStatus(name,sid){
   if(sendPolls[name])return;
@@ -1276,11 +1713,12 @@ async function pollSendStatus(name,sid){
         j=await r.json();
       }catch(e){continue}              // network blip: keep waiting
       if(!mine())return;              // a newer send to this session owns the status line
-      if(j&&j.pending){setSendState(sid,sendText(j));continue}
+      if(j&&j.pending){setSendState(sid,{key:sendKey(j)});continue}
       const done=j||{};
-      setSendState(sid,
-        done.ok?`dispatched${done.task_id?" · "+done.task_id:""}`
-          :(done.error||"send failed"),true);
+      setSendState(sid,done.ok
+        ?{key:done.task_id?"send.dispatched_task":"send.dispatched",
+          params:done.task_id?{task:done.task_id}:null,final:true}
+        :sendErrState(done));
       return;
     }
   }finally{delete sendPolls[name]}
@@ -1341,16 +1779,60 @@ mq.addEventListener("change",()=>{if(themePref()==="system")applyTheme()});
 addEventListener("storage",e=>{if(e.key===THEME_KEY)applyTheme()});
 applyTheme();
 
+/* ---------- language (System · English · 简体中文 · 繁體中文) ----------
+   Switching re-renders every localized surface from source data — the pane
+   is rebuilt from eventsCache (no transcript refetch), stashed panes are
+   dropped because their labels are locale-bound, and the send status line
+   re-renders from its stored key/params. */
+function rerenderLocale(){
+  for(const id of[...paneLru])dropPane(id);
+  for(const id of Object.keys(rendered))rendered[id]=0;
+  if(replaying){replayGen[replaying]=(replayGen[replaying]||0)+1;replaying=null}
+  const refocus=document.activeElement===$("#chatinput")||document.activeElement===$("#chatsend");
+  closeBlocks();tools={};lastPromptTs=null;
+  const id=selected;
+  if(id&&eventsCache[id]&&eventsCache[id].length){
+    const pin=content.scrollHeight-content.scrollTop-content.clientHeight<120;
+    content.innerHTML="";
+    startReplay(id,pin);
+  }else{
+    content.innerHTML='<div class="empty">'+esc(t(id
+      ?(polled[id]?"empty.no_events":"empty.loading")
+      :"session.select"))+'</div>';
+  }
+  if(refocus)$("#chatinput").focus();
+  lastSidebarSig="";                 // labels are baked into the sidebar DOM
+  renderSidebar();renderSessionHeader();renderLive();refreshComposer();
+  scheduleRail();
+}
+function applyLocale(){
+  locale=langPref==="system"?resolveSystemLocale():langPref;
+  document.documentElement.lang=locale;
+  document.title=t("app.title");
+  const sel=$("#langsel");if(sel&&sel.value!==langPref)sel.value=langPref;
+  applyStatic();
+  rerenderLocale();
+}
+function setLocalePref(p){
+  langPref=LOCALE_PREFS.includes(p)?p:"system";
+  try{localStorage.setItem(LOCALE_KEY,langPref)}catch(e){}
+  applyLocale();
+}
+$("#langsel").addEventListener("change",e=>setLocalePref(e.target.value));
+addEventListener("storage",e=>{if(e.key!==LOCALE_KEY)return;
+  const p=localePref();if(p!==langPref){langPref=p;applyLocale()}});
+// Only a "system" preference tracks OS/browser language changes.
+addEventListener("languagechange",()=>{if(langPref==="system")applyLocale()});
+applyLocale();
+
 function select(id){
-  const s=sessions.find(x=>x.session_id===id);
   if(selected!==id){
     const prev=selected,wasReplaying=replaying;
     selected=id;
     if(prev)replayGen[prev]=(replayGen[prev]||0)+1;   // abort the outgoing replay only
     replaying=null;
     chatInput.disabled=false;$("#chatsend").disabled=false;
-    setChatStatus(sendState[id]?sendState[id].text:"");
-    chatInput.placeholder=s?`Send an instruction to ${s.title||s.session_id}…`:"Send an instruction…";
+    refreshComposer();
     if(prev){
       const done=(rendered[prev]||0)===(eventsCache[prev]||[]).length;
       if(wasReplaying===prev&&!done){ // mid-replay partial pane: discard, re-render on return
@@ -1373,7 +1855,7 @@ function select(id){
         startReplay(id,true);
       }else{
         eventsCache[id]=[];offsets[id]=0;
-        content.innerHTML='<div class="empty">Loading…</div>';
+        content.innerHTML='<div class="empty">'+esc(t("empty.loading"))+'</div>';
       }
     }
     touchCache(id);
@@ -1467,7 +1949,7 @@ class Handler(BaseHTTPRequestHandler):
                 reset = True
             events, new_offset = read_events(session, offset)
             if events is None:
-                self._json({"error": "bad session"}, 400)
+                self._json({"error": "bad session", "error_code": "bad_session"}, 400)
                 return
             self._json({"events": events, "offset": new_offset, "reset": reset})
             return
@@ -1485,7 +1967,7 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             name = (q.get("name") or [""])[0]
             if not re.match(r"^msg_\d+_[0-9a-f]{8}\.json$", name):
-                self._json({"error": "bad name"}, 400)
+                self._json({"error": "bad name", "error_code": "bad_name"}, 400)
                 return
             done = OUTBOX_DIR / "done" / name
             if done.exists():
@@ -1525,11 +2007,12 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": False,
                     "state": "missing",
                     "error": "message is no longer queued and no result was recorded",
+                    "error_code": "missing",
                 },
                 404,
             )
             return
-        self._json({"error": "not found"}, 404)
+        self._json({"error": "not found", "error_code": "not_found"}, 404)
 
     def do_POST(self):
         u = urlparse(self.path)
@@ -1538,20 +2021,20 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(min(length, 1 << 20)) or b"{}")
             except Exception:
-                self._json({"ok": False, "error": "bad request"}, 400)
+                self._json({"ok": False, "error": "bad request", "error_code": "bad_request"}, 400)
                 return
             session = str(payload.get("session") or "")
             text = str(payload.get("text") or "").strip()
             if not SAFE_ID.match(session):
-                self._json({"ok": False, "error": "bad session"}, 400)
+                self._json({"ok": False, "error": "bad session", "error_code": "bad_session"}, 400)
                 return
             if not text or len(text) > 20000:
-                self._json({"ok": False, "error": "empty or too long"}, 400)
+                self._json({"ok": False, "error": "empty or too long", "error_code": "empty_or_too_long"}, 400)
                 return
             state = load_state()
             known = {s.get("session_id") for s in state.get("sessions", [])}
             if session not in known:
-                self._json({"ok": False, "error": "unknown session"}, 404)
+                self._json({"ok": False, "error": "unknown session", "error_code": "unknown_session"}, 404)
                 return
             OUTBOX_DIR.mkdir(exist_ok=True)
             name = f"msg_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.json"
@@ -1573,7 +2056,7 @@ class Handler(BaseHTTPRequestHandler):
             bye = (q.get("bye") or ["0"])[0] in ("1", "true")
             self._json({"ok": True, "clients": presence_update(client_id, bye)})
             return
-        self._json({"error": "not found"}, 404)
+        self._json({"error": "not found", "error_code": "not_found"}, 404)
 
 
 def main():

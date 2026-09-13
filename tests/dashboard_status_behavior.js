@@ -3,7 +3,9 @@
 // Extracts the real inline <script> from src/agent_bridge/share/dashboard.py's
 // PAGE and runs it inside a vm context with a minimal DOM stub — no jsdom, no
 // npm packages. Covers the centralized proc_state map, latestTask chronology,
-// and the taskDur/fmtDur/durText rules end to end.
+// the taskDur/fmtDur/durText rules end to end, and the bundled i18n layer
+// (en / zh-CN / zh-TW): dictionaries, locale resolution, localized labels,
+// and rerendering on locale switch without a transcript refetch.
 //
 // Usage: node tests/dashboard_status_behavior.js   (exit 0 = all pass)
 "use strict";
@@ -22,37 +24,66 @@ const code = (page.match(/<script>([\s\S]*?)<\/script>/g) || [])
 
 /* ---------- minimal DOM/window stubs ----------
    Enough surface for the page script's top-level wiring; every fetch is left
-   pending so no poll mutates `tasks` between assertions. */
-const el = () => ({
-  innerHTML: "", textContent: "", style: {}, title: "", type: "",
-  classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
-  dataset: {}, disabled: false, value: "", placeholder: "", tabIndex: 0,
-  open: false, hidden: false, isConnected: true, offsetTop: 0,
-  children: [], firstChild: null, firstElementChild: null,
-  scrollTop: 0, scrollHeight: 0, clientHeight: 0,
-  appendChild() {}, insertAdjacentHTML() {}, setAttribute() {},
-  removeAttribute() {}, replaceChildren() {},
-  addEventListener() {}, querySelector: () => el(), querySelectorAll: () => [],
-  focus() {}, remove() {},
-});
+   pending (and recorded) so no poll mutates `tasks` between assertions.
+   querySelector results are cached per selector so tests can observe the
+   elements the page owns (#chatstatus, #chatinput, #hwrap, ...); each element
+   records setAttribute values and returns stable children for querySelector. */
+const created = [];
+const el = () => {
+  const e = {
+    innerHTML: "", textContent: "", style: {}, title: "", type: "",
+    className: "",
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    dataset: {}, disabled: false, value: "", placeholder: "", tabIndex: 0,
+    open: false, hidden: false, isConnected: true, offsetTop: 0,
+    children: [], firstChild: null, firstElementChild: null,
+    scrollTop: 0, scrollHeight: 0, clientHeight: 0,
+    attrs: {}, _q: {}, focused: 0,
+    appendChild() {}, insertAdjacentHTML() {}, after() {},
+    setAttribute(k, v) { e.attrs[k] = String(v); },
+    getAttribute(k) { return e.attrs[k]; },
+    removeAttribute(k) { delete e.attrs[k]; },
+    replaceChildren() {},
+    addEventListener() {},
+    querySelector(s) { return e._q[s] || (e._q[s] = el()); },
+    querySelectorAll: () => [],
+    focus() { e.focused++; },
+    remove() {},
+  };
+  return e;
+};
+const elCache = {};
 const documentStub = {
-  documentElement: el(), activeElement: null,
-  querySelector: () => el(), querySelectorAll: () => [],
-  createElement: () => el(), addEventListener() {},
+  documentElement: Object.assign(el(), { lang: "" }),
+  activeElement: null, title: "",
+  querySelector: (s) => elCache[s] || (elCache[s] = el()),
+  querySelectorAll: () => [],
+  createElement() {
+    const e = el(); created.push(e); return e;
+  },
+  addEventListener() {},
 };
 const pending = () => new Promise(() => {});
+const fetchCalls = [];
+const store = {};            // mutable localStorage backing
+const listeners = {};        // captured window-level event listeners
 const sandbox = {
   document: documentStub,
-  fetch: pending,
-  localStorage: { getItem: () => null, setItem() {} },
+  fetch: (u) => { fetchCalls.push(String(u)); return pending(); },
+  localStorage: {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => { store[k] = String(v); },
+    removeItem: (k) => { delete store[k]; },
+  },
   sessionStorage: { getItem: () => null, setItem() {} },
-  navigator: { sendBeacon() {} },
+  navigator: { sendBeacon() {}, languages: ["en-US"], language: "en-US" },
   crypto: { randomUUID: () => "00000000-0000-0000-0000-000000000000" },
   matchMedia: () => ({
     matches: false, media: "", addEventListener() {}, removeEventListener() {},
     addListener() {}, removeListener() {},
   }),
-  addEventListener() {}, removeEventListener() {},
+  addEventListener(ev, fn) { (listeners[ev] || (listeners[ev] = [])).push(fn); },
+  removeEventListener() {},
   setInterval: () => 0, clearInterval() {},
   setTimeout: () => 0, clearTimeout() {},
   requestAnimationFrame: () => 0,
@@ -69,9 +100,19 @@ vm.runInContext(
     "\n;globalThis.__x = { statusOf, latestTask, taskDur, fmtDur, durText," +
     " durSpan, PROC_STATUS, subSeed, agentAvatar, statusGlyph, icon," +
     " usageNums, tokCount, runTok, tokTitle, fmtTok, tokSpan, turnDurMs," +
-    " addTurn, addPrompt, clusterYs, markable, MARK_SEL, MARK_GAP," +
+    " addTurn, addPrompt, addTool, addToolStatus, clusterYs, markable," +
+    " MARK_SEL, MARK_GAP," +
     " scheduleRail, layoutRail, jumpToMark, updateCurMark," +
-    " _setTasks: (v) => { tasks = v; } };",
+    " t, LOCALES, LOCALE_PREFS, localePref, resolveSystemLocale," +
+    " setLocalePref, applyLocale, rerenderLocale, ago, fmtTs, fmtNum," +
+    " sendKey, sendErrState, setSendState, renderSendStatus," +
+    " refreshComposer, toolKindLabel, stopReasonLabel, renderLive," +
+    " select, pollEvents, sendState," +
+    " _setTasks: (v) => { tasks = v; }," +
+    " _setSessions: (v) => { sessions = v; }," +
+    " _cache: () => eventsCache, _polled: () => polled," +
+    " _panes: () => panes, _rendered: () => rendered," +
+    " _getLocale: () => locale, _getLangPref: () => langPref };",
   sandbox);
 const X = sandbox.__x;
 
@@ -88,19 +129,29 @@ const task = (over) =>
   Object.assign({ task_id: "t1", session_id: "s1", status: "completed",
     created_at: "2026-01-01T00:00:00Z", started_at: "2026-01-01T00:00:02Z",
     finished_at: "2026-01-01T00:00:42Z" }, over);
+const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
 
 (async () => {
-  // --- centralized status mapping: proc_state wins over task status ---
+  // --- centralized status mapping: stable keys + tones, not baked labels ---
   X._setTasks([task({})]);
-  eq(X.statusOf(sess("busy")).label, "Running",
-    "busy -> Running even when latest task is completed");
-  eq(X.statusOf(sess("spawning")).label, "Starting", "spawning -> Starting");
-  eq(X.statusOf(sess("ready")).label, "Ready", "ready + completed -> Ready");
-  eq(X.statusOf(sess("idle_unloaded")).label, "Idle",
-    "idle_unloaded + completed -> Idle");
-  eq(X.statusOf(sess("dead")).label, "Done", "dead + completed -> Done");
+  eq(X.statusOf(sess("busy")).key, "status.proc.running",
+    "busy -> running key even when latest task is completed");
+  eq(X.t(X.statusOf(sess("busy")).key), "Running",
+    "busy -> Running (en)");
+  eq(X.statusOf(sess("spawning")).key, "status.proc.starting",
+    "spawning -> starting key");
+  eq(X.statusOf(sess("ready")).key, "status.proc.ready",
+    "ready + completed -> ready key");
+  eq(X.statusOf(sess("idle_unloaded")).key, "status.proc.idle",
+    "idle_unloaded + completed -> idle key");
+  eq(X.statusOf(sess("dead")).key, "status.proc.done",
+    "dead + completed -> done key");
   X._setTasks([task({ status: "failed" })]);
-  eq(X.statusOf(sess("dead")).label, "Failed", "dead + failed -> Failed");
+  eq(X.statusOf(sess("dead")).key, "status.proc.failed",
+    "dead + failed -> failed key");
+  const unk = X.statusOf(sess("mystery"));
+  eq(unk.key, "status.proc.unknown", "unknown proc_state -> unknown key");
+  eq(unk.raw, "mystery", "unknown proc_state keeps the raw code as detail");
   eq(X.statusOf(sess("ready")).tone, "neutral", "ready tone neutral");
   eq(X.statusOf(sess("idle_unloaded")).tone, "neutral", "idle tone neutral");
   eq(X.statusOf(sess("busy")).tone, "running", "busy tone running");
@@ -336,6 +387,9 @@ const task = (over) =>
     src: null });
   X.addTurn({ t: "turn", ts: "2026-01-01T00:00:45Z", stop_reason: "end_turn" });
   eq(spanText(), "turn ended · 40s", "legacy prompt-pair fallback in text");
+  documentStub.createElement = function () {
+    const e = el(); created.push(e); return e;
+  };
 
   // --- nav rail: mark predicate mirrors MARK_SEL (user cards excluded) ---
   const fakeEl = (cls) => ({ classList: { contains: (c) => cls.includes(c) } });
@@ -376,6 +430,236 @@ const task = (over) =>
   X.updateCurMark();
   X.scheduleRail();
   eq(true, true, "rail helpers run on the DOM stub without throwing");
+
+  /* ================= i18n: bundled dictionaries ================= */
+
+  // --- dictionary shape: three frozen locales, English fallback in t() ---
+  eq(Object.isFrozen(X.LOCALES), true, "LOCALES is frozen");
+  eq(Object.keys(X.LOCALES).sort().join(","), "en,zh-CN,zh-TW",
+    "exactly three resource locales");
+  const enKeys = Object.keys(X.LOCALES.en).sort();
+  eq(JSON.stringify(Object.keys(X.LOCALES["zh-CN"]).sort()),
+    JSON.stringify(enKeys), "zh-CN key set identical to en");
+  eq(JSON.stringify(Object.keys(X.LOCALES["zh-TW"]).sort()),
+    JSON.stringify(enKeys), "zh-TW key set identical to en");
+  eq(X.LOCALE_PREFS.join(","), "system,en,zh-CN,zh-TW",
+    "preference values: system + three locales");
+  eq(X.t("does.not.exist"), "does.not.exist",
+    "missing key surfaces the key itself (dev signal)");
+  eq(X.t("session.turns", { n: 1 }), "1 turn", "en plural one");
+  eq(X.t("session.turns", { n: 7 }), "7 turns", "en plural other");
+  eq(X.t("session.working_repo", { repo: "<x>" }), "Working repo · <x>",
+    "named interpolation (text, escaping is the caller's job)");
+
+  // --- system-locale resolution: zh-Hant/TW/HK/MO -> zh-TW etc. ---
+  const sysLoc = (langs, lang) => {
+    sandbox.navigator.languages = langs;
+    sandbox.navigator.language = lang;
+    return X.resolveSystemLocale();
+  };
+  eq(sysLoc(["zh-TW"]), "zh-TW", "zh-TW -> zh-TW");
+  eq(sysLoc(["zh-Hant"]), "zh-TW", "zh-Hant -> zh-TW");
+  eq(sysLoc(["zh-HK"]), "zh-TW", "zh-HK -> zh-TW");
+  eq(sysLoc(["zh-MO"]), "zh-TW", "zh-MO -> zh-TW");
+  eq(sysLoc(["zh-Hant-HK"]), "zh-TW", "zh-Hant-HK -> zh-TW");
+  eq(sysLoc(["zh"]), "zh-CN", "bare zh -> zh-CN");
+  eq(sysLoc(["zh-Hans"]), "zh-CN", "zh-Hans -> zh-CN");
+  eq(sysLoc(["zh-CN"]), "zh-CN", "zh-CN -> zh-CN");
+  eq(sysLoc(["zh-SG"]), "zh-CN", "zh-SG -> zh-CN");
+  eq(sysLoc(["zh-MY"]), "zh-CN", "zh-MY -> zh-CN");
+  eq(sysLoc(["en-GB"]), "en", "en-GB -> en");
+  eq(sysLoc(["en-AU", "zh-TW"]), "en", "first preference wins (en-AU)");
+  eq(sysLoc(["fr-FR", "zh-TW"]), "zh-TW",
+    "unrecognized tags are skipped in order");
+  eq(sysLoc(["fr-FR"]), "en", "unrecognized -> en");
+  eq(sysLoc([], "zh-Hant"), "zh-TW",
+    "empty navigator.languages falls back to navigator.language");
+  eq(sysLoc(undefined, "zh-CN"), "zh-CN", "no languages list -> language");
+  eq(sysLoc([], "ja-JP"), "en", "unrecognized language -> en");
+  sandbox.navigator.languages = ["en-US"];
+  sandbox.navigator.language = "en-US";
+
+  // --- preference persistence + document lang/title ---
+  eq(X._getLangPref(), "system", "default preference is system");
+  eq(X._getLocale(), "en", "system resolved to en (navigator en-US)");
+  eq(documentStub.documentElement.lang, "en", "<html lang> applied");
+  eq(documentStub.title, "Agent Bridge Dashboard", "document.title en");
+
+  X.setLocalePref("zh-CN");
+  eq(X._getLangPref(), "zh-CN", "zh-CN preference stored");
+  eq(store["ab-locale"], "zh-CN", "ab-locale persisted");
+  eq(X._getLocale(), "zh-CN", "locale resolved to zh-CN");
+  eq(documentStub.documentElement.lang, "zh-CN", "<html lang=zh-CN>");
+  eq(documentStub.title, "Agent Bridge 仪表板", "document.title zh-CN");
+  eq(elCache["#langsel"].value, "zh-CN", "select mirrors the preference");
+  eq(X.t("status.proc.running"), "运行中", "running label zh-CN");
+  eq(X.t("status.proc.idle"), "空闲", "idle label zh-CN");
+  eq(X.t("session.turns", { n: 7 }), "7 回合", "zh plural flat {n}");
+  eq(X.t("session.turns", { n: 1 }), "1 回合", "zh has no one/other split");
+
+  X.setLocalePref("zh-TW");
+  eq(X._getLocale(), "zh-TW", "locale resolved to zh-TW");
+  eq(documentStub.title, "Agent Bridge 儀表板", "document.title zh-TW");
+  eq(X.t("status.proc.running"), "執行中", "running label zh-TW");
+  eq(X.t("status.proc.idle"), "閒置", "idle label zh-TW");
+  eq(X.t("status.proc.failed"), "失敗", "failed label zh-TW");
+  eq(X.t("transcript.user_message"), "使用者訊息", "user message zh-TW");
+  eq(X.t("transcript.dispatched_message"), "已派發訊息",
+    "dispatched message zh-TW");
+  eq(X.t("transcript.turn_ended"), "回合已結束", "turn ended zh-TW");
+
+  X.setLocalePref("bogus");
+  eq(X._getLangPref(), "system", "unknown preference falls back to system");
+  eq(X._getLocale(), "en", "bogus pref -> system -> en");
+
+  // system mode tracks navigator.languages at apply time
+  sandbox.navigator.languages = ["zh-HK"];
+  X.setLocalePref("system");
+  eq(X._getLocale(), "zh-TW", "system pref + zh-HK -> zh-TW");
+  eq(store["ab-locale"], "system", "system itself is persisted");
+
+  // storage sync: another tab wrote a new ab-locale
+  store["ab-locale"] = "zh-CN";
+  (listeners.storage || []).forEach((f) => f({ key: "ab-locale" }));
+  eq(X._getLangPref(), "zh-CN", "storage event re-reads ab-locale");
+  eq(X._getLocale(), "zh-CN", "storage event applies zh-CN");
+  store["ab-locale"] = "system";
+  (listeners.storage || []).forEach((f) => f({ key: "ab-locale" }));
+  eq(X._getLangPref(), "system", "storage event back to system");
+  // languagechange only fires while preference is system
+  sandbox.navigator.languages = ["zh-MO"];
+  (listeners.languagechange || []).forEach((f) => f());
+  eq(X._getLocale(), "zh-TW", "languagechange re-resolves in system mode");
+  X.setLocalePref("en");
+  sandbox.navigator.languages = ["zh-TW"];
+  (listeners.languagechange || []).forEach((f) => f());
+  eq(X._getLocale(), "en", "languagechange ignored with explicit pref");
+  sandbox.navigator.languages = ["en-US"];
+
+  // --- localized formats in each locale ---
+  X.setLocalePref("zh-CN");
+  eq(X.fmtDur(40 * 1000), "40 秒", "duration zh-CN");
+  eq(X.fmtDur((20 * 60 + 43) * 1000), "20 分 43 秒", "min+sec zh-CN");
+  eq(X.ago(new Date(Date.now() - 30e3).toISOString()), "30 秒前",
+    "relative time zh-CN");
+  const zhTok = X.tokTitle({ total: 72, input: 60, output: 12, used: 12,
+    size: 100 });
+  eq(zhTok.includes("运行 token 72"), true, "token tooltip zh-CN");
+  eq(zhTok.includes("令牌"), false, "token never translated as 令牌");
+  X.setLocalePref("zh-TW");
+  eq(X.fmtDur(40 * 1000), "40 秒", "duration zh-TW");
+  eq(X.tokTitle({ total: 72 }).includes("執行 token 72"), true,
+    "token tooltip zh-TW");
+  X.setLocalePref("en");
+  eq(X.ago(new Date(Date.now() - 30e3).toISOString()), "30s ago",
+    "relative time en");
+  eq(X.t("tokens.run", { n: "72" }), "Run tokens 72", "token tooltip en");
+
+  // --- tool kinds / status a11y / stop reasons localize; raw stays raw ---
+  X.setLocalePref("zh-CN");
+  eq(X.toolKindLabel("execute"), "执行", "tool kind execute zh-CN");
+  eq(X.toolKindLabel("weirdkind"), "Weirdkind",
+    "unknown tool kind stays raw (capitalized)");
+  eq(X.stopReasonLabel("stalled"), "已停滞", "known stop reason zh-CN");
+  eq(X.stopReasonLabel("end_turn"), "end_turn",
+    "end_turn is suppressed upstream, stays raw here");
+  eq(X.stopReasonLabel("provider_x"), "provider_x",
+    "unknown stop reason stays raw");
+  const beforeTool = created.length;
+  X.addTool({ t: "tool", ts: 1, id: "tc1", kind: "execute", title: "run ls",
+    input: "ls -la" });
+  const toolRow = created.slice(beforeTool)
+    .find((e) => e.className === "tool");
+  eq(toolRow.innerHTML.includes("执行"), true, "tool row label zh-CN");
+  eq(toolRow.innerHTML.includes('aria-label="进行中"'), true,
+    "in-progress tool status aria-label zh-CN");
+  eq(toolRow.innerHTML.includes("run ls"), true,
+    "tool title (user data) not translated");
+  X.addToolStatus({ t: "tool_status", id: "tc1", status: "completed", ts: 5 });
+  eq(toolRow._q[".st"].attrs["aria-label"], "已完成",
+    "completed tool status aria-label zh-CN");
+  X.addToolStatus({ t: "tool_status", id: "tc1", status: "weird_state",
+    ts: 9 });
+  eq(toolRow._q[".st"].attrs["aria-label"], undefined,
+    "unknown tool status drops the a11y label (raw text instead)");
+  X.setLocalePref("en");
+  eq(X.toolKindLabel("execute"), "Execute", "tool kind execute en");
+
+  // --- send states: stable keys + params, re-render on locale switch ---
+  eq(X.sendKey({ state: "waiting_busy" }), "send.waiting_busy",
+    "waiting_busy maps to its key");
+  eq(X.sendKey({ state: "waiting_owner" }), "send.waiting_owner",
+    "waiting_owner maps to its key");
+  eq(X.sendKey({ state: "delivering" }), "send.delivering",
+    "delivering maps to its key");
+  eq(X.sendKey({ state: "queued" }), "send.queued", "queued default");
+  eq(X.sendKey({}), "send.queued", "missing state -> queued");
+  const errSt = X.sendErrState({ error_code: "expired", error: "raw diag 1" });
+  eq(errSt.key, "send.err_expired", "error_code expired -> its key");
+  eq(errSt.detail, "raw diag 1", "raw error kept as detail");
+  eq(errSt.final, true, "error states are final");
+  eq(X.sendErrState({ error_code: "nope", error: "weird" }).key,
+    "send.failed", "unknown error_code -> generic failed key");
+  eq(X.sendErrState({}).key, "send.failed", "no error_code -> generic key");
+
+  // selected session + send state + placeholder rerender on locale switch
+  X._setSessions([{ session_id: "s1", proc_state: "ready", title: "s1",
+    agent: "devin", cwd: "/repo/proj", turns: 3 }]);
+  const evCalls0 = apiCalls("/api/events");
+  X.select("s1");
+  X.setSendState("s1", { key: "send.queued" });
+  eq(elCache["#chatstatus"].textContent, "queued…", "send status en");
+  eq(elCache["#chatinput"].placeholder, "Send an instruction to s1…",
+    "placeholder en interpolates the session title verbatim");
+  eq(elCache["#hwrap"].innerHTML.includes("3 turns"), true,
+    "header turns en");
+  documentStub.activeElement = elCache["#chatinput"];
+  const foc0 = elCache["#chatinput"].focused;
+  X.setLocalePref("zh-CN");
+  eq(elCache["#chatstatus"].textContent, "已排队…",
+    "send status re-rendered zh-CN from stored key");
+  eq(elCache["#chatinput"].placeholder, "向 s1 发送指令…",
+    "placeholder zh-CN keeps the session title verbatim");
+  eq(elCache["#hwrap"].innerHTML.includes("3 回合"), true,
+    "header turns zh-CN");
+  eq(elCache["#hwrap"].innerHTML.includes("工作儲存庫") ||
+     elCache["#hwrap"].innerHTML.includes("工作仓库"), true,
+    "header repo label localized zh-CN");
+  eq(elCache["#chatinput"].focused > foc0, true,
+    "composer focus restored after locale switch");
+  eq(documentStub.activeElement === elCache["#chatinput"], true,
+    "focus target unchanged (still the composer)");
+  X.setSendState("s1", { key: "send.dispatched_task",
+    params: { task: "task_9" }, final: true });
+  eq(elCache["#chatstatus"].textContent, "已派发 · task_9",
+    "dispatched task id interpolates verbatim zh-CN");
+
+  // transcript re-render from eventsCache — zero refetch, source preserved
+  X._cache().s1 = [{ t: "prompt", ts: "2026-01-01T00:00:05Z",
+    text: "deploy <prod> now", src: "outbox" }];
+  const before = apiCalls("/api/events");
+  X.setLocalePref("zh-TW");
+  eq(apiCalls("/api/events"), before,
+    "locale switch does not refetch /api/events");
+  const card = created.slice().reverse()
+    .find((e) => (e.className || "").includes("card prompt"));
+  eq(!!card, true, "dispatched prompt card re-rendered");
+  eq(card.innerHTML.includes("已派發訊息"), true, "card label zh-TW");
+  eq(card.innerHTML.includes("deploy &lt;prod&gt; now"), true,
+    "prompt source text preserved verbatim (escaped, untranslated)");
+  X.setLocalePref("en");
+  const cardEn = created.slice().reverse()
+    .find((e) => (e.className || "").includes("card prompt"));
+  eq(cardEn.innerHTML.includes("Dispatched Message"), true,
+    "card label back to en");
+  eq(cardEn.innerHTML.includes("deploy &lt;prod&gt; now"), true,
+    "source text still verbatim after switch back");
+  eq(apiCalls("/api/events"), before, "switch back refetches nothing either");
+
+  // empty-state distinguishes loading vs polled-empty across locales
+  X._cache().s2 = [];
+  X._polled().s2 = false;
+  eq(true, true, "polled flag is test-controllable");
 
   console.log(failed ? `\n${failed} FAILED` : "\nall assertions passed");
   process.exit(failed ? 1 : 0);

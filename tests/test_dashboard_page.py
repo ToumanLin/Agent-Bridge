@@ -179,6 +179,7 @@ def test_page_dom_ids_and_endpoints():
         "chatstatus",
         "live",
         "backtop",
+        "langsel",
     ):
         assert f'id="{dom_id}"' in PAGE
     for ep in ("/api/overview", "/api/events", "/api/send", "/api/send_status", "/api/presence"):
@@ -212,22 +213,28 @@ def test_inline_svg_icon_policy():
 
 
 def test_status_mapping_labels():
-    # Centralized, immutable proc_state -> {label, tone} table; statusOf only
-    # applies the dead latest-task Failed/Done override on top of it.
+    # Centralized, immutable proc_state -> {key, tone} table; statusOf only
+    # applies the dead latest-task Failed/Done override on top of it. Labels
+    # resolve through the LOCALES dictionary at render time, so the map holds
+    # stable message keys, not baked English.
     m = re.search(r"const PROC_STATUS=Object\.freeze\(\{([\s\S]*?)\}\)", PAGE)
     assert m, "PROC_STATUS freeze map missing"
     body = m.group(1)
     for entry in (
-        'busy:{label:"Running",tone:"running"}',
-        'spawning:{label:"Starting",tone:"running"}',
-        'ready:{label:"Ready",tone:"neutral"}',
-        'idle_unloaded:{label:"Idle",tone:"neutral"}',
+        'busy:{key:"status.proc.running",tone:"running"}',
+        'spawning:{key:"status.proc.starting",tone:"running"}',
+        'ready:{key:"status.proc.ready",tone:"neutral"}',
+        'idle_unloaded:{key:"status.proc.idle",tone:"neutral"}',
     ):
         assert entry in body
     assert '"Waiting"' not in PAGE
     assert "PROC_STATUS[st]" in PAGE
-    dead = re.search(r'if\(st==="dead"\)\{([\s\S]*?)\}', PAGE).group(1)
+    dead = re.search(r'if\(st==="dead"\)\{([\s\S]*?)\n  \}', PAGE).group(1)
     assert "latestTask" in dead and '"failed"' in dead
+    assert 'key:"status.proc.failed",tone:"error"' in dead
+    assert 'key:"status.proc.done",tone:"success"' in dead
+    # Unknown proc_states surface a localized Unknown plus the raw code.
+    assert '"status.proc.unknown"' in PAGE and "raw:" in PAGE
     # Executable coverage of all six state/result scenarios (and the duration
     # rules) lives in tests/dashboard_status_behavior.js, run by
     # test_dashboard_status_behavior_node below.
@@ -500,7 +507,9 @@ def test_turn_end_shows_duration():
     body = re.search(r"function addTurn\(e\)\{([\s\S]*?)\n\}", PAGE).group(1)
     # Visible text is exactly "turn ended · <dur>" (+reason when abnormal);
     # the wall-clock timestamp lives in the tooltip, not the divider text.
-    assert 'parts=["turn ended"]' in body
+    # The label itself comes from the dictionary (transcript.turn_ended).
+    assert 'parts=[t("transcript.turn_ended")]' in body
+    assert "stopReasonLabel" in body
     assert "parts.push(fmtTs" not in body and "d.title" in body
     # A still-running task's interval ends at the turn ts — validated by
     # Number.isFinite so a bad timestamp yields no invented duration.
@@ -531,7 +540,7 @@ def test_token_counter_helpers():
     # The sidebar signature fingerprints run_usage (preferred), legacy usage,
     # and the live usage-event snapshot so a finishing/running turn repaints.
     sig = re.search(r'const sig=([\s\S]*?)join\("\|"\)', PAGE).group(1)
-    assert "t.run_usage" in sig and "t.usage" in sig and "liveUsage" in sig
+    assert "tk.run_usage" in sig and "tk.usage" in sig and "liveUsage" in sig
     # tokSpan prefers the persisted per-run aggregate over the raw last
     # snapshot; legacy usage is only an estimate fallback.
     body = re.search(r"function tokSpan\(t,cls,live\)\{([\s\S]*?)\n\}", PAGE).group(1)
@@ -575,10 +584,12 @@ def test_perf_architecture_hooks():
 def test_nav_rail():
     # Codex-style proportional nav rail: a semantic landmark left of the
     # scroller with one native <button> mark per rendered message card.
-    assert '<nav id="rail" aria-label="Message positions" hidden></nav>' in PAGE
+    rail_nav = re.search(r'<nav id="rail"[^>]*>', PAGE).group(0)
+    assert 'aria-label="Message positions"' in rail_nav and "hidden" in rail_nav
+    # The landmark label localizes via the i18n hook.
+    assert 'data-i18n-aria-label="rail.label"' in rail_nav
     # The landmark label must not redundantly contain the role name.
-    assert "Message positions" in PAGE and "navigation" not in re.search(
-        r'<nav id="rail"[^>]*>', PAGE).group(0).lower()
+    assert "Message positions" in PAGE and "navigation" not in rail_nav.lower()
     # Marks only for Agent cards and non-user Dispatched cards — the classList
     # predicate is the applied half; MARK_SEL is the selector form pinned for
     # tests/benchmarks (kept in sync by contract).
@@ -641,6 +652,181 @@ def test_nav_rail():
     assert "updateCurMark" in scroll.group(1)
     sel_body = re.search(r"function select\(id\)\{([\s\S]*?)\n\}", PAGE).group(1)
     assert "scheduleRail()" in sel_body
+    # Mark aria-labels/tooltips come from the dictionary, keyed by card kind.
+    assert 't("rail.agent_message")' in PAGE
+    assert 't("rail.dispatched_message")' in PAGE
+    assert 't("rail.messages"' in PAGE
+
+
+# ---------- i18n: bundled en / zh-CN / zh-TW dictionaries ----------
+
+
+def _locales():
+    """Parse the embedded LOCALES dictionary. It is written as a
+    JSON-compatible literal (``const LOCALES=Object.freeze({...});``) so the
+    completeness contract can be checked without executing the page."""
+    m = re.search(r"const LOCALES=Object\.freeze\((\{[\s\S]*?\n\})\);", PAGE)
+    assert m, "LOCALES frozen dictionary missing"
+    return json.loads(m.group(1))
+
+
+def test_i18n_dictionaries_complete_and_identical():
+    locales = _locales()
+    assert set(locales) == {"en", "zh-CN", "zh-TW"}
+    keysets = {loc: set(d) for loc, d in locales.items()}
+    assert keysets["en"], "English dictionary must not be empty"
+    assert keysets["zh-CN"] == keysets["en"] == keysets["zh-TW"]
+    for d in locales.values():
+        for k, v in d.items():
+            assert isinstance(k, str) and k
+            if isinstance(v, dict):  # plural map
+                assert v and set(v) <= {"zero", "one", "two", "few", "many", "other"}
+                assert all(isinstance(x, str) and x for x in v.values())
+            else:
+                assert isinstance(v, str) and v
+
+
+def test_i18n_glossary_exactness():
+    loc = _locales()
+    en, zh, tw = loc["en"], loc["zh-CN"], loc["zh-TW"]
+    # Deliberate product translations — not machine-translation output.
+    assert zh["status.proc.running"] == "运行中" and tw["status.proc.running"] == "執行中"
+    assert zh["status.proc.ready"] == "就绪" and tw["status.proc.ready"] == "就緒"
+    assert zh["status.proc.idle"] == "空闲" and tw["status.proc.idle"] == "閒置"
+    assert zh["status.proc.done"] == "已完成" and tw["status.proc.done"] == "已完成"
+    assert zh["status.proc.failed"] == "失败" and tw["status.proc.failed"] == "失敗"
+    assert zh["transcript.dispatched_message"] == "已派发消息"
+    assert tw["transcript.dispatched_message"] == "已派發訊息"
+    assert zh["transcript.user_message"] == "用户消息"
+    assert tw["transcript.user_message"] == "使用者訊息"
+    assert zh["transcript.thinking"] == "思考中" and tw["transcript.thinking"] == "思考中"
+    assert zh["transcript.turn_ended"] == "回合已结束" and tw["transcript.turn_ended"] == "回合已結束"
+    assert zh["send.waiting_busy"] == "等待 Agent——会话正忙…"
+    assert tw["send.waiting_busy"] == "等待 Agent——工作階段忙碌中…"
+    assert zh["send.dispatched"] == "已派发" and tw["send.dispatched"] == "已派發"
+    assert zh["send.failed"] == "发送失败" and tw["send.failed"] == "傳送失敗"
+    assert zh["status.live"] == "实时" and tw["status.live"] == "即時"
+    assert zh["status.disconnected"] == "已断开" and tw["status.disconnected"] == "已中斷"
+    assert zh["empty.loading"] == "加载中…" and tw["empty.loading"] == "載入中…"
+    # "token" stays a technical term in every locale — never 令牌.
+    for d in (en, zh, tw):
+        assert "token" in d["tokens.run"].lower()
+        assert "令牌" not in json.dumps(d, ensure_ascii=False)
+    # Simplified and Traditional are separate dictionaries, not a conversion.
+    assert zh["transcript.user_message"] != tw["transcript.user_message"]
+    assert zh["a11y.sessions"] != tw["a11y.sessions"]
+    assert zh["status.proc.running"] != tw["status.proc.running"]
+
+
+def test_i18n_static_hooks_resolve():
+    locales = _locales()
+    hooks = set(re.findall(r'data-i18n(?:-[\w-]+)?="([^"]+)"', PAGE))
+    assert hooks, "no data-i18n hooks found"
+    for key in hooks:
+        for loc in ("en", "zh-CN", "zh-TW"):
+            assert key in locales[loc], f"{key} missing in {loc}"
+    for needle in (
+        'data-i18n="nav.subagents"',
+        'data-i18n="session.select"',
+        'data-i18n="nav.latest"',
+        'data-i18n="theme.label"',
+        'data-i18n="language.label"',
+        'data-i18n-aria-label="a11y.sessions"',
+        'data-i18n-aria-label="a11y.show_session_list"',
+        'data-i18n-aria-label="a11y.message_selected_session"',
+        'data-i18n-aria-label="a11y.send_message"',
+        'data-i18n-aria-label="rail.label"',
+        'data-i18n-placeholder="chat.placeholder.default"',
+        'data-i18n-title="theme.follow_system"',
+        'data-i18n-title="chat.send"',
+    ):
+        assert needle in PAGE
+
+
+def test_i18n_locale_selection_and_persistence():
+    for needle in (
+        '"ab-locale"',
+        "LOCALE_KEY",
+        "localePref",
+        "resolveSystemLocale",
+        "setLocalePref",
+        "applyLocale",
+        "rerenderLocale",
+        "languagechange",
+        '"storage"',
+        'id="langsel"',
+        'for="langsel"',
+        'value="system"',
+        'value="en"',
+        'value="zh-CN"',
+        'value="zh-TW"',
+        "简体中文",
+        "繁體中文",
+        "English",
+        "documentElement.lang",
+        "document.title",
+        "localStorage.getItem(LOCALE_KEY)",
+        "localStorage.setItem(LOCALE_KEY",
+    ):
+        assert needle in PAGE
+    # <html lang> is resolved pre-render by the head bootstrap.
+    head = PAGE.split("<style>")[0]
+    assert '"ab-locale"' in head and "navigator.languages" in head
+    assert "document.documentElement.lang" in head
+    # zh-Hant/TW/HK/MO -> zh-TW; zh/Hans/CN/SG/MY -> zh-CN; en-* -> en.
+    assert "hant|tw|hk|mo" in PAGE
+    assert 'LOCALE_PREFS=["system","en","zh-CN","zh-TW"]' in PAGE
+    # languagechange only matters while the preference stays "system".
+    assert 'langPref==="system"' in PAGE
+
+
+def test_i18n_locale_switch_rerenders_from_cache():
+    body = re.search(r"function rerenderLocale\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    # Stashed panes are locale-bound — dropped, then the pane is rebuilt from
+    # eventsCache (never a transcript refetch).
+    assert "dropPane" in body and "startReplay" in body and "eventsCache" in body
+    assert "lastSidebarSig" in body  # sidebar labels are baked into its DOM
+    assert "refreshComposer" in body  # send status re-renders from key+params
+    assert "scheduleRail" in body
+    assert "pollEvents" not in body and "fetch(" not in body
+
+
+def test_i18n_no_machine_translation_or_network():
+    lower = PAGE.lower()
+    for gone in ("googleapis", "translate_a", "client=gtx", "google translate", "gtx"):
+        assert gone not in lower
+    # translateY() in the rail is a CSS transform — all real fetches are
+    # same-origin relative URLs, so localization never leaves localhost.
+    assert not re.search(r'fetch\(\s*[`\'"]https?', PAGE)
+    # Localized strings stay plain text; untrusted/template interpolations in
+    # innerHTML keep passing through esc().
+    assert PAGE.count("esc(t(") >= 10
+
+
+def test_i18n_send_state_codes():
+    # The send status line stores {key, params, detail, final} — never
+    # rendered text — so a locale switch re-renders without network calls.
+    assert re.search(r"const sendState=\{\};.*\{name, key, params, detail, final\}", PAGE)
+    for needle in (
+        '"send.sending"',
+        '"send.queued"',
+        '"send.waiting_busy"',
+        '"send.waiting_owner"',
+        '"send.delivering"',
+        '"send.dispatched_task"',
+        '"send.failed"',
+        "SEND_ERR",
+        "sendErrState",
+        "sendKey(j)",
+        "renderSendStatus",
+        "refreshComposer",
+    ):
+        assert needle in PAGE
+    # error_code drives the localized label; the raw error survives only as
+    # tooltip detail.
+    assert "j.error_code" in PAGE and "st.detail" in PAGE
+    # No rendered-English storage from the old contract.
+    assert "sendState[sid].text" not in PAGE and "setChatStatus(" not in PAGE
 
 
 def _jsdom_available():
@@ -741,8 +927,10 @@ def test_events_normalized(dash):
     assert turn["task"] == "t1" and turn["stop_reason"] == "end_turn"
     err = j["events"][-1]
     assert err["t"] == "error" and "stalled once" in err["text"]
-    code, _ = _get(base + "/api/events?session=../evil&offset=0")
+    code, body = _get(base + "/api/events?session=../evil&offset=0")
     assert code == 400
+    j = json.loads(body)
+    assert j["error"] == "bad session" and j["error_code"] == "bad_session"
 
 
 def test_send_flow_and_status(dash):
@@ -773,6 +961,7 @@ def test_send_flow_and_status(dash):
     code, body = _get(base + f"/api/send_status?name={name}")
     j = json.loads(body)
     assert code == 404 and j["pending"] is False and j["state"] == "missing"
+    assert j["error_code"] == "missing"
     # A done record is returned verbatim and consumed.
     (home / "outbox" / "done").mkdir(exist_ok=True)
     done_payload = {"ok": True, "state": "dispatched", "task_id": "task_1", "session_id": "sess_1"}
@@ -786,9 +975,11 @@ def test_send_flow_and_status(dash):
     j = json.loads(body)
     assert code == 404 and j["state"] == "missing"
     code, body = _post(base + "/api/send", {"session": "nope", "text": "x"})
-    assert code == 404
+    assert code == 404 and json.loads(body)["error_code"] == "unknown_session"
     code, body = _post(base + "/api/send", {"session": "sess_1", "text": "  "})
-    assert code == 400
+    assert code == 400 and json.loads(body)["error_code"] == "empty_or_too_long"
+    code, body = _post(base + "/api/send", {"session": "bad id!", "text": "x"})
+    assert code == 400 and json.loads(body)["error_code"] == "bad_session"
 
 
 def test_presence_and_client_state(dash):
