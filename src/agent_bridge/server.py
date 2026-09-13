@@ -7,6 +7,7 @@ from typing import Any
 from mcp.server.mcpserver import Context, MCPServer
 from mcp_types import ToolAnnotations
 
+from agent_bridge.dashboard import maybe_open_dashboard
 from agent_bridge.logging_setup import setup_logging
 from agent_bridge.models import DEFAULT_WAIT_SEC
 from agent_bridge.paths import ensure_home
@@ -72,6 +73,7 @@ def _registry(ctx: Context) -> Registry:
     lifespan_ctx = ctx.request_context.lifespan_context
     if isinstance(lifespan_ctx, Registry):
         lifespan_ctx.touch_activity()
+        maybe_open_dashboard(lifespan_ctx.home, lifespan_ctx.config.dashboard)
         return lifespan_ctx
     raise RuntimeError("Agent Bridge registry is not available")
 

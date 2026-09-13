@@ -96,3 +96,14 @@ def bundled_dsh_cordis() -> Path:
         if candidate.is_file():
             return candidate
     return here.parent / "share" / "dsh-acp.cordis.yml"
+
+
+def bundled_dashboard() -> Path:
+    here = Path(__file__).resolve()
+    for candidate in (
+        here.parent / "share" / "dashboard.py",
+        here.parents[2] / "src" / "agent_bridge" / "share" / "dashboard.py",
+    ):
+        if candidate.is_file():
+            return candidate
+    return here.parent / "share" / "dashboard.py"

@@ -115,6 +115,19 @@ class ServerConfig(BaseModel):
     idle_exit_sec: int = 7200
 
 
+class DashboardConfig(BaseModel):
+    """Pop the local session dashboard up in a browser on MCP activity.
+
+    A browser tab counts as open while it heartbeats ``/api/presence``; Bridge
+    only opens a new tab when none has been seen recently. ``port`` must match
+    the port dashboard.py is serving (or will be launched with).
+    """
+
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = Field(default=8787, gt=0, le=65535)
+
+
 class QuotaConfig(BaseModel):
     """Remaining-quota lookup that rides along with ``list_agents``.
 
@@ -182,6 +195,7 @@ class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     coordinator: CoordinatorConfig = Field(default_factory=CoordinatorConfig)
     quota: QuotaConfig = Field(default_factory=QuotaConfig)
+    dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     warnings: list[str] = Field(default_factory=list)
 
     def get(self, name: str) -> AgentConfig:
@@ -260,6 +274,20 @@ def _coerce_server(raw: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "idle_exit_sec" in block and block["idle_exit_sec"] is not None:
         out["idle_exit_sec"] = int(block["idle_exit_sec"])
+    return out
+
+
+def _coerce_dashboard(raw: dict[str, Any]) -> dict[str, Any]:
+    block = raw.get("dashboard")
+    if not isinstance(block, dict):
+        return {}
+    out: dict[str, Any] = {}
+    if block.get("enabled") is not None:
+        out["enabled"] = bool(block["enabled"])
+    if block.get("host") is not None:
+        out["host"] = str(block["host"])
+    if block.get("port") is not None:
+        out["port"] = int(block["port"])
     return out
 
 
@@ -426,7 +454,7 @@ def load_config(home: Path | None = None) -> AppConfig:
             f"{overlay_path} is not valid TOML: {exc}. "
             "Fix or delete the file, then restart the Bridge."
         ) from exc
-    supported_sections = {"agents", "env", "server", "coordinator", "quota"}
+    supported_sections = {"agents", "env", "server", "coordinator", "quota", "dashboard"}
     unsupported = sorted(set(overlay_raw) - supported_sections)
     warnings = []
     if unsupported:
@@ -463,11 +491,15 @@ def load_config(home: Path | None = None) -> AppConfig:
     coord_raw["mode"] = normalize_coordinator_mode(coord_raw.get("mode"))
     coordinator = CoordinatorConfig.model_validate(coord_raw)
     quota = QuotaConfig.model_validate({**_coerce_quota(bundled_raw), **_coerce_quota(overlay_raw)})
+    dashboard = DashboardConfig.model_validate(
+        {**_coerce_dashboard(bundled_raw), **_coerce_dashboard(overlay_raw)}
+    )
     return AppConfig(
         agents=agents,
         env=env,
         server=server,
         coordinator=coordinator,
         quota=quota,
+        dashboard=dashboard,
         warnings=warnings,
     )
