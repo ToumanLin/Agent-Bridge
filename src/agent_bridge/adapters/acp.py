@@ -451,14 +451,20 @@ def _pick_permission_option(options: Iterable[PermissionOption]) -> PermissionOp
 
 
 class _BridgeClient:
-    def __init__(self, session_id: str, home: Path, agent: str = "") -> None:
+    def __init__(
+        self,
+        session_id: str,
+        home: Path,
+        agent: str = "",
+        prompt_usage_scope: str = "conversation",
+    ) -> None:
         self.session_id = session_id
         self.home = home
         self.text_parts: list[str] = []
         self.files: set[str] = set()
         self.usage: dict[str, Any] = {}
         self.tool_kinds: dict[str, str] = {}
-        self.run = RunUsage(agent)
+        self.run = RunUsage(agent, prompt_usage_scope=prompt_usage_scope)
         self._usage_emit: tuple | None = None
 
     def reset_turn(
@@ -466,13 +472,18 @@ class _BridgeClient:
         *,
         resumed: bool = False,
         conv_baseline: dict[str, Any] | None = None,
+        stream_baselines: dict[str, Any] | None = None,
     ) -> None:
         self.text_parts = []
         self.files = set()
         self.usage = {}
         self.tool_kinds = {}
         self._usage_emit = None
-        self.run.reset(resumed=resumed, conv_baseline=conv_baseline)
+        self.run.reset(
+            resumed=resumed,
+            conv_baseline=conv_baseline,
+            stream_baselines=stream_baselines,
+        )
 
     async def request_permission(
         self,
@@ -628,6 +639,12 @@ class _Live:
         self.proc: asyncio.subprocess.Process | None = None
         self.conn: Any = None
         self.client: _BridgeClient | None = None
+        # Set by ensure_session when it kept or revived a native conversation;
+        # False when session/new created one. run_turn reads it to decide
+        # whether usage counters resume or start fresh — the decision must
+        # follow ensure_session because a failed revive falls through to
+        # session/new.
+        self.conversation_continued = False
         self.stderr_task: asyncio.Task[None] | None = None
         self.stderr_tail = ""
         self.prompt_task: asyncio.Task[Any] | None = None
@@ -793,7 +810,12 @@ class AcpAdapter(Adapter):
             raise RuntimeError(f"{self.agent.name} did not expose stdio")
         live = _Live()
         live.proc = proc
-        live.client = _BridgeClient(session.session_id, self.home, self.agent.name)
+        live.client = _BridgeClient(
+            session.session_id,
+            self.home,
+            self.agent.name,
+            self.agent.prompt_usage_scope,
+        )
         live.conn = connect_to_agent(live.client, proc.stdin, proc.stdout)
         live.stderr_task = asyncio.create_task(
             self._drain_stderr(proc, session.session_id, live)
@@ -1353,6 +1375,7 @@ class AcpAdapter(Adapter):
                 await self.shutdown(session)
             else:
                 await self._sync_selection(live, session)
+                live.conversation_continued = True
                 return
         live = await self._spawn(session)
         native = session.native_session_id
@@ -1375,6 +1398,7 @@ class AcpAdapter(Adapter):
             else:
                 self._remember_config_options(live, revived)
                 await self._sync_selection(live, session)
+                live.conversation_continued = True
                 return
         created = await self._rpc(
             self._call_new_session(live.conn, session.cwd, self._new_session_meta(session)),
@@ -1382,6 +1406,7 @@ class AcpAdapter(Adapter):
             session,
         )
         session.native_session_id = created.session_id
+        live.conversation_continued = False
         self._remember_config_options(live, created)
         if self.agent.name == "grok":
             # Grok /new applies the _meta reasoningEffort but always lands on
@@ -1392,23 +1417,22 @@ class AcpAdapter(Adapter):
         await self._sync_selection(live, session)
 
     async def run_turn(self, session: Session, task: Task) -> TurnResult:
-        # A native session id / prior turn means this turn resumes a
-        # conversation — must be decided before ensure_session, which sets
-        # native_session_id even for a brand-new conversation.
-        resumed = bool(session.native_session_id) or session.turns > 0
         await self.ensure_session(session)
         live = self._live[session.session_id]
         assert live.conn is not None and live.client is not None
-        # The persisted baseline only applies to the same conversation; a
+        # resumed = the native conversation actually continued — kept live or
+        # revived. A failed revive falls through to session/new, so this must
+        # be decided after ensure_session, not from pre-existing session
+        # fields: a fresh conversation's first counters count in full.
+        resumed = live.conversation_continued
+        # The persisted baselines only apply to the same conversation; a
         # re-created native session must not delta against stale counters.
         base = session.usage_baseline
+        same_conversation = base.get("cid") == session.native_session_id
         live.client.reset_turn(
             resumed=resumed,
-            conv_baseline=(
-                base.get("counters")
-                if base.get("cid") == session.native_session_id
-                else None
-            ),
+            conv_baseline=base.get("counters") if same_conversation else None,
+            stream_baselines=base.get("streams") if same_conversation else None,
         )
         live.stderr_tail = ""
         warnings: list[str] = live.pending_warnings
@@ -1448,7 +1472,7 @@ class AcpAdapter(Adapter):
                 observed_model=live.applied_model,
                 observed_effort=live.applied_effort,
             )
-        except Exception:
+        except Exception as exc:
             if live.stderr_tail:
                 log.warning(
                     "%s prompt failed for %s stderr_tail=%r",
@@ -1456,15 +1480,40 @@ class AcpAdapter(Adapter):
                     session.session_id,
                     live.stderr_tail,
                 )
-            raise
+            # Keep whatever this turn consumed: partial run_usage lands on the
+            # failed task and the baselines still persist for the next run.
+            with contextlib.suppress(OSError):
+                append_event(
+                    session.session_id,
+                    "turn_end",
+                    {
+                        "stop_reason": "error",
+                        "task_id": task.task_id,
+                        "error": str(exc)[:500],
+                    },
+                    self.home,
+                )
+            return TurnResult(
+                text="".join(live.client.text_parts),
+                files_changed=sorted(live.client.files),
+                stop_reason="error",
+                usage=live.client.usage,
+                run_usage=self._finish_usage(session, live.client),
+                native_session_id=session.native_session_id,
+                error=str(exc) or type(exc).__name__,
+                warnings=warnings,
+                observed_model=live.applied_model,
+                observed_effort=live.applied_effort,
+            )
         finally:
             live.prompt_task = None
         stop = getattr(response, "stop_reason", None) or "end_turn"
         if hasattr(stop, "value"):
             stop = stop.value
         stop = str(stop)
-        # PromptResponse.usage is conversation-cumulative; the accumulator
-        # deltas it against the previous turn's snapshot as a fallback when no
+        # PromptResponse.usage means whatever this agent's prompt_usage_scope
+        # declares (per-turn or conversation-cumulative — the spec is
+        # ambiguous); the accumulator applies it as a fallback when no
         # UsageUpdate counters arrived (never double-counting stream data).
         response_usage = _dump(getattr(response, "usage", None))
         if isinstance(response_usage, dict):
@@ -1491,14 +1540,18 @@ class AcpAdapter(Adapter):
         )
 
     def _finish_usage(self, session: Session, client: _BridgeClient) -> dict[str, Any]:
-        """Final run_usage; persist the conversation baseline so the next
-        turn's delta is attributable even across a bridge restart."""
+        """Final run_usage; persist the conversation + per-stream baselines so
+        the next turn's delta is attributable even across a bridge restart or
+        a worker respawn (UsageUpdate counters may be conversation- or even
+        process-cumulative)."""
         run_usage = client.run.finish()
         baseline = client.run.conversation_baseline
-        if baseline:
+        streams = client.run.stream_baselines
+        if baseline or streams:
             session.usage_baseline = {
                 "cid": session.native_session_id,
                 "counters": baseline,
+                "streams": streams,
             }
         return run_usage
 

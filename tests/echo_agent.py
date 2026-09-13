@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import os
+from pathlib import Path
 from typing import Any
 
 from acp import run_agent, update_agent_message_text
@@ -74,8 +77,35 @@ class EchoAgent:
         return NewSessionResponse(session_id=self._session_id)
 
     async def load_session(self, cwd: str, session_id: str, mcp_servers=None, **kwargs: Any) -> None:
+        # ECHO_FAIL_LOAD simulates a worker that cannot reload a persisted
+        # native session: the bridge must fall through to session/new and
+        # treat the turn as a fresh conversation.
+        if os.environ.get("ECHO_FAIL_LOAD"):
+            raise RuntimeError("echo load_session failed")
         self._session_id = session_id
         return None
+
+    def _turn(self, session_id: str) -> int:
+        """This prompt's turn index.
+
+        ECHO_USAGE_STATE points at a JSON file carrying the counter across a
+        worker respawn — like a provider whose UsageUpdate counters are
+        conversation-cumulative no matter which process answers.
+        """
+        path = os.environ.get("ECHO_USAGE_STATE")
+        if path:
+            try:
+                return int(json.loads(Path(path).read_text(encoding="utf-8")).get("turn", 0))
+            except (OSError, ValueError, TypeError):
+                pass
+        return self._turns.get(session_id, 0)
+
+    def _save_turn(self, session_id: str, turn: int) -> None:
+        self._turns[session_id] = turn + 1
+        path = os.environ.get("ECHO_USAGE_STATE")
+        if path:
+            with contextlib.suppress(OSError):
+                Path(path).write_text(json.dumps({"turn": turn + 1}), encoding="utf-8")
 
     async def prompt(self, session_id: str, prompt: list[Any], **kwargs: Any) -> PromptResponse:
         text = ""
@@ -96,13 +126,17 @@ class EchoAgent:
                     session_id,
                     update_agent_message_text(f"echo:{text}"),
                 )
-            turn = self._turns.get(session_id, 0)
-            self._turns[session_id] = turn + 1
+            turn = self._turn(session_id)
+            self._save_turn(session_id, turn)
             for update in _usage_updates(turn):
                 try:
                     await self._conn.session_update(session_id=session_id, update=update)
                 except TypeError:
                     await self._conn.session_update(session_id, update)
+        # ECHO_FAIL_PROMPT fails the turn after the usage updates landed —
+        # the bridge must keep the partial run_usage on the failed task.
+        if os.environ.get("ECHO_FAIL_PROMPT"):
+            raise RuntimeError("echo prompt exploded")
         return PromptResponse(
             stop_reason="end_turn",
             usage=Usage(total_tokens=3, input_tokens=1, output_tokens=2),

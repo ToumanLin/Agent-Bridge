@@ -44,6 +44,11 @@ const html = (() => {
   return m[1];
 })();
 
+// The rail's mark taxonomy lives in exactly one place — the page's MARK_SEL
+// constant — so the rail invariant below reads it back out of the loaded
+// page rather than keeping a second copy that could silently drift.
+const MARK_SEL = (html.match(/const MARK_SEL="([^"]+)"/) || [])[1] || null;
+
 /* ---------- synthetic streams (deterministic, no real transcript data) ---------- */
 function synthPathological() {
   // One giant single-block chunk stream + tail — the O(chunks x block) killer.
@@ -260,11 +265,12 @@ async function waitStable() {
   const coldMs = performance.now() - t;
   const expected = streams.find((s) => s.id === coldId).stream.events.length;
   // Nav rail: jsdom has no layout metrics, so layoutRail takes the
-  // unclustered fallback — one .mark button per markable card. This also
-  // cross-checks the classList markable predicate against MARK_SEL.
+  // unclustered fallback — one .mark button per card matching MARK_SEL. This
+  // cross-checks the live rail against the selector the page actually applies.
   const markCount = () => w.document.querySelectorAll("#rail .mark").length;
-  const cardCount = () => w.document.querySelectorAll(
-    "#content .block.card.msg,#content .block.card.prompt:not(.user)").length;
+  const cardCount = () => MARK_SEL
+    ? w.document.querySelector("#content").querySelectorAll(MARK_SEL).length
+    : markCount();
   const railShown = () => !w.document.querySelector("#rail").hidden;
   results.push({
     session: coldId, events: expected, elements: nodes,

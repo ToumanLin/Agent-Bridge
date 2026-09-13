@@ -94,7 +94,9 @@ class Session(BaseModel):
     title: str | None = None
     turns: int = 0
     # Persisted conversation-cumulative usage counters so a resumed session can
-    # attribute only this run's delta (agy / ACP PromptResponse fallback).
+    # attribute only this run's delta: "counters" for agy / ACP PromptResponse
+    # snapshots, "streams" for per-stream UsageUpdate counters that must survive
+    # a worker respawn or bridge restart. Keyed to the native conversation id.
     usage_baseline: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=iso)
     last_active_at: str = Field(default_factory=iso)
@@ -118,8 +120,18 @@ class Task(BaseModel):
     status: TaskStatus = TaskStatus.queued
     stop_reason: str | None = None
     # Origin of the dispatch: "dashboard" for messages sent from the web UI
-    # outbox, None for ordinary MCP dispatches. Surfaced on prompt_sent events.
+    # outbox, "resume" for a resume_task continuation, None for ordinary MCP
+    # dispatches. Surfaced on prompt_sent events.
     source: str | None = None
+    # pause_task ended this task's turn: the row stays terminal (cancelled,
+    # stop_reason "paused") and resumable via resume_task on the same session.
+    paused: bool = False
+    # Audit links between a paused/interrupted task and its continuation:
+    # resume_of points back at the task this one continues; resumed_by points
+    # forward at the latest continuation task. The old row is never rewritten
+    # into the new one.
+    resume_of: str | None = None
+    resumed_by: str | None = None
     result_text: str = ""
     result_chars: int = 0
     files_changed: list[str] = Field(default_factory=list)

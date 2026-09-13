@@ -61,11 +61,15 @@ INSTRUCTIONS = (
     "alone cannot establish the shared status. If "
     "dispatch_enabled is false, this Bridge was inherited inside a worker "
     "process — do not call dispatch_task, set_preferences, cancel_task, "
-    "or end_session. When "
+    "end_session, pause_task, or resume_task. When "
     "dispatch_enabled is true and the user states a lasting preference, "
     "persist it with set_preferences. A task another live Bridge instance "
     "owns shows remote: true in list_tasks / check_task / wait_task — it is "
-    "read-only here; keep polling it, never cancel or re-dispatch it."
+    "read-only here; keep polling it, never cancel or re-dispatch it. "
+    "pause_task(task_id) ends a turn gracefully and keeps it resumable "
+    "(partial result and transcript are preserved); resume_task(task_id) "
+    "continues it later on the same conversation — including after a "
+    "coordinator restart, where a dead owner's session is adopted."
 )
 
 mcp = MCPServer[Registry]("agent-bridge", instructions=INSTRUCTIONS, lifespan=lifespan)
@@ -128,7 +132,7 @@ async def dispatch_task(
     user_requested: bool = False,
     request_id: str | None = None,
 ) -> dict[str, Any]:
-    """Start a worker turn. cwd is this coordinator conversation's project (absolute). model/effort are optional coordinator choices (agy: --model/--effort/--new-project; grok: session/setModel after /new; kimi/cursor/opencode/claude/devin: session/set_config_option after new/resume, devin has no effort; dsh: legacy demo spawn env + respawn on change, native --profile acp session/set_config_option; codex: exec -m / -c model_reasoning_effort, off->none). Pass session_id to continue. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false, even with user_requested=true. For optional retry deduplication, supply a UUID request_id on the first call and replay the same ID and original arguments on retries; keep session_id omitted if it was originally omitted. Adding an ID only on retry cannot deduplicate the first call. Identical retries reuse the task in this Bridge instance while it is retained; different arguments are rejected. Normal dispatch validation still applies. Bindings are lost on restart and are not shared with other instances — after a coordinator restart, rediscover a still-running task through list_tasks / check_task (remote: true) instead of re-dispatching it. Returns immediately."""
+    """Start a worker turn. cwd is this coordinator conversation's project (absolute). model/effort are optional coordinator choices (agy: --model/--effort/--new-project; grok: session/setModel after /new; kimi/cursor/opencode/claude/devin: session/set_config_option after new/resume, devin has no effort; dsh: legacy demo spawn env + respawn on change, native --profile acp session/set_config_option; codex: exec -m / -c model_reasoning_effort, off->none). Pass session_id to continue — a session whose owning Bridge died is adopted first, its orphaned worker reaped before a replacement spawns. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false, even with user_requested=true. For optional retry deduplication, supply a UUID request_id on the first call and replay the same ID and original arguments on retries; keep session_id omitted if it was originally omitted. Adding an ID only on retry cannot deduplicate the first call. Identical retries reuse the task in this Bridge instance while it is retained; different arguments are rejected. Normal dispatch validation still applies. Bindings are lost on restart and are not shared with other instances — after a coordinator restart, rediscover a still-running task through list_tasks / check_task (remote: true) instead of re-dispatching it. Returns immediately."""
     try:
         result = await _registry(ctx).dispatch_task(
             agent=agent,
@@ -158,7 +162,7 @@ async def wait_task(ctx: Context, task_id: str, timeout_sec: float = DEFAULT_WAI
 
 @mcp.tool(annotations=READ_ONLY)
 async def check_task(ctx: Context, task_id: str) -> dict[str, Any]:
-    """Non-blocking status, elapsed time, and recent activity for a task. files_changed is capped at 200 paths; files_changed_total carries the real count. silent_for_sec is the time since the worker's last output; Bridge fails the task with stop_reason "stalled" once it passes stall_timeout_sec. With server.remote_tasks on (default), a task owned by another live Bridge instance sharing this data directory resolves as remote: true with owner {pid, create_time, alive} instead of "unknown task"; owner_lost: true means its owner died mid-run. Remote tasks are read-only — only the owning instance runs or cancels them."""
+    """Non-blocking status, elapsed time, and recent activity for a task. files_changed is capped at 200 paths; files_changed_total carries the real count. silent_for_sec is the time since the worker's last output; Bridge fails the task with stop_reason "stalled" once it passes stall_timeout_sec. With server.remote_tasks on (default), a task owned by another live Bridge instance sharing this data directory resolves as remote: true with owner {pid, create_time, alive} instead of "unknown task"; owner_lost: true means its owner died mid-run. Remote tasks are read-only — only the owning instance runs or cancels them. Payloads also carry paused / resumable / resume_hint: resumable means the turn ended unfinished and resume_task can continue it on the same conversation (adopting it first when the owner died)."""
     try:
         return {"ok": True, **_registry(ctx).check_task(task_id)}
     except Exception as exc:
@@ -203,9 +207,30 @@ async def get_transcript(
 
 @mcp.tool()
 async def cancel_task(ctx: Context, task_id: str) -> dict[str, Any]:
-    """Cancel an in-flight worker turn. ACP sessions are cancelled; agy processes are killed. A remote (sibling-owned) task cannot be cancelled here — only its owning instance can. Rejected when coordinator.dispatch_enabled is false."""
+    """Cancel an in-flight worker turn. ACP sessions are cancelled; agy processes are killed. A remote (sibling-owned) task cannot be cancelled while its owner lives — but a dead owner's task is adopted, its orphaned worker reaped, and the row finalized as failed/bridge_restarted. Prefer pause_task when the work should stay resumable. Rejected when coordinator.dispatch_enabled is false."""
     try:
         return {"ok": True, **await _registry(ctx).cancel_task(task_id)}
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool()
+async def pause_task(ctx: Context, task_id: str) -> dict[str, Any]:
+    """Pause a queued/running task: the worker turn is cancelled gracefully — partial output, usage, transcript, and the native session are preserved — and the task ends terminal with status "cancelled", stop_reason "paused", paused=true, resumable=true. This is NOT frozen execution: the turn ends for real and cannot restart mid-flight. resume_task(task_id) continues the work later as a new task on the same conversation. Pausing an already-paused task is a no-op. A remote (sibling-owned) task cannot be paused here — only its owner can. Rejected when coordinator.dispatch_enabled is false."""
+    try:
+        return {"ok": True, **await _registry(ctx).pause_task(task_id)}
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool()
+async def resume_task(ctx: Context, task_id: str, message: str | None = None, request_id: str | None = None) -> dict[str, Any]:
+    """Continue an unfinished task's work as a NEW task on the same session/native conversation. Accepts paused, cancelled, and failed tasks — including a dead owner's row after a coordinator restart or a sibling's death: the session is adopted and its orphaned worker is reaped before a replacement spawns. The original task row stays final and auditable — never rewritten — gaining resumed_by, while the new task carries resume_of and source="resume". message is optional; when omitted a safe explicit "pick up the paused work" continuation prompt is sent. request_id is an optional UUID for retry deduplication, same semantics as dispatch_task. Running tasks are rejected (pause_task or wait first), completed tasks too (dispatch_task with session_id sends a follow-up), and a task owned by a live sibling Bridge is rejected — only its owner can resume it. Rejected when coordinator.dispatch_enabled is false."""
+    try:
+        return {
+            "ok": True,
+            **await _registry(ctx).resume_task(task_id, message=message, request_id=request_id),
+        }
     except Exception as exc:
         return _error(exc)
 
@@ -230,7 +255,7 @@ async def list_sessions(ctx: Context, active_only: bool = False) -> dict[str, An
 
 @mcp.tool()
 async def end_session(ctx: Context, session_id: str) -> dict[str, Any]:
-    """Shut down a worker session process and mark it dead. Rejected when coordinator.dispatch_enabled is false."""
+    """Shut down a worker session process and mark it dead. A session whose owning Bridge died is adopted first — its orphaned worker is reaped; a live sibling's session is rejected. Rejected when coordinator.dispatch_enabled is false."""
     try:
         return {"ok": True, **await _registry(ctx).end_session(session_id)}
     except Exception as exc:

@@ -177,13 +177,22 @@ PAGE = r"""<!DOCTYPE html>
 <script>try{var p=localStorage.getItem("ab-theme");
 document.documentElement.setAttribute("data-theme",
   p==="light"||p==="dark"?p:(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"))}catch(e){}
+/* Locale bootstrap: keep this resolver in sync with resolveSystemLocale() in
+   the body script — it runs pre-render so <html lang> is right before first
+   paint. The title map mirrors LOCALES[...]["app.title"]. For non-English
+   locales the data-i18n fallback text is English, so [data-i18n] elements
+   stay invisible until applyStatic() localizes them; the timeout failsafe
+   reveals the fallback if the body script never runs. */
 try{var _l=localStorage.getItem("ab-locale"),_lang="en";
 if(_l==="en"||_l==="zh-CN"||_l==="zh-TW")_lang=_l;
 else{var _ls=(navigator.languages&&navigator.languages.length?navigator.languages:[navigator.language])||[];
 for(var _i=0;_i<_ls.length;_i++){var _t=String(_ls[_i]||"").toLowerCase();
 if(/^zh/.test(_t)){_lang=/hant|tw|hk|mo/.test(_t)?"zh-TW":"zh-CN";break}
 if(/^en/.test(_t)){_lang="en";break}}}
-document.documentElement.lang=_lang}catch(e){}</script>
+document.documentElement.lang=_lang;
+document.title={en:"Agent Bridge Dashboard","zh-CN":"Agent Bridge 仪表板","zh-TW":"Agent Bridge 儀表板"}[_lang];
+if(_lang!=="en"){document.documentElement.setAttribute("data-i18n-pending","");
+setTimeout(function(){document.documentElement.removeAttribute("data-i18n-pending")},1500)}}catch(e){}</script>
 <style>
 :root{
   color-scheme:light;
@@ -319,7 +328,10 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
   background:var(--border)}
 .mark{position:absolute;top:0;left:4px;width:10px;min-height:3px;padding:0;
   border:0;border-radius:2px;background:var(--dimmer);opacity:.65;cursor:pointer}
-.mark::after{content:"";position:absolute;inset:-5px -4px}
+/* Hit zone: unclustered marks keep >=3px between pill edges (MARK_GAP tops
+   stay >=6 apart), so 1.5px of vertical expansion fills the gap exactly —
+   adjacent hit zones can touch but can never overlap. */
+.mark::after{content:"";position:absolute;inset:-1.5px -4px}
 .mark:hover{opacity:1}
 .mark.cur{background:var(--accent);opacity:1}
 .mark:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
@@ -415,6 +427,9 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
   display:inline-block;background:none;border:none;padding:0}
 .expand:focus-visible{outline:2px solid var(--accent)}
 #backdrop{display:none}
+/* While a non-English locale is pending, hide the English fallback text in
+   data-i18n elements (visibility only — no layout shift). */
+html[data-i18n-pending] [data-i18n]{visibility:hidden}
 @media (max-width:900px){
   #menubtn{display:flex}
   #sidebar{position:fixed;top:0;left:0;bottom:0;width:min(320px,85vw);z-index:40;
@@ -427,7 +442,7 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
   #content{padding:14px 16px}
   #chatbar{padding:10px 16px}
   #rail{width:14px}
-  .mark{left:2px;width:8px}
+  .mark{left:3px;width:8px}
 }
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
@@ -593,11 +608,15 @@ const LOCALES=Object.freeze({
 "send.err_empty_or_too_long":"message empty or too long",
 "send.err_bad_session":"bad session",
 "send.err_bad_request":"bad request",
+"send.err_invalid_record":"invalid queued message",
+"send.err_dispatch_failed":"dispatch failed",
+"send.err_dispatch_error":"dispatch error",
 "transcript.user_message":"User Message",
 "transcript.dispatched_message":"Dispatched Message",
 "transcript.agent":"Agent",
 "transcript.thinking":"Thinking",
 "transcript.thinking_words":"Thinking · {n} words",
+"transcript.thinking_chars":"Thinking · {n} chars",
 "transcript.show_more":"show more",
 "transcript.turn_ended":"turn ended",
 "transcript.error":"error",
@@ -614,6 +633,7 @@ const LOCALES=Object.freeze({
 "tool.status.error":"error",
 "stop.stalled":"stalled",
 "stop.cancelled":"cancelled",
+"stop.paused":"paused",
 "stop.error":"error",
 "time.dur_sec":"{n}s",
 "time.dur_min_sec":"{m}m {s}s",
@@ -633,7 +653,8 @@ const LOCALES=Object.freeze({
 "tokens.context":"context {n}",
 "tokens.conversation":"conversation {n}",
 "tokens.live":"live",
-"tokens.estimate":"estimate"
+"tokens.estimate":"estimate",
+"tokens.unit":"tok"
 },
 "zh-CN":{
 "app.title":"Agent Bridge 仪表板",
@@ -688,11 +709,15 @@ const LOCALES=Object.freeze({
 "send.err_empty_or_too_long":"消息为空或过长",
 "send.err_bad_session":"无效会话",
 "send.err_bad_request":"无效请求",
+"send.err_invalid_record":"无效的队列消息",
+"send.err_dispatch_failed":"派发失败",
+"send.err_dispatch_error":"派发错误",
 "transcript.user_message":"用户消息",
 "transcript.dispatched_message":"已派发消息",
 "transcript.agent":"Agent 消息",
 "transcript.thinking":"思考中",
 "transcript.thinking_words":"思考中 · {n} 词",
+"transcript.thinking_chars":"思考中 · {n} 字",
 "transcript.show_more":"显示更多",
 "transcript.turn_ended":"回合已结束",
 "transcript.error":"错误",
@@ -709,6 +734,7 @@ const LOCALES=Object.freeze({
 "tool.status.error":"错误",
 "stop.stalled":"已停滞",
 "stop.cancelled":"已取消",
+"stop.paused":"已暂停",
 "stop.error":"错误",
 "time.dur_sec":"{n} 秒",
 "time.dur_min_sec":"{m} 分 {s} 秒",
@@ -728,7 +754,8 @@ const LOCALES=Object.freeze({
 "tokens.context":"上下文 {n}",
 "tokens.conversation":"会话累计 {n}",
 "tokens.live":"实时",
-"tokens.estimate":"估算"
+"tokens.estimate":"估算",
+"tokens.unit":"token"
 },
 "zh-TW":{
 "app.title":"Agent Bridge 儀表板",
@@ -783,11 +810,15 @@ const LOCALES=Object.freeze({
 "send.err_empty_or_too_long":"訊息為空或過長",
 "send.err_bad_session":"無效工作階段",
 "send.err_bad_request":"無效請求",
+"send.err_invalid_record":"無效的佇列訊息",
+"send.err_dispatch_failed":"派發失敗",
+"send.err_dispatch_error":"派發錯誤",
 "transcript.user_message":"使用者訊息",
 "transcript.dispatched_message":"已派發訊息",
 "transcript.agent":"Agent 訊息",
 "transcript.thinking":"思考中",
 "transcript.thinking_words":"思考中 · {n} 詞",
+"transcript.thinking_chars":"思考中 · {n} 字",
 "transcript.show_more":"顯示更多",
 "transcript.turn_ended":"回合已結束",
 "transcript.error":"錯誤",
@@ -804,6 +835,7 @@ const LOCALES=Object.freeze({
 "tool.status.error":"錯誤",
 "stop.stalled":"已停滯",
 "stop.cancelled":"已取消",
+"stop.paused":"已暫停",
 "stop.error":"錯誤",
 "time.dur_sec":"{n} 秒",
 "time.dur_min_sec":"{m} 分 {s} 秒",
@@ -816,14 +848,15 @@ const LOCALES=Object.freeze({
 "time.ago_hour":"{n} 小時前",
 "time.ago_day":"{n} 天前",
 "tokens.run":"執行 token {n}",
-"tokens.ctx_only":"內容使用量 ~{n}——僅為最近快照，不是單次執行總量",
+"tokens.ctx_only":"上下文佔用 ~{n}——僅為最近快照，不是單次執行總量",
 "tokens.in":"輸入 {n}",
 "tokens.cached":"已快取 {n}",
 "tokens.out":"輸出 {n}",
 "tokens.context":"上下文 {n}",
 "tokens.conversation":"工作階段累計 {n}",
 "tokens.live":"即時",
-"tokens.estimate":"估算"
+"tokens.estimate":"估算",
+"tokens.unit":"token"
 }
 });
 const LOCALE_KEY="ab-locale";
@@ -833,7 +866,9 @@ function localePref(){
     return LOCALE_PREFS.includes(p)?p:"system"}catch(e){return"system"}
 }
 /* zh-Hant/TW/HK/MO -> zh-TW; zh/Hans/CN/SG/MY -> zh-CN; en-* -> en;
-   anything else -> en. First recognized tag in preference order wins. */
+   anything else -> en. First recognized tag in preference order wins.
+   The head bootstrap mirrors this so <html lang> is right pre-render —
+   keep both copies in sync. */
 function resolveSystemLocale(){
   let ls=[];
   try{ls=navigator.languages&&navigator.languages.length?[...navigator.languages]
@@ -865,13 +900,19 @@ function t(key,params){
     params&&params[k]!=null?String(params[k]):s);
 }
 const fmtNum=v=>{try{return Number(v).toLocaleString(locale)}catch(e){return String(v)}};
-const fmtTs=v=>{try{return new Date(v).toLocaleTimeString(locale)}catch(e){
-  try{return new Date(v).toLocaleTimeString()}catch(e2){return""}}};
-const ago=v=>{const s=(Date.now()-new Date(v))/1e3;
-  if(s<60)return t("time.ago_sec",{n:Math.floor(s)});
-  if(s<3600)return t("time.ago_min",{n:Math.floor(s/60)});
-  if(s<86400)return t("time.ago_hour",{n:Math.floor(s/3600)});
-  return t("time.ago_day",{n:Math.floor(s/86400)})};
+/* Missing/unparseable timestamps render nothing — never an English
+   "Invalid Date" or a NaN count like "NaN 天前". */
+const fmtTs=v=>{if(v==null)return"";
+  const d=new Date(v);if(!Number.isFinite(+d))return"";
+  try{return d.toLocaleTimeString(locale)}catch(e){
+  try{return d.toLocaleTimeString()}catch(e2){return""}}};
+const ago=v=>{if(v==null)return"";
+  const s=(Date.now()-new Date(v))/1e3;if(!Number.isFinite(s))return"";
+  const c=Math.max(0,s);                  // future ts (clock skew) -> "0s ago"
+  if(c<60)return t("time.ago_sec",{n:Math.floor(c)});
+  if(c<3600)return t("time.ago_min",{n:Math.floor(c/60)});
+  if(c<86400)return t("time.ago_hour",{n:Math.floor(c/3600)});
+  return t("time.ago_day",{n:Math.floor(c/86400)})};
 function applyStatic(){
   document.querySelectorAll("[data-i18n]").forEach(el=>{
     el.textContent=t(el.dataset.i18n)});
@@ -881,6 +922,7 @@ function applyStatic(){
     el.setAttribute("aria-label",t(el.dataset.i18nAriaLabel))});
   document.querySelectorAll("[data-i18n-placeholder]").forEach(el=>{
     el.setAttribute("placeholder",t(el.dataset.i18nPlaceholder))});
+  document.documentElement.removeAttribute("data-i18n-pending");
 }
 
 /* ---------- inline icons (showcase-style: stroke 24x24, filled glyphs, brand marks) ---------- */
@@ -993,11 +1035,11 @@ function latestTask(sid){
   // resolve to the later array index — so all-legacy lists still return the
   // last appended task.
   let best=null,bestTs=-Infinity,bestIdx=-1;
-  tasks.forEach((t,i)=>{
-    if(t.session_id!==sid)return;
-    const ts=Date.parse(t.created_at);
+  tasks.forEach((tk,i)=>{
+    if(tk.session_id!==sid)return;
+    const ts=Date.parse(tk.created_at);
     const v=Number.isFinite(ts)?ts:-Infinity;
-    if(v>bestTs||(v===bestTs&&i>bestIdx)){best=t;bestTs=v;bestIdx=i}
+    if(v>bestTs||(v===bestTs&&i>bestIdx)){best=tk;bestTs=v;bestIdx=i}
   });
   return best;
 }
@@ -1033,12 +1075,12 @@ const fmtDur=ms=>{
   if(m<60)return rs?t("time.dur_min_sec",{m,s:rs}):t("time.dur_min",{m});
   const h=Math.floor(m/60),rm=m%60;
   return rm?t("time.dur_hour_min",{h,m:rm}):t("time.dur_hour",{h})};
-function taskDur(t){
-  if(!t)return null;
-  const start=Date.parse(t.started_at);
+function taskDur(tk){
+  if(!tk)return null;
+  const start=Date.parse(tk.started_at);
   if(!Number.isFinite(start))return null;
-  if(t.status==="queued"||t.status==="running")return{start,end:null};
-  const end=Date.parse(t.finished_at);
+  if(tk.status==="queued"||tk.status==="running")return{start,end:null};
+  const end=Date.parse(tk.finished_at);
   if(!Number.isFinite(end))return null;
   return{start,end};
 }
@@ -1046,9 +1088,9 @@ function durText(d){
   const s=fmtDur((d.end===null?Date.now():d.end)-d.start);
   return s?" · "+s:"";
 }
-function durSpan(t,cls){
-  const d=taskDur(t);if(!d)return"";
-  return `<span class="${cls}" data-tid="${esc(t.task_id)}">${durText(d)}</span>`;
+function durSpan(tk,cls){
+  const d=taskDur(tk);if(!d)return"";
+  return `<span class="${cls}" data-tid="${esc(tk.task_id)}">${durText(d)}</span>`;
 }
 
 /* ---------- task token usage (latest task only) ----------
@@ -1129,20 +1171,20 @@ function tokTitle(o){
    is authoritative — when it has no computable run total (estimate without
    counters) nothing renders rather than showing the conversation total.
    Old state falls back to raw `usage`, always marked as an estimate. */
-function tokSpan(t,cls,live){
+function tokSpan(tk,cls,live){
   let info=null,isLive=false,ctxOnly=false;
-  if(t&&(t.status==="running"||t.status==="queued")&&live){
+  if(tk&&(tk.status==="running"||tk.status==="queued")&&live){
     info=runTok(live);isLive=!!info;
   }
-  const hasRun=t&&t.run_usage&&Object.keys(t.run_usage).length>0;
-  if(!info&&hasRun)info=runTok(t.run_usage);
-  if(!info&&!hasRun&&t&&t.usage&&typeof t.usage==="object"){
-    const m=tokCount(t.usage);
+  const hasRun=tk&&tk.run_usage&&Object.keys(tk.run_usage).length>0;
+  if(!info&&hasRun)info=runTok(tk.run_usage);
+  if(!info&&!hasRun&&tk&&tk.usage&&typeof tk.usage==="object"){
+    const m=tokCount(tk.usage);
     if(m!==null){
-      const n=usageNums(t.usage);
-      ctxOnly=n.input===null&&n.output===null&&t.usage.total===undefined&&
-        t.usage.total_tokens===undefined&&t.usage.totalTokens===undefined&&
-        !(t.usage._meta&&t.usage._meta["cognition.ai/totalTokens"]!==undefined);
+      const n=usageNums(tk.usage);
+      ctxOnly=n.input===null&&n.output===null&&tk.usage.total===undefined&&
+        tk.usage.total_tokens===undefined&&tk.usage.totalTokens===undefined&&
+        !(tk.usage._meta&&tk.usage._meta["cognition.ai/totalTokens"]!==undefined);
       info={total:m,input:n.input,cached:n.cached,output:n.output,
         used:n.used,size:n.size,quality:"estimate"};
     }
@@ -1151,7 +1193,7 @@ function tokSpan(t,cls,live){
   const s=fmtTok(info.total);if(!s)return"";
   const est=info.quality==="estimate";
   const title=tokTitle({...info,live:isLive,estimate:est,ctxOnly});
-  return `<span class="${cls}" title="${esc(title)}" aria-label="${esc(title)}"> · ${est?"~":""}${s} tok</span>`;
+  return `<span class="${cls}" title="${esc(title)}" aria-label="${esc(title)}"> · ${est?"~":""}${s} ${t("tokens.unit")}</span>`;
 }
 function tickDurations(){
   document.querySelectorAll("[data-tid]").forEach(el=>{
@@ -1216,6 +1258,7 @@ function renderSessionHeader(){
   const st=statusOf(s);
   const tk=latestTask(s.session_id);
   const repo=baseName(s.cwd);
+  const agoStr=s.last_active_at?ago(s.last_active_at):"";
   el.innerHTML=`<div class="avatar">${agentAvatar(s,26)}</div>
     <div class="hbody">
       <h2 class="htitle">${esc(s.title||s.session_id)}</h2>
@@ -1226,7 +1269,7 @@ function renderSessionHeader(){
         ${repo?`<span class="hsep">|</span><span class="hrepo" title="${esc(s.cwd||"")}">${esc(t("session.working_repo",{repo}))}</span>`:""}
       </div>
     </div>
-    <div class="hmeta">${esc(t("session.turns",{n:s.turns??0}))}${s.last_active_at?" · "+ago(s.last_active_at):""}</div>`;
+    <div class="hmeta">${esc(t("session.turns",{n:s.turns??0}))}${agoStr?" · "+esc(agoStr):""}</div>`;
 }
 
 /* ---------- conversation rendering ---------- */
@@ -1241,12 +1284,21 @@ let replaying=null;             // session id whose replay is painting the live 
 const replayGen={};             // id -> replay generation token (abort stamp, per session)
 const rendered={};          // id -> count of eventsCache[id] entries already in the DOM
 
+/* Whitespace-split word counts mislead for space-less scripts: when the text
+   is predominantly CJK the fold label counts characters instead. English and
+   other space-separated text keep the plain word count. */
+const CJK_RE=/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]/g;
+function thinkLabel(s){
+  const words=s.split(/\s+/).filter(Boolean).length;
+  const cjk=(s.match(CJK_RE)||[]).length;
+  return cjk>words?t("transcript.thinking_chars",{n:(s.match(/\S/g)||[]).length})
+    :t("transcript.thinking_words",{n:words});
+}
 function flushBlocks(){
   for(const b of dirty){
     if(b.tagName==="DETAILS"){
       b.querySelector(".body").textContent=b._text;
-      b.querySelector(".tlabel").textContent=
-        t("transcript.thinking_words",{n:b._text.split(/\s+/).filter(Boolean).length});
+      b.querySelector(".tlabel").textContent=thinkLabel(b._text);
     }else b.querySelector(".msg-body").innerHTML=md(b._text);
   }
   dirty.clear();
@@ -1328,7 +1380,8 @@ function addToolStatus(e){
     :esc(e.status);
   if(e.status!=="in_progress"&&r.start){
     const s=(new Date(e.ts)-new Date(r.start))/1000;
-    r.el.querySelector(".dur").textContent=s>=1?t("time.dur_sec",{n:s.toFixed(1)}):t("time.dur_ms",{n:Math.round(s*1000)});
+    if(Number.isFinite(s))
+      r.el.querySelector(".dur").textContent=s>=1?t("time.dur_sec",{n:s.toFixed(1)}):t("time.dur_ms",{n:Math.round(s*1000)});
   }
 }
 /* Turn duration: join on the task row via task_id (started_at→finished_at is
@@ -1348,7 +1401,7 @@ function turnDurMs(e,promptTs){
   return Number.isFinite(a)&&Number.isFinite(b)?a-b:null;
 }
 /* Known stop reasons localize; provider-specific values stay raw. */
-const STOP_REASONS={stalled:1,cancelled:1,error:1};
+const STOP_REASONS={stalled:1,cancelled:1,paused:1,error:1};
 function stopReasonLabel(r){return STOP_REASONS[r]?t("stop."+r):String(r)}
 function addTurn(e){
   closeBlocks();
@@ -1369,7 +1422,8 @@ function addTurn(e){
 function addErr(e){
   closeBlocks();
   const d=document.createElement("div");d.className="turnend err";
-  d.innerHTML=`${icon("xCircle",10)}<span>${esc(e.text||t("transcript.error"))} · ${esc(fmtTs(e.ts))}</span>`;
+  const parts=[e.text||t("transcript.error"),fmtTs(e.ts)].filter(Boolean);
+  d.innerHTML=`${icon("xCircle",10)}<span>${esc(parts.join(" · "))}</span>`;
   content.appendChild(d);
 }
 const handlers={prompt:addPrompt,msg:addMsg,think:addThink,tool:addTool,
@@ -1390,13 +1444,12 @@ function applyEvents(evs){
    stash/restore, fold toggles, prompt expansion and resizes all self-heal
    with no bookkeeping in the render path. */
 const rail=$("#rail");
+/* Mark taxonomy — the single source of truth, applied by layoutRail via
+   querySelectorAll and consumed verbatim by the tests and benchmark: Agent
+   message cards and MCP-dispatched prompt cards only. Dashboard-authored
+   "User Message" cards (.prompt.user), thinking folds, tool groups, turn and
+   error dividers, empty states and usage events never get a mark. */
 const MARK_SEL=".block.card.msg,.block.card.prompt:not(.user)";
-/* MARK_SEL's predicate in classList form — used to filter content.children
-   (keeps the node-vm tests independent of a CSS selector engine); keep in
-   sync with MARK_SEL. */
-const markable=el=>{const c=el.classList;
-  return c.contains("block")&&c.contains("card")&&
-    (c.contains("msg")||(c.contains("prompt")&&!c.contains("user")))};
 const MARK_GAP=6;                    // px: nearer marks merge into one cluster
 let railQueued=false,railBtns=[],curIdx=-1;
 const rmo=matchMedia("(prefers-reduced-motion: reduce)");
@@ -1420,7 +1473,7 @@ function scheduleRail(){
 }
 
 function layoutRail(){
-  const els=[...content.children].filter(markable);
+  const els=[...content.querySelectorAll(MARK_SEL)];
   if(!selected||!els.length){
     rail.hidden=true;railBtns=[];curIdx=-1;
     if(rail.replaceChildren)rail.replaceChildren();else rail.innerHTML="";
@@ -1439,8 +1492,13 @@ function layoutRail(){
       b.onclick=e=>jumpToMark(b,e&&e.detail===0);
       rail.appendChild(b);railBtns.push(b)}
     b._els=g.idx.map(j=>els[j]);
-    b.style.transform=`translateY(${g.y.toFixed(1)}px)`;
-    b.style.height=(g.idx.length>1?Math.min(3+g.idx.length*1.5,9):3)+"px";
+    /* A cluster pill covers its members' pixel span (a lone mark is 3px),
+       capped at 9px; clamping the anchor keeps the whole pill inside the
+       rail no matter how close to the bottom edge the cluster sits. */
+    const h=Math.max(0,Math.min(g.y1-g.y+3,9,RH));
+    const y=Math.max(0,Math.min(g.y,RH-h));
+    b.style.transform=`translateY(${y.toFixed(1)}px)`;
+    b.style.height=h+"px";
     const first=b._els[0];
     const kind=first.classList.contains("msg")?t("rail.agent_message"):t("rail.dispatched_message");
     const cts=(first.querySelector(".ctime")||{}).textContent||"";
@@ -1465,6 +1523,9 @@ function updateCurMark(){
     const el=railBtns[i]._els&&railBtns[i]._els[0];
     if(el&&el.isConnected&&el.offsetTop<=y)idx=i;else break;   // tops are monotonic
   }
+  /* Nothing above the fold yet (the first card sits below the +8 probe):
+     the first mark is current — the same rest position the tab stop uses. */
+  if(idx<0&&railBtns.length)idx=0;
   if(idx===curIdx)return;
   curIdx=idx;
   // Exactly one tabbable mark: the focused one while the rail is in use,
@@ -1494,12 +1555,14 @@ rail.addEventListener("keydown",e=>{
   railBtns[n].tabIndex=0;railBtns[i].tabIndex=-1;
   railBtns[n].focus();
 });
-/* Bare-track click seeks proportionally down the transcript. */
+/* Bare-track click seeks proportionally down the transcript — the same
+   document fraction the marks are positioned by, so clicking level with a
+   mark lands its card at the top of the viewport. */
 rail.addEventListener("click",e=>{
   if(e.target!==rail)return;
   const doc=content.scrollHeight,vh=content.clientHeight,RH=rail.clientHeight;
   if(!doc||!RH||doc<=vh)return;
-  const top=Math.max(0,Math.min(doc-vh,e.offsetY/RH*(doc-vh)));
+  const top=Math.max(0,Math.min(doc-vh,e.offsetY/RH*doc));
   if(content.scrollTo)content.scrollTo({top,behavior:rmo.matches?"auto":"smooth"});
   else content.scrollTop=top;
 });
@@ -1679,14 +1742,20 @@ function sendKey(j){
     :st==="delivering"?"send.delivering"
     :"send.queued";
 }
-/* error_code -> dictionary key for known bridge-reported failures; anything
-   else falls back to the generic failure with the raw error as detail. */
+/* error_code -> dictionary key for known bridge-reported failures. Anything
+   else falls back to the generic failure with the raw error as tooltip
+   detail — not_found is routing-only (the page's fixed /api/* URLs can never
+   receive it), so it intentionally stays on the generic label. */
 const SEND_ERR={expired:"send.err_expired",
   unknown_session:"send.err_unknown_session",
   missing:"send.err_missing",
   empty_or_too_long:"send.err_empty_or_too_long",
   bad_session:"send.err_bad_session",
-  bad_request:"send.err_bad_request"};
+  bad_request:"send.err_bad_request",
+  bad_name:"send.err_bad_request",
+  invalid_record:"send.err_invalid_record",
+  dispatch_failed:"send.err_dispatch_failed",
+  dispatch_error:"send.err_dispatch_error"};
 function sendErrState(j){
   const k=j&&SEND_ERR[j.error_code];
   return{key:k||"send.failed",detail:j&&j.error||"",final:true};
@@ -1904,6 +1973,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1914,6 +1984,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            # The page is deliberately self-contained — inline script/style,
+            # data: avatar images, same-origin /api calls only — so this CSP
+            # pins that contract and hard-blocks any external network call a
+            # future change might try to wire in.
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; script-src 'unsafe-inline'; "
+                "style-src 'unsafe-inline'; img-src data:; "
+                "connect-src 'self'; base-uri 'none'; form-action 'none'",
+            )
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
             return
@@ -1931,6 +2012,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "agent",
                                 "status",
                                 "stop_reason",
+                                "paused",
                                 "message",
                                 "result_chars",
                                 "files_changed",

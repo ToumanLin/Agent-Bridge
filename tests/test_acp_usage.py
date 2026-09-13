@@ -26,13 +26,21 @@ def _upd(used: int, meta: dict) -> UsageUpdate:
     )
 
 
-def _adapter(tmp_path: Path, env: dict[str, str] | None = None) -> AcpAdapter:
+def _adapter(
+    tmp_path: Path,
+    env: dict[str, str] | None = None,
+    *,
+    revivable: bool = False,
+    prompt_usage_scope: str = "conversation",
+) -> AcpAdapter:
     return AcpAdapter(
         AgentConfig(
             name="echo",
             protocol="acp",
             command=[sys.executable, str(ECHO)],
             env=env or {},
+            revivable=revivable,
+            prompt_usage_scope=prompt_usage_scope,
         ),
         tmp_path,
     )
@@ -147,5 +155,127 @@ async def test_run_turn_usage_stream_aggregates_root_and_subagent(tmp_path):
         assert second.run_usage["input"] == 10
         assert second.run_usage["output"] == 7
         assert second.run_usage["total"] == 17
+    finally:
+        await adapter.shutdown(session)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_prompt_usage_scope_turn_never_zeroes(tmp_path):
+    """prompt_usage_scope="turn" (claude-agent-acp semantics): every
+    PromptResponse.usage is this turn's usage — identical follow-up
+    snapshots count in full instead of deltaing to zero."""
+    adapter = _adapter(tmp_path, prompt_usage_scope="turn")
+    session = Session(session_id="sess_pt", agent="echo", cwd=str(tmp_path))
+    try:
+        first = await adapter.run_turn(session, _task(session, "t_pt1", "one"))
+        second = await adapter.run_turn(session, _task(session, "t_pt2", "two"))
+    finally:
+        await adapter.shutdown(session)
+    for result in (first, second):
+        assert result.run_usage["input"] == 1
+        assert result.run_usage["output"] == 2
+        assert result.run_usage["total"] == 3
+        assert result.run_usage["quality"] == "exact"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_failed_revive_is_a_fresh_conversation(tmp_path):
+    """A stale native id whose session/load fails falls through to
+    session/new: the conversation did NOT continue, so the first usage
+    snapshot counts in full rather than hiding behind an estimate."""
+    adapter = _adapter(tmp_path, env={"ECHO_FAIL_LOAD": "1"}, revivable=True)
+    session = Session(
+        session_id="sess_fresh",
+        agent="echo",
+        cwd=str(tmp_path),
+        native_session_id="echo-stale",
+        usage_baseline={
+            "cid": "echo-stale",
+            "counters": {"input": 9, "output": 9, "total": 18},
+        },
+    )
+    try:
+        result = await adapter.run_turn(session, _task(session, "t_fr", "hi"))
+        assert result.run_usage["input"] == 1
+        assert result.run_usage["output"] == 2
+        assert result.run_usage["total"] == 3
+        assert result.run_usage["quality"] == "exact"
+        # The baseline re-anchors on the new native conversation.
+        assert session.usage_baseline["cid"] == "echo-session"
+    finally:
+        await adapter.shutdown(session)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_revived_conversation_still_deltas(tmp_path):
+    """The other half of the resumed decision: a successful revive continues
+    the conversation, so an unchanged snapshot deltas to zero against the
+    persisted baseline — a fresh conversation would have counted it."""
+    adapter = _adapter(tmp_path, revivable=True)
+    session = Session(
+        session_id="sess_rev",
+        agent="echo",
+        cwd=str(tmp_path),
+        native_session_id="echo-session",
+        usage_baseline={
+            "cid": "echo-session",
+            "counters": {"input": 1, "output": 2, "total": 3},
+        },
+    )
+    try:
+        result = await adapter.run_turn(session, _task(session, "t_rv", "hi"))
+        assert result.run_usage == {"scope": "run", "quality": "exact"}
+    finally:
+        await adapter.shutdown(session)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_respawned_worker_deltas_against_stream_baselines(tmp_path):
+    """Conversation-cumulative UsageUpdate counters keep attributing only
+    the new delta after the worker process is replaced: the persisted
+    per-stream baseline, not zero, is the reference."""
+    state = tmp_path / "echo-usage-state.json"
+    adapter = _adapter(
+        tmp_path,
+        env={"ECHO_USAGE": "1", "ECHO_USAGE_STATE": str(state)},
+        revivable=True,
+    )
+    session = Session(session_id="sess_respawn", agent="echo", cwd=str(tmp_path))
+    try:
+        first = await adapter.run_turn(session, _task(session, "t_rs1", "hi"))
+        assert first.run_usage["total"] == 72
+        assert session.usage_baseline["streams"]
+
+        await adapter.shutdown(session)  # worker process dies
+
+        second = await adapter.run_turn(session, _task(session, "t_rs2", "again"))
+        # Turn-1 counters continue the conversation totals (root 30/13, sub
+        # 40/6); only the new deltas count — not the whole snapshots.
+        assert second.run_usage["input"] == 10
+        assert second.run_usage["output"] == 7
+        assert second.run_usage["total"] == 17
+        assert second.run_usage["quality"] == "exact"
+    finally:
+        await adapter.shutdown(session)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_error_keeps_partial_usage_and_persists_baselines(tmp_path):
+    """A prompt that fails mid-stream still returns a TurnResult carrying
+    the partial run_usage, closes the transcript turn, and persists the
+    baselines for the next run."""
+    adapter = _adapter(tmp_path, env={"ECHO_USAGE": "1", "ECHO_FAIL_PROMPT": "1"})
+    session = Session(session_id="sess_err", agent="echo", cwd=str(tmp_path))
+    try:
+        result = await adapter.run_turn(session, _task(session, "t_err", "boom"))
+        assert result.stop_reason == "error"
+        assert result.error
+        # All five updates landed before the raise; nothing is dropped.
+        assert result.run_usage["input"] == 60
+        assert result.run_usage["output"] == 12
+        assert result.run_usage["total"] == 72
+        assert session.usage_baseline["streams"]
+        ends = [e for e in read_events("sess_err", tmp_path) if e["type"] == "turn_end"]
+        assert ends and ends[-1]["data"]["stop_reason"] == "error"
     finally:
         await adapter.shutdown(session)

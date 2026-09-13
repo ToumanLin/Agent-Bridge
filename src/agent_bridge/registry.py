@@ -37,7 +37,13 @@ from agent_bridge.models import (
 from agent_bridge.paths import ensure_home, is_safe_id, result_path, state_path, transcript_path
 from agent_bridge.persist import atomic_write_json, atomic_write_text, read_json
 from agent_bridge.probes import probe_agent
-from agent_bridge.processes import count_sibling_servers, owner_alive, process_create_time, reap_orphans
+from agent_bridge.processes import (
+    count_sibling_servers,
+    owner_alive,
+    process_create_time,
+    reap_orphan_for_session,
+    reap_orphans,
+)
 from agent_bridge.quota import QuotaCache, fetch_quota, looks_like_quota_error, provider_table, unknown_quota
 from agent_bridge.transcript import (
     append_event,
@@ -68,6 +74,12 @@ NESTED_CANCEL_ERROR = (
 )
 NESTED_END_SESSION_ERROR = (
     "session shutdown is disabled: this Agent Bridge instance was inherited inside a worker process"
+)
+NESTED_PAUSE_ERROR = (
+    "task pause is disabled: this Agent Bridge instance was inherited inside a worker process"
+)
+NESTED_RESUME_ERROR = (
+    "task resume is disabled: this Agent Bridge instance was inherited inside a worker process"
 )
 
 RESULT_TAIL = 6000
@@ -105,6 +117,17 @@ OUTBOX_CLAIM_STALE_SEC = 60.0
 OUTBOX_CLAIM_SWEEP_SEC = 60.0
 # Poll cadence for wait_task on a sibling-owned (remote) task row.
 REMOTE_TASK_POLL_SEC = 1.5
+# pause_task first lets the adapter's own cancel land the partial result
+# through the normal run_turn return path; only a turn still running after
+# this window is force-cancelled.
+PAUSE_GRACE_SEC = 10.0
+# resume_task continuation prompt when the caller gives no message: explicit
+# enough that any worker can pick the paused work back up safely.
+RESUME_DEFAULT_MESSAGE = (
+    "This conversation's previous turn was paused before it finished. Pick up "
+    "the work where it left off, complete the remaining steps, and report the "
+    "final result."
+)
 
 
 def _parse_outbox_claim(name: str) -> tuple[str, int | None, float | None]:
@@ -155,6 +178,25 @@ def _resolve_runtime_context(runtime_context: RuntimeContext | None) -> RuntimeC
     if runtime_context not in ("coordinator", "worker"):
         raise ValueError(f"unknown runtime_context {runtime_context!r}; use coordinator or worker")
     return runtime_context
+
+
+def _partial_run_usage(events: list[dict[str, Any]], started_at: str) -> dict[str, Any]:
+    """The last ``usage`` event's ``consumed`` snapshot at/after ``started_at``.
+
+    Events older than ``started_at`` belong to a prior run on this reusable
+    session. Only the most recent usage event is consulted — it already
+    carries the run's accumulated consumption.
+    """
+    for event in reversed(events):
+        if event.get("type") != "usage":
+            continue
+        if str(event.get("ts") or "") < started_at:
+            break
+        consumed = (event.get("data") or {}).get("consumed")
+        if isinstance(consumed, dict) and consumed:
+            return consumed
+        break
+    return {}
 
 
 def _session_last_active_ts(last_active_at: str) -> float:
@@ -227,6 +269,10 @@ class Registry:
         self._stopping = False
         self._stop_started = False
         self._stop_done = asyncio.Event()
+        # Set when a stop() caller is cancelled mid-teardown: the shutdown
+        # body watches it to abandon the linger wait early instead of sitting
+        # out linger_max_sec.
+        self._stop_interrupted = asyncio.Event()
         self._pending_state: dict[str, list[dict]] | None = None
         self._flush_task: asyncio.Task[None] | None = None
 
@@ -481,8 +527,13 @@ class Registry:
             except OSError:
                 log.warning("could not rescue outbox claim %s", claim.name)
 
-    def _adopt_outbox_session(self, session_id: str) -> tuple[Session | None, bool]:
-        """(session, foreign) — adopt a session whose owner bridge is gone."""
+    def _lookup_dead_session(self, session_id: str) -> tuple[Session | None, bool]:
+        """(session, foreign) — read-only lookup of a disk session row.
+
+        A row whose owner bridge is verifiably alive is foreign: it stays
+        untouched and the caller must not adopt it. Dead-owner and ownerless
+        rows come back as a validated Session, not yet inserted.
+        """
         disk = read_json(state_path(self.home), {})
         for raw in (disk or {}).get("sessions") or []:
             if not isinstance(raw, dict) or raw.get("session_id") != session_id:
@@ -490,16 +541,104 @@ class Registry:
             if self._foreign_live(raw.get("owner_pid"), raw.get("owner_create_time")):
                 return None, True
             try:
-                session = Session.model_validate(raw)
+                return Session.model_validate(raw), False
             except Exception:
                 return None, False
-            self._stamp_owner(session)
-            if session.proc_state in {ProcState.busy, ProcState.spawning, ProcState.ready}:
-                session.proc_state = ProcState.idle_unloaded
-            session.pid = None
-            self.sessions[session.session_id] = session
+        return None, False
+
+    async def _adopt_dead_session(self, session_id: str) -> tuple[Session | None, bool]:
+        """(session, foreign) — adopt a session whose owner bridge is gone.
+
+        The session's recorded orphan worker is reaped first so a follow-up
+        spawn never leaves two executors driving one native conversation.
+        Used by the outbox delivery path, dispatch_task follow-ups,
+        resume_task, end_session, and cancel_task adoption.
+        """
+        session, foreign = self._lookup_dead_session(session_id)
+        if session is None:
+            return None, foreign
+        reaped = await asyncio.to_thread(reap_orphan_for_session, self.home, session_id)
+        if reaped is not None:
+            log.warning(
+                "reaped orphan worker pid=%s before adopting session %s",
+                reaped,
+                session_id,
+            )
+        self._stamp_owner(session)
+        if session.proc_state in {ProcState.busy, ProcState.spawning, ProcState.ready}:
+            session.proc_state = ProcState.idle_unloaded
+        session.pid = None
+        self.sessions[session.session_id] = session
+        self.save()
+        return session, False
+
+    def _recover_run_usage(self, task: Task) -> None:
+        """Recover a dead run's partial consumption from the transcript tail.
+
+        A task being finalized as ``bridge_restarted`` never got its final
+        run_usage write; whatever usage events the dead owner flushed (or a
+        same-process caller buffered) are the best record left. Marked
+        ``partial`` so it is never mistaken for a complete run total.
+        """
+        if task.run_usage or not task.started_at or not is_safe_id(task.session_id):
+            return
+        consumed = _partial_run_usage(
+            read_events_tail(task.session_id, self.home), task.started_at
+        )
+        if consumed:
+            task.run_usage = {**consumed, "partial": True}
+
+    def _adopt_dead_task(self, task_id: str) -> tuple[Task | None, bool]:
+        """(task, foreign) — take over a dead owner's task row on disk.
+
+        Mirrors start()-time adoption for a single row so control operations
+        (resume_task, cancel_task) work when the owner died after this
+        instance booted: a live-foreign row is never touched, an adopted row
+        still queued/running finalizes as failed/bridge_restarted, and the
+        row lands in memory stamped with this instance's owner identity.
+        """
+        if not self.config.server.remote_tasks:
+            return None, False
+        if not is_safe_id(task_id):
+            return None, False
+        for raw in self._disk_task_rows():
+            if raw.get("task_id") != task_id:
+                continue
+            if self._is_mine(raw.get("owner_pid"), raw.get("owner_create_time")):
+                return None, False
+            if self._foreign_live(raw.get("owner_pid"), raw.get("owner_create_time")):
+                return None, True
+            try:
+                task = Task.model_validate(raw)
+            except Exception:
+                return None, False
+            # session_id becomes a transcript path component downstream.
+            if not is_safe_id(task.session_id):
+                return None, False
+            self._stamp_owner(task)
+            if task.status in {TaskStatus.queued, TaskStatus.running}:
+                if task.paused:
+                    # The pause intent was persisted before the owner died;
+                    # honor it — the row ends cancelled/paused, not failed.
+                    task.status = TaskStatus.cancelled
+                    task.stop_reason = "paused"
+                else:
+                    task.status = TaskStatus.failed
+                    task.error = "bridge_restarted"
+                task.finished_at = iso()
+                self._recover_run_usage(task)
+            self.tasks[task.task_id] = task
+            done = asyncio.Event()
+            done.set()
+            self._done[task.task_id] = done
             self.save()
-            return session, False
+            log.info(
+                "task_adopted task_id=%s session_id=%s status=%s",
+                task.task_id,
+                task.session_id,
+                task.status.value,
+            )
+            return task, False
         return None, False
 
     async def _outbox_deliver(self, outbox: Path, claimed: Path, name: str) -> float | None:
@@ -536,7 +675,7 @@ class Registry:
         session = self.sessions.get(session_id)
         foreign = False
         if session is None:
-            session, foreign = self._adopt_outbox_session(session_id)
+            session, foreign = await self._adopt_dead_session(session_id)
         if session is None:
             if foreign:
                 # Requeued without an attempts increment, but the persisted
@@ -600,6 +739,7 @@ class Registry:
         self._stopping = False
         self._stop_started = False
         self._stop_done = asyncio.Event()
+        self._stop_interrupted = asyncio.Event()
         install_host_env(self.config.env)
         reap_orphans(self.home)
         payload = read_json(state_path(self.home), {})
@@ -618,9 +758,16 @@ class Registry:
                 continue
             self._stamp_owner(task)
             if task.status in {TaskStatus.queued, TaskStatus.running}:
-                task.status = TaskStatus.failed
-                task.error = "bridge_restarted"
+                if task.paused:
+                    # Same as a mid-pause crash on the owner: the persisted
+                    # intent ends the row cancelled/paused, not failed.
+                    task.status = TaskStatus.cancelled
+                    task.stop_reason = "paused"
+                else:
+                    task.status = TaskStatus.failed
+                    task.error = "bridge_restarted"
                 task.finished_at = iso()
+                self._recover_run_usage(task)
             self.tasks[task.task_id] = task
             done = asyncio.Event()
             done.set()
@@ -650,67 +797,98 @@ class Registry:
             return
         self._stop_started = True
         self._stopping = True
+        # Teardown — worker shutdown, transcript flush, final state save — is
+        # not optional, so it runs as an inner task nothing cancels and this
+        # caller keeps waiting for it through a CancelledError. Interruption
+        # still wins over the linger wait via _stop_interrupted, so a second
+        # Ctrl+C abandons linger instead of sitting out linger_max_sec.
+        shutdown = asyncio.ensure_future(self._shutdown())
+        interrupted = False
         try:
-            await self._quota_cache.close()
-            watchdog = self._watchdog
-            self._watchdog = None
-            if watchdog is not None:
-                watchdog.cancel()
-            outbox_task = self._outbox_task
-            self._outbox_task = None
-            if outbox_task is not None:
-                outbox_task.cancel()
-            for idle in list(self._idle.values()):
-                idle.cancel()
-            self._idle.clear()
-            bgs = [task for task in self._bg.values() if not task.done()]
-            linger_max = self.config.server.linger_max_sec
-            if bgs and self.config.server.shutdown_policy == "linger" and linger_max > 0:
-                # Opt-in: the host went away orderly (stdin EOF / lifespan),
-                # but in-flight turns keep their pipes and run to completion
-                # — transcript, result, and state all land as usual — up to
-                # the linger deadline, which cancels what is left.
-                log.info(
-                    "shutdown_policy=linger: holding shutdown up to %ss for %d in-flight task(s)",
-                    linger_max,
-                    len(bgs),
-                )
-                _finished, pending = await asyncio.wait(bgs, timeout=linger_max)
-                bgs = list(pending)
-                if bgs:
-                    log.warning(
-                        "linger deadline %ss reached with %d task(s) still in flight; cancelling",
-                        linger_max,
-                        len(bgs),
-                    )
-            for bg in bgs:
-                bg.cancel()
-            if bgs:
-                _done, pending = await asyncio.wait(bgs, timeout=STOP_TASK_GRACE_SEC)
-                if pending:
-                    log.warning(
-                        "%d task(s) did not finish cancelling within %ss",
-                        len(pending),
-                        STOP_TASK_GRACE_SEC,
-                    )
-            for session_id, adapter in list(self._adapters.items()):
-                session = self.sessions.get(session_id)
-                if session is not None:
-                    try:
-                        await adapter.shutdown(session)
-                    except Exception:
-                        log.exception("shutdown failed for %s", session_id)
-                    if session.proc_state != ProcState.dead:
-                        session.proc_state = ProcState.idle_unloaded
-            self._adapters.clear()
-            try:
-                flush_pending(self.home)
-            except OSError:
-                log.exception("could not flush transcripts during shutdown")
-            self.save()
-            await self.flush_state()
+            while not shutdown.done():
+                try:
+                    await asyncio.shield(shutdown)
+                except asyncio.CancelledError:
+                    interrupted = True
+                    self._stop_interrupted.set()
         finally:
             self._stop_done.set()
+        if interrupted:
+            raise asyncio.CancelledError()
+
+    async def _shutdown(self) -> None:
+        await self._quota_cache.close()
+        watchdog = self._watchdog
+        self._watchdog = None
+        if watchdog is not None:
+            watchdog.cancel()
+        outbox_task = self._outbox_task
+        self._outbox_task = None
+        if outbox_task is not None:
+            outbox_task.cancel()
+        for idle in list(self._idle.values()):
+            idle.cancel()
+        self._idle.clear()
+        bgs = [task for task in self._bg.values() if not task.done()]
+        linger_max = self.config.server.linger_max_sec
+        if bgs and self.config.server.shutdown_policy == "linger" and linger_max > 0:
+            # Opt-in: the host went away orderly (stdin EOF / lifespan),
+            # but in-flight turns keep their pipes and run to completion
+            # — transcript, result, and state all land as usual — up to
+            # the linger deadline, which cancels what is left. A cancelled
+            # stop() ends the wait early via _stop_interrupted.
+            log.info(
+                "shutdown_policy=linger: holding shutdown up to %ss for %d in-flight task(s)",
+                linger_max,
+                len(bgs),
+            )
+            all_done = asyncio.gather(*bgs, return_exceptions=True)
+            interrupt_wait = asyncio.ensure_future(self._stop_interrupted.wait())
+            waitables: set[asyncio.Future[Any]] = {all_done, interrupt_wait}
+            try:
+                await asyncio.wait(
+                    waitables,
+                    timeout=linger_max,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                interrupt_wait.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await interrupt_wait
+            bgs = [task for task in bgs if not task.done()]
+            if bgs:
+                why = "interrupted" if self._stop_interrupted.is_set() else f"deadline {linger_max}s reached"
+                log.warning(
+                    "linger %s with %d task(s) still in flight; cancelling",
+                    why,
+                    len(bgs),
+                )
+        for bg in bgs:
+            bg.cancel()
+        if bgs:
+            _done, pending = await asyncio.wait(bgs, timeout=STOP_TASK_GRACE_SEC)
+            if pending:
+                log.warning(
+                    "%d task(s) did not finish cancelling within %ss",
+                    len(pending),
+                    STOP_TASK_GRACE_SEC,
+                )
+        for session_id, adapter in list(self._adapters.items()):
+            session = self.sessions.get(session_id)
+            if session is not None:
+                try:
+                    await adapter.shutdown(session)
+                except Exception:
+                    log.exception("shutdown failed for %s", session_id)
+                if session.proc_state != ProcState.dead:
+                    session.proc_state = ProcState.idle_unloaded
+        self._adapters.clear()
+        try:
+            flush_pending(self.home)
+        except OSError:
+            log.exception("could not flush transcripts during shutdown")
+        self.save()
+        await self.flush_state()
 
     def _adapter_for(self, session: Session) -> Adapter:
         existing = self._adapters.get(session.session_id)
@@ -894,7 +1072,18 @@ class Registry:
             if session_id:
                 session = self.sessions.get(session_id)
                 if session is None:
-                    raise KeyError(f"unknown session {session_id}")
+                    # The session's owner may have died after this instance
+                    # booted: adopt the dead-owner row (reaping its orphaned
+                    # worker) instead of answering "unknown session" until
+                    # the next restart.
+                    session, foreign = await self._adopt_dead_session(session_id)
+                    if session is None:
+                        if foreign:
+                            raise RuntimeError(
+                                f"session {session_id} is owned by another live "
+                                "Bridge instance and cannot be driven from here"
+                            )
+                        raise KeyError(f"unknown session {session_id}")
                 if session.agent != agent:
                     raise ValueError(f"session {session_id} belongs to agent {session.agent}, not {agent}")
                 if Path(session.cwd).resolve() != cwd_path.resolve():
@@ -1030,7 +1219,9 @@ class Registry:
             # cancel_task's timeout path may already have finalized this task
             # as cancelled; a late turn result must not overwrite that.
             if task.status not in TERMINAL_STATUSES:
-                task.stop_reason = result.stop_reason
+                task.stop_reason = (
+                    "paused" if task.paused and result.stop_reason == "cancelled" else result.stop_reason
+                )
                 if result.error:
                     task.status = TaskStatus.failed
                     task.error = result.error
@@ -1042,7 +1233,7 @@ class Registry:
         except asyncio.CancelledError:
             if task.status not in TERMINAL_STATUSES:
                 task.status = TaskStatus.cancelled
-                task.stop_reason = "cancelled"
+                task.stop_reason = "paused" if task.paused else "cancelled"
         except Exception as exc:
             log.exception("task %s failed", task_id)
             if task.status not in TERMINAL_STATUSES:
@@ -1297,6 +1488,11 @@ class Registry:
         # Worker-silence bookkeeping lives in the owning process; nothing
         # truthful to report for a sibling's turn.
         payload["silent_for_sec"] = None
+        # _task_snapshot computed these as a local row; recompute with owner
+        # liveness so a remote paused/dead-owner row reports honestly.
+        resumable, resume_hint = self._resume_fields(task, remote_alive=alive)
+        payload["resumable"] = resumable
+        payload["resume_hint"] = resume_hint
         if task.status in {TaskStatus.queued, TaskStatus.running} and not alive:
             payload["owner_lost"] = True
             payload["hint"] = (
@@ -1380,7 +1576,10 @@ class Registry:
             else:
                 alive = True
                 owner = {"pid": self._owner_pid, "create_time": self._owner_create_time, "alive": True}
-            return {
+            resumable, resume_hint = self._resume_fields(
+                task, remote_alive=alive if remote else None
+            )
+            row = {
                 "task_id": task.task_id,
                 "session_id": task.session_id,
                 "agent": task.agent,
@@ -1398,7 +1597,16 @@ class Registry:
                 "owner_lost": (
                     not alive and task.status in {TaskStatus.queued, TaskStatus.running}
                 ),
+                "paused": task.paused,
+                "resumable": resumable,
             }
+            if resume_hint is not None:
+                row["resume_hint"] = resume_hint
+            if task.resume_of is not None:
+                row["resume_of"] = task.resume_of
+            if task.resumed_by is not None:
+                row["resumed_by"] = task.resumed_by
+            return row
 
         for task in self.tasks.values():
             if active_only and task.status in TERMINAL_STATUSES:
@@ -1434,6 +1642,50 @@ class Registry:
             "linger_max_sec": cfg.linger_max_sec,
             "remote_tasks": cfg.remote_tasks,
         }
+
+    def _resume_fields(self, task: Task, *, remote_alive: bool | None) -> tuple[bool, str | None]:
+        """``(resumable, resume_hint)`` for snapshots and listings.
+
+        ``remote_alive`` is None for this instance's own rows (the session
+        lookup decides), True for a live sibling's row (read-only here —
+        only that owner may resume it), False for a dead owner's row
+        (resume_task can adopt it). A task is resumable when its turn ended
+        unfinished — paused, cancelled, or failed — on a session that can
+        still take a follow-up turn.
+        """
+        if task.status in {TaskStatus.queued, TaskStatus.running}:
+            if remote_alive is True:
+                return False, "a live sibling Bridge owns this turn — only it can pause or cancel it"
+            if remote_alive is False:
+                return True, (
+                    f"the owning Bridge died mid-run — resume_task(task_id=\"{task.task_id}\") adopts "
+                    "this session (reaping its orphaned worker), finalizes the row as "
+                    "failed/bridge_restarted, and continues the same conversation"
+                )
+            return False, (
+                f"in-flight — pause_task(task_id=\"{task.task_id}\") ends the turn and keeps it "
+                "resumable; cancel_task cancels it outright"
+            )
+        if remote_alive is True:
+            return False, "owned by a live sibling Bridge (remote) — only that instance can resume it"
+        session = self.sessions.get(task.session_id)
+        if session is not None and session.proc_state == ProcState.dead:
+            return False, "the session was ended; dispatch_task starts a fresh task"
+        if task.status == TaskStatus.completed:
+            return False, f"dispatch_task(session_id=\"{task.session_id}\") sends a follow-up on this conversation"
+        # cancelled or failed: the turn ended unfinished and the conversation
+        # can continue on the same session.
+        if remote_alive is False:
+            return True, (
+                f"the owning Bridge is gone — resume_task(task_id=\"{task.task_id}\") adopts this "
+                "session (reaping its orphaned worker) and continues the same conversation"
+            )
+        why = "paused" if task.paused else task.status.value
+        return True, (
+            f"this {why} turn kept its partial result, transcript, and session — "
+            f"resume_task(task_id=\"{task.task_id}\") dispatches a continuation turn on the same "
+            "conversation, or dispatch_task(session_id=...) sends a free-form follow-up"
+        )
 
     @staticmethod
     def _result_hint(task: Task, prefix: str) -> str:
@@ -1513,21 +1765,23 @@ class Registry:
             "finished_at": task.finished_at,
             "recent_activity": recent_activity(events),
         }
+        resumable, resume_hint = self._resume_fields(task, remote_alive=None)
+        payload["paused"] = task.paused
+        payload["resumable"] = resumable
+        payload["resume_hint"] = resume_hint
+        if task.resume_of is not None:
+            payload["resume_of"] = task.resume_of
+        if task.resumed_by is not None:
+            payload["resumed_by"] = task.resumed_by
         # While the task is still running its persisted run_usage is empty;
         # surface the latest normalized "usage" transcript event as a marked
         # live partial instead. Events older than started_at belong to a
         # prior run on this reusable session. The final Task.run_usage
         # written at finalization stays the authoritative record.
         if task.status == TaskStatus.running and task.started_at and not task.run_usage:
-            for event in reversed(events):
-                if event.get("type") != "usage":
-                    continue
-                if str(event.get("ts") or "") < task.started_at:
-                    break
-                consumed = (event.get("data") or {}).get("consumed")
-                if isinstance(consumed, dict) and consumed:
-                    payload["run_usage"] = {**consumed, "partial": True}
-                break
+            consumed = _partial_run_usage(events, task.started_at)
+            if consumed:
+                payload["run_usage"] = {**consumed, "partial": True}
         if task.started_at:
             start = datetime.fromisoformat(task.started_at)
             end = datetime.fromisoformat(task.finished_at) if task.finished_at else datetime.fromisoformat(iso())
@@ -1653,12 +1907,22 @@ class Registry:
             raise RuntimeError(NESTED_CANCEL_ERROR)
         task = self.tasks.get(task_id)
         if task is None:
-            if self._remote_task(task_id) is not None:
+            remote = self._remote_task(task_id)
+            if remote is None:
+                raise KeyError(f"unknown task {task_id}")
+            if owner_alive(remote.owner_pid, remote.owner_create_time):
                 raise RuntimeError(
                     f"task {task_id} is owned by another Bridge instance and "
                     "cannot be cancelled from here (remote tasks are read-only)"
                 )
-            raise KeyError(f"unknown task {task_id}")
+            # The owning instance is gone: adopt the row (finalizing an
+            # in-flight turn as failed/bridge_restarted) and its session so
+            # the orphaned worker is reaped instead of left running.
+            adopted, _foreign = self._adopt_dead_task(task_id)
+            if adopted is None:
+                raise KeyError(f"unknown task {task_id}")
+            await self._adopt_dead_session(adopted.session_id)
+            return self._task_snapshot(adopted)
         if task.status in TERMINAL_STATUSES:
             return self._task_snapshot(task)
         session = self.sessions[task.session_id]
@@ -1683,7 +1947,163 @@ class Registry:
             self._bg.pop(task_id, None)
             self._done[task_id].set()
             self.save()
-        return self._task_snapshot(self.tasks[task_id])
+        return self._task_snapshot(self.tasks.get(task_id, task))
+
+    async def pause_task(self, task_id: str) -> dict:
+        """End the in-flight turn while keeping the task resumable.
+
+        This is a graceful cancel, not frozen execution: the adapter's own
+        cancel runs first so the partial result, usage, transcript, and
+        native session id land through the normal return path; only a turn
+        still running after PAUSE_GRACE_SEC is force-cancelled. The row ends
+        terminal — status cancelled, stop_reason "paused", paused=True —
+        and resume_task continues the same conversation as a new task.
+        """
+        if not self.dispatch_enabled:
+            raise RuntimeError(NESTED_PAUSE_ERROR)
+        task = self.tasks.get(task_id)
+        if task is None:
+            if self._remote_task(task_id) is not None:
+                raise RuntimeError(
+                    f"task {task_id} is owned by another Bridge instance and "
+                    "cannot be paused from here (remote tasks are read-only)"
+                )
+            raise KeyError(f"unknown task {task_id}")
+        if task.status in TERMINAL_STATUSES:
+            if task.paused:
+                # already paused: idempotent
+                return self._task_snapshot(task, include_result=True)
+            raise RuntimeError(
+                f"task {task_id} is already {task.status.value}; "
+                "only a queued/running task can be paused"
+            )
+        # Persist the pause intent before touching the worker: even a crash
+        # mid-pause leaves a truthful row instead of an abandoned "running".
+        task.paused = True
+        self.save()
+        session = self.sessions.get(task.session_id)
+        adapter = self._adapters.get(task.session_id) if session is not None else None
+        if session is not None and adapter is not None:
+            try:
+                await adapter.cancel(session)
+            except Exception:
+                log.exception("pause: adapter cancel failed for task %s", task_id)
+        done_event = self._done.get(task_id)
+        bg = self._bg.get(task_id)
+        if bg is not None and task.status == TaskStatus.running:
+            # Grace first: the adapter cancel lets the worker return its
+            # partial result through the normal run_turn path.
+            finished, _pending = await asyncio.wait({bg}, timeout=PAUSE_GRACE_SEC)
+            if not finished:
+                bg.cancel()
+                await asyncio.wait({bg}, timeout=STOP_TASK_GRACE_SEC)
+        elif bg is not None:
+            # Still queued — no turn is running, so there is nothing to wait
+            # out gracefully; cancel immediately.
+            bg.cancel()
+            await asyncio.wait({bg}, timeout=STOP_TASK_GRACE_SEC)
+        elif done_event is not None:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(done_event.wait(), timeout=PAUSE_GRACE_SEC)
+        if done_event is None or not done_event.is_set():
+            # _run_task never started (queued) or could not finish in time;
+            # close the record here so the pause is terminal, not dangling.
+            task.status = TaskStatus.cancelled
+            task.stop_reason = "paused"
+            task.finished_at = iso()
+            if (
+                session is not None
+                and task.started_at is None
+                and session.proc_state == ProcState.spawning
+            ):
+                session.proc_state = ProcState.idle_unloaded
+            self._bg.pop(task_id, None)
+            if done_event is not None:
+                done_event.set()
+            with contextlib.suppress(OSError):
+                append_event(
+                    task.session_id,
+                    "turn_end",
+                    {"stop_reason": "paused", "task_id": task.task_id},
+                    self.home,
+                )
+            self.save()
+        log.info("task_paused task_id=%s session_id=%s", task_id, task.session_id)
+        return self._task_snapshot(self.tasks.get(task_id, task), include_result=True)
+
+    async def resume_task(
+        self,
+        task_id: str,
+        message: str | None = None,
+        request_id: str | None = None,
+    ) -> dict:
+        """Continue an unfinished task's work as a new task on the same session.
+
+        Accepts paused, cancelled, and failed rows — including a dead owner's
+        row, which is adopted first (its orphaned worker is reaped before a
+        replacement spawns). The original row stays final and auditable: it
+        is never rewritten; it gains ``resumed_by`` and the new task carries
+        ``resume_of``. ``message`` defaults to an explicit "pick up the paused
+        work" continuation prompt; ``request_id`` deduplicates like
+        dispatch_task's.
+        """
+        if not self.dispatch_enabled:
+            raise RuntimeError(NESTED_RESUME_ERROR)
+        if self._stopping:
+            raise RuntimeError("bridge is shutting down; not accepting new tasks")
+        task = self.tasks.get(task_id)
+        if task is None:
+            task, foreign = self._adopt_dead_task(task_id)
+            if task is None:
+                if foreign:
+                    raise RuntimeError(
+                        f"task {task_id} is owned by another live Bridge instance "
+                        "and cannot be resumed from here (remote tasks are read-only)"
+                    )
+                raise KeyError(f"unknown task {task_id}")
+        if task.status in {TaskStatus.queued, TaskStatus.running}:
+            raise RuntimeError(
+                f"task {task_id} is still {task.status.value}; "
+                "pause_task or cancel_task it, or wait for it to finish"
+            )
+        if task.status == TaskStatus.completed:
+            raise RuntimeError(
+                f"task {task_id} already completed; send a follow-up with "
+                f"dispatch_task(session_id={task.session_id}) instead"
+            )
+        session = self.sessions.get(task.session_id)
+        if session is None:
+            session, foreign = await self._adopt_dead_session(task.session_id)
+            if session is None:
+                if foreign:
+                    raise RuntimeError(
+                        f"session {task.session_id} is owned by another live "
+                        "Bridge instance and cannot be adopted here"
+                    )
+                raise KeyError(
+                    f"session {task.session_id} for task {task_id} is gone; "
+                    "dispatch a fresh task instead"
+                )
+        if session.proc_state == ProcState.dead:
+            raise RuntimeError(
+                f"session {session.session_id} was ended; dispatch a fresh task instead"
+            )
+        text = (message or "").strip() or RESUME_DEFAULT_MESSAGE
+        result = await self.dispatch_task(
+            agent=session.agent,
+            message=text,
+            cwd=session.cwd,
+            session_id=session.session_id,
+            user_requested=True,
+            request_id=request_id,
+            source="resume",
+        )
+        new_task = self.tasks.get(result["task_id"])
+        if new_task is not None:
+            new_task.resume_of = task.task_id
+        task.resumed_by = result["task_id"]
+        self.save()
+        return {"resumed_from": task.task_id, **result}
 
     def list_sessions(self, active_only: bool = False) -> list[dict]:
         rows = []
@@ -1711,7 +2131,16 @@ class Registry:
             raise RuntimeError(NESTED_END_SESSION_ERROR)
         session = self.sessions.get(session_id)
         if session is None:
-            raise KeyError(f"unknown session {session_id}")
+            # A session whose owner died after this instance booted is
+            # adoptable here; a live sibling's session is not ours to end.
+            session, foreign = await self._adopt_dead_session(session_id)
+            if session is None:
+                if foreign:
+                    raise RuntimeError(
+                        f"session {session_id} is owned by another live "
+                        "Bridge instance and cannot be ended from here"
+                    )
+                raise KeyError(f"unknown session {session_id}")
         busy = self._busy_task(session_id)
         if busy is not None:
             await self.cancel_task(busy.task_id)

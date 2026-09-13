@@ -381,14 +381,14 @@ def test_task_duration_plumbing():
     for needle in ("taskDur", "fmtDur", "durText", "durSpan", "tickDurations", '"sdur"', '"hdur"', "data-tid", '" · "'):
         assert needle in PAGE
     assert re.search(r"setInterval\(tickDurations,1000\)", PAGE)
-    body = re.search(r"function taskDur\(t\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    body = re.search(r"function taskDur\(tk\)\{([\s\S]*?)\n\}", PAGE).group(1)
     # The clock starts strictly at a valid started_at — never created_at,
     # queue time, or session age.
-    assert "Date.parse(t.started_at)" in body
+    assert "Date.parse(tk.started_at)" in body
     assert "created_at" not in body and "last_active_at" not in body
     # Only queued/running may be live; terminal statuses require finished_at.
-    assert 't.status==="queued"||t.status==="running"' in body
-    assert "Date.parse(t.finished_at)" in body
+    assert 'tk.status==="queued"||tk.status==="running"' in body
+    assert "Date.parse(tk.finished_at)" in body
     # Whole-second floor math; the old Math.round/padStart version is gone.
     fmt = re.search(r"const fmtDur=([\s\S]*?)\nfunction taskDur", PAGE).group(1)
     assert "Math.floor" in fmt and "Math.round" not in fmt and "padStart" not in fmt
@@ -534,7 +534,7 @@ def test_token_counter_helpers():
         "cognition.ai/outputTokens",
         '"input_tokens"',
         '"inputTokens"',
-        " tok",
+        '"tokens.unit"',
     ):
         assert needle in PAGE
     # The sidebar signature fingerprints run_usage (preferred), legacy usage,
@@ -543,9 +543,11 @@ def test_token_counter_helpers():
     assert "tk.run_usage" in sig and "tk.usage" in sig and "liveUsage" in sig
     # tokSpan prefers the persisted per-run aggregate over the raw last
     # snapshot; legacy usage is only an estimate fallback.
-    body = re.search(r"function tokSpan\(t,cls,live\)\{([\s\S]*?)\n\}", PAGE).group(1)
-    assert "t.run_usage" in body and "runTok" in body
+    body = re.search(r"function tokSpan\(tk,cls,live\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert "tk.run_usage" in body and "runTok" in body
     assert 'quality:"estimate"' in body
+    # The compact-count unit comes from the dictionary, not a hardcoded suffix.
+    assert 't("tokens.unit")' in body
     # Usage text stays static between overview polls — not joined to the tick.
     tick = re.search(r"function tickDurations\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
     assert "stok" not in tick and "htok" not in tick
@@ -590,19 +592,15 @@ def test_nav_rail():
     assert 'data-i18n-aria-label="rail.label"' in rail_nav
     # The landmark label must not redundantly contain the role name.
     assert "Message positions" in PAGE and "navigation" not in rail_nav.lower()
-    # Marks only for Agent cards and non-user Dispatched cards — the classList
-    # predicate is the applied half; MARK_SEL is the selector form pinned for
-    # tests/benchmarks (kept in sync by contract).
+    # Marks only for Agent cards and non-user Dispatched cards. MARK_SEL is
+    # the single source of truth: layoutRail applies it via querySelectorAll
+    # and the JS behavior tests + benchmark consume the same literal — no
+    # second taxonomy copy exists to drift.
     sel = re.search(r'const MARK_SEL="([^"]+)"', PAGE)
     assert sel, "MARK_SEL selector missing"
-    assert ".block.card.msg" in sel.group(1)
-    assert ".block.card.prompt:not(.user)" in sel.group(1)
-    pred = re.search(r"const markable=el=>\{([\s\S]*?)\};", PAGE)
-    assert pred, "markable predicate missing"
-    body = pred.group(1)
-    for needle in ('contains("block")', 'contains("card")', 'contains("msg")',
-                   'contains("prompt")', '!c.contains("user")'):
-        assert needle in body
+    assert sel.group(1) == ".block.card.msg,.block.card.prompt:not(.user)"
+    layout = re.search(r"function layoutRail\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert "querySelectorAll(MARK_SEL)" in layout
     # Layout, clustering and interaction machinery.
     for needle in (
         "MARK_GAP",
@@ -641,7 +639,7 @@ def test_nav_rail():
     assert re.search(r"\.mark\.cur\{[^}]*var\(--accent\)", PAGE)
     assert re.search(r"\.mark:focus-visible\{[^}]*outline:2px", PAGE)
     narrow = re.search(r"@media \(max-width:900px\)\{([\s\S]*?)\n\}", PAGE).group(1)
-    assert "#rail{width:14px}" in narrow and ".mark{left:2px;width:8px}" in narrow
+    assert "#rail{width:14px}" in narrow and ".mark{left:3px;width:8px}" in narrow
     # #conv wraps the scroller; #content stays the positioned offset parent so
     # card.offsetTop maps proportionally onto the rail.
     assert re.search(r"#conv\{[^}]*display:flex", PAGE)
@@ -829,6 +827,105 @@ def test_i18n_send_state_codes():
     assert "sendState[sid].text" not in PAGE and "setChatStatus(" not in PAGE
 
 
+def test_i18n_send_err_covers_emitted_codes():
+    """Every error_code the bridge or the dashboard's send endpoints emit maps
+    to a localized label — a raw English diagnostic can only ever surface in
+    the tooltip, never as the status line."""
+    send_err = dict(
+        re.findall(
+            r'(\w+):"(send\.[\w.]+)"',
+            re.search(r"const SEND_ERR=\{([\s\S]*?)\};", PAGE).group(1),
+        )
+    )
+    agent_bridge_dir = Path(dashboard.__file__).parent.parent
+    emitted = set(
+        re.findall(
+            r'"error_code":\s*"(\w+)"',
+            (agent_bridge_dir / "registry.py").read_text(encoding="utf-8")
+            + Path(dashboard.__file__).read_text(encoding="utf-8"),
+        )
+    )
+    # not_found is endpoint routing only — unreachable from the page's fixed
+    # /api/* URLs — and keeps the generic localized send.failed fallback.
+    emitted.discard("not_found")
+    missing = emitted - set(send_err)
+    assert not missing, f"error codes without a localized label: {missing}"
+    locales = _locales()
+    for key in send_err.values():
+        for loc in ("en", "zh-CN", "zh-TW"):
+            assert key in locales[loc], f"{key} missing in {loc}"
+
+
+def test_i18n_invalid_timestamp_guards():
+    """ago()/fmtTs() render nothing for missing/unparseable input — no
+    English 'Invalid Date' or 'NaN 天前' can leak into any locale."""
+    fmt = re.search(r"const fmtTs=([\s\S]*?)\nconst ago=", PAGE).group(1)
+    assert "v==null" in fmt and "Number.isFinite(+d)" in fmt
+    body = re.search(r"const ago=([\s\S]*?)\nfunction applyStatic", PAGE).group(1)
+    assert "v==null" in body and "Number.isFinite(s)" in body
+    # addToolStatus's inline duration math is the other NaN path: guard it.
+    tool = re.search(r"function addToolStatus\(e\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert "Number.isFinite(s)" in tool
+    # Per-locale executable coverage lives in dashboard_status_behavior.js.
+
+
+def test_i18n_cjk_thinking_count():
+    """Word counts mislead for space-less scripts — predominantly-CJK thinking
+    text counts characters; space-separated text keeps word counts."""
+    locales = _locales()
+    for loc in ("en", "zh-CN", "zh-TW"):
+        d = locales[loc]
+        assert "transcript.thinking_words" in d and "transcript.thinking_chars" in d
+    assert "CJK_RE" in PAGE and "function thinkLabel(" in PAGE
+    flush = re.search(r"function flushBlocks\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert "thinkLabel(b._text)" in flush
+
+
+def test_i18n_zh_tw_context_terminology():
+    # 上下文 is the established zh-CN/zh-TW term for the context window — the
+    # occupancy tooltip and the breakdown label must agree on it.
+    locales = _locales()
+    for loc in ("zh-CN", "zh-TW"):
+        d = locales[loc]
+        assert "上下文" in d["tokens.context"]
+        assert "上下文" in d["tokens.ctx_only"]
+
+
+def test_i18n_no_t_param_shadowing():
+    """No parameter or callback arg may shadow the global translate function
+    t() — a `t` param would silently break a future t() call in that body."""
+    for sig in (
+        "function taskDur(tk)",
+        "function durSpan(tk,cls)",
+        "function tokSpan(tk,cls,live)",
+        "forEach((tk,i)=>",
+    ):
+        assert sig in PAGE
+    for gone in (
+        "function taskDur(t)",
+        "function durSpan(t,cls)",
+        "function tokSpan(t,cls,live)",
+        "forEach((t,i",
+    ):
+        assert gone not in PAGE
+
+
+def test_i18n_first_paint_fouc_guard():
+    """Non-English locales hide English fallback text until applyStatic()
+    localizes it, with a timed failsafe so a dead body script can never leave
+    the chrome invisible."""
+    head = PAGE.split("<style>")[0]
+    assert 'setAttribute("data-i18n-pending"' in head
+    assert 'removeAttribute("data-i18n-pending")' in head and "setTimeout" in head
+    assert '_lang!=="en"' in head  # English fallback is already final
+    # The pre-render title map mirrors LOCALES app.title for every locale.
+    for d in _locales().values():
+        assert f'"{d["app.title"]}"' in head
+    assert re.search(r"html\[data-i18n-pending\] \[data-i18n\]\{visibility:hidden\}", PAGE)
+    apply = re.search(r"function applyStatic\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert 'removeAttribute("data-i18n-pending")' in apply
+
+
 def _jsdom_available():
     """Locate a jsdom install for the optional DOM benchmark."""
     node = shutil.which("node")
@@ -873,6 +970,46 @@ def test_dashboard_replay_benchmark():
 # ---------- HTTP surface ----------
 
 
+def test_index_security_headers(dash):
+    """The dashboard page ships a restrictive CSP: the single-file design
+    needs inline script/style, the avatar assets are data: images, and the
+    API surface is same-origin — everything else is hard-blocked."""
+    _, base = dash
+    with urllib.request.urlopen(base + "/", timeout=10) as r:
+        csp = r.headers.get("Content-Security-Policy")
+        nosniff = r.headers.get("X-Content-Type-Options")
+    assert csp is not None
+    for directive in (
+        "default-src 'none'",
+        "script-src 'unsafe-inline'",
+        "style-src 'unsafe-inline'",
+        "img-src data:",
+        "connect-src 'self'",
+        "base-uri 'none'",
+        "form-action 'none'",
+    ):
+        assert directive in csp
+    assert nosniff == "nosniff"
+
+
+def test_page_has_no_external_subresources():
+    """Belt and suspenders under the CSP: the page must not reference any
+    external origin — no remote script/style/image/font loads and no
+    non-relative fetch/beacon/socket targets."""
+    for pat in (
+        r'src=["\']https?://',
+        r'href=["\']https?://',
+        r"url\(\s*[\"']?https?://",
+        r"@import",
+        r'fetch\(\s*[`\'"]https?',
+        r'sendBeacon\(\s*[`\'"]https?',
+        r"new\s+WebSocket",
+        r"new\s+EventSource",
+        r"XMLHttpRequest",
+    ):
+        assert not re.search(pat, PAGE), pat
+
+
 def test_index_and_overview(dash):
     _, base = dash
     code, body = _get(base + "/")
@@ -889,6 +1026,7 @@ def test_index_and_overview(dash):
         "agent",
         "status",
         "stop_reason",
+        "paused",
         "message",
         "result_chars",
         "files_changed",

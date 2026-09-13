@@ -97,6 +97,13 @@ class AgentConfig(BaseModel):
     idle_unload_sec: int = 0
     stall_timeout_sec: int = Field(default=1800, ge=0)
     print_timeout: str = "120m"
+    # What PromptResponse.usage counters mean on ACP workers (the spec's docs
+    # contradict themselves, and agents diverged):
+    #   "conversation" — cumulative across all turns; run_usage deltas against
+    #                    the previous turn's snapshot (default).
+    #   "turn"         — the snapshot is this turn alone; counted in full.
+    # Only consulted when no UsageUpdate counters arrived for the turn.
+    prompt_usage_scope: Literal["conversation", "turn"] = "conversation"
 
 
 class EnvConfig(BaseModel):

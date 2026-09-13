@@ -29,8 +29,17 @@ class FakeAdapter(Adapter):
             {"text": task.message, "task_id": task.task_id, "source": task.source},
             self.home,
         )
-        cancel = self._cancel[session.session_id]
+        # Cancel is per-turn like the real adapters: a fresh event each turn so
+        # a cancelled/paused turn does not poison follow-ups on this session.
+        cancel = asyncio.Event()
+        self._cancel[session.session_id] = cancel
         delay = float(os.environ.get("AGENT_BRIDGE_FAKE_DELAY", "0.05"))
+        # Tests set AGENT_BRIDGE_FAKE_PARTIAL=1 to model real workers: stream a
+        # chunk up front and return it as the partial result on cancellation.
+        partial = ""
+        if os.environ.get("AGENT_BRIDGE_FAKE_PARTIAL") == "1":
+            partial = f"[fake:{self.agent.name}] partial progress on: {task.message}"
+            append_event(session.session_id, "message_chunk", {"text": partial}, self.home)
         try:
             await asyncio.wait_for(cancel.wait(), timeout=delay)
             append_event(
@@ -39,7 +48,7 @@ class FakeAdapter(Adapter):
                 {"stop_reason": "cancelled", "task_id": task.task_id},
                 self.home,
             )
-            return TurnResult(text="", stop_reason="cancelled")
+            return TurnResult(text=partial, stop_reason="cancelled")
         except TimeoutError:
             pass
         text = f"[fake:{self.agent.name}] {task.message}"

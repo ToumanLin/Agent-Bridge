@@ -247,6 +247,50 @@ def _owner_alive(info: dict[str, Any]) -> bool:
     return owner_alive(owner_pid, info.get("owner_create_time"))
 
 
+def _reap_orphan_record(session_id: str, info: dict[str, Any]) -> int | None:
+    """Verify and kill one recorded worker; returns the reaped pid or None.
+
+    The pid is only killed when it still maps to the recorded identity —
+    image name and create time must both match, so a pid recycled by an
+    unrelated process can never trigger a kill. A mismatch (or a dead pid)
+    returns None; the caller drops the record either way.
+    """
+    pid = info.get("pid")
+    create_time = info.get("create_time")
+    image_name = info.get("image_name")
+    if not isinstance(pid, int):
+        return None
+    try:
+        proc = psutil.Process(pid)
+    except psutil.Error:
+        return None
+    if not proc.is_running():
+        return None
+    match_image = True
+    if image_name:
+        try:
+            match_image = Path(proc.exe()).name.lower() == str(image_name).lower()
+        except (psutil.Error, OSError):
+            match_image = False
+    match_time = True
+    if create_time is not None:
+        try:
+            match_time = abs(proc.create_time() - float(create_time)) < 1.0
+        except (psutil.Error, TypeError, ValueError):
+            match_time = False
+    if match_image and match_time:
+        log.warning("reaping orphan worker pid=%s session=%s", pid, session_id)
+        kill_tree(pid)
+        _wait_and_kill_tree(pid)
+        return pid
+    log.info(
+        "dropping stale pid record pid=%s session=%s (pid recycled by another process)",
+        pid,
+        session_id,
+    )
+    return None
+
+
 def reap_orphans(home) -> list[int]:
     """Kill workers whose owning Bridge instance is gone.
 
@@ -271,40 +315,9 @@ def reap_orphans(home) -> list[int]:
         if _owner_alive(info):
             kept[session_id] = info
             continue
-        pid = info.get("pid")
-        create_time = info.get("create_time")
-        image_name = info.get("image_name")
-        if not isinstance(pid, int):
-            continue
-        try:
-            proc = psutil.Process(pid)
-        except psutil.Error:
-            continue
-        if not proc.is_running():
-            continue
-        match_image = True
-        if image_name:
-            try:
-                match_image = Path(proc.exe()).name.lower() == str(image_name).lower()
-            except (psutil.Error, OSError):
-                match_image = False
-        match_time = True
-        if create_time is not None:
-            try:
-                match_time = abs(proc.create_time() - float(create_time)) < 1.0
-            except (psutil.Error, TypeError, ValueError):
-                match_time = False
-        if match_image and match_time:
-            log.warning("reaping orphan worker pid=%s session=%s", pid, session_id)
-            kill_tree(pid)
-            _wait_and_kill_tree(pid)
-            killed.append(pid)
-        else:
-            log.info(
-                "dropping stale pid record pid=%s session=%s (pid recycled by another process)",
-                pid,
-                session_id,
-            )
+        reaped = _reap_orphan_record(session_id, info)
+        if reaped is not None:
+            killed.append(reaped)
     if table != kept:
         try:
             atomic_write_json(path, kept)
@@ -313,6 +326,35 @@ def reap_orphans(home) -> list[int]:
             # must not abort server startup; the next boot retries.
             log.warning("could not rewrite pid table %s", path, exc_info=True)
     return killed
+
+
+def reap_orphan_for_session(home, session_id: str) -> int | None:
+    """Kill one session's recorded worker iff its owning Bridge is gone.
+
+    Runtime variant of ``reap_orphans`` for lazy session adoption: before a
+    dead owner's session is taken over and a replacement worker spawns, the
+    orphaned executor is reaped so two processes never drive one native
+    conversation. A record whose owner is still alive is left untouched —
+    the session is not ours to take. Returns the reaped pid or None.
+    """
+    path = pids_path(home)
+    table = read_json(path, {})
+    if not isinstance(table, dict):
+        return None
+    info = table.get(session_id)
+    if not isinstance(info, dict):
+        return None
+    if _owner_alive(info):
+        return None
+    reaped = _reap_orphan_record(session_id, info)
+    table.pop(session_id, None)
+    try:
+        atomic_write_json(path, table)
+    except OSError:
+        # Same tolerance as reap_orphans: a transient lock must not abort
+        # the adoption; the next pass retries the record.
+        log.warning("could not rewrite pid table %s", path, exc_info=True)
+    return reaped
 
 
 def python_executable() -> str:

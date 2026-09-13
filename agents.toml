@@ -96,8 +96,11 @@ idle_exit_sec = 7200
 # in-flight tasks: "cancel" kills worker turns at once (default), "linger"
 # lets them finish first — transcripts, results, and state land exactly as
 # if the host had stayed — bounded by linger_max_sec, then workers shut
-# down normally. A force-killed Bridge still loses the worker pipes;
-# linger only covers orderly shutdown, and there is no pause/resume.
+# down normally. Linger only covers orderly shutdown; it cannot defeat a
+# host force-kill of the Bridge process tree (e.g. Codex terminating its
+# MCP Job Object, workers included). To carry a turn across a host
+# restart, park it with pause_task and continue it with resume_task after
+# the next Bridge instance adopts the session.
 # shutdown_policy = "cancel"
 # linger_max_sec = 86400
 # Let check_task / wait_task / get_result / list_tasks read task rows owned
@@ -183,6 +186,10 @@ command = ["claude-agent-acp"]
 fallback_commands = [["claude-code-acp"]]
 revivable = true
 idle_unload_sec = 900
+# Verified per upstream evidence (agentclientprotocol/agent-client-protocol#1860):
+# the Claude Code ACP bridge's PromptResponse.usage is this turn's usage, not
+# session-cumulative — "turn" keeps follow-up turns from reading as zero.
+prompt_usage_scope = "turn"
 
 [agents.opencode]
 protocol = "acp"

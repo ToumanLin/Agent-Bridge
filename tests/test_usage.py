@@ -76,6 +76,33 @@ def test_devin_output_is_per_step_and_exact_dups_suppressed():
     assert out["total"] == 38
 
 
+def test_devin_output_not_recounted_when_only_context_moves():
+    """Dedup fingerprints the counters, not the context keys: a paired
+    re-emission with only used/size changed must not re-add per-step
+    output."""
+    run = RunUsage("devin")
+    run.reset()
+    run.update(devin_update(10, 4, used=5, size=100))
+    run.update(devin_update(10, 4, used=6, size=100))
+    out = run.finish()
+    assert out["input"] == 10
+    assert out["output"] == 4
+    assert out["total"] == 14
+    # The latest context occupancy still lands on the result.
+    assert out["used"] == 6 and out["size"] == 100
+
+
+def test_context_moving_counters_still_count_once_for_cumulative_agents():
+    run = RunUsage("echo")
+    run.reset()
+    run.update(devin_update(10, 4, used=5, size=100))
+    run.update(devin_update(10, 4, used=6, size=100))
+    run.update(devin_update(12, 4, used=7, size=100))
+    out = run.finish()
+    assert out["input"] == 12
+    assert out["output"] == 4
+
+
 def test_non_devin_output_is_cumulative_snapshot():
     run = RunUsage("echo")
     run.reset()
@@ -168,6 +195,90 @@ def test_resumed_with_persisted_baseline_deltas():
     assert out["quality"] == "exact"
 
 
+def test_prompt_response_turn_scope_counts_each_snapshot_in_full():
+    """prompt_usage_scope="turn" (claude-agent-acp / codex-acp): each
+    PromptResponse.usage is this turn alone — identical follow-ups never
+    read as zero."""
+    run = RunUsage("claude", prompt_usage_scope="turn")
+    run.reset(resumed=False)
+    run.note_conversation_snapshot({"totalTokens": 150, "inputTokens": 100, "outputTokens": 50})
+    out = run.finish()
+    assert out["input"] == 100 and out["output"] == 50 and out["total"] == 150
+    assert out["quality"] == "exact"
+    run.reset(resumed=True)
+    run.note_conversation_snapshot({"totalTokens": 150, "inputTokens": 100, "outputTokens": 50})
+    out = run.finish()
+    assert out["input"] == 100 and out["output"] == 50 and out["total"] == 150
+    assert out["quality"] == "exact"
+    assert "conversation_total" not in out
+
+
+def test_prompt_response_turn_scope_needs_no_baseline_when_resumed():
+    run = RunUsage("claude", prompt_usage_scope="turn")
+    run.reset(resumed=True)  # no baseline at all — a per-turn snapshot is exact anyway
+    run.note_conversation_snapshot({"inputTokens": 10, "outputTokens": 4})
+    out = run.finish()
+    assert out["input"] == 10 and out["output"] == 4 and out["total"] == 14
+    assert out["quality"] == "exact"
+
+
+def test_prompt_response_turn_scope_yields_to_stream_counters():
+    run = RunUsage("claude", prompt_usage_scope="turn")
+    run.reset()
+    run.update({"inputTokens": 10})
+    run.note_conversation_snapshot({"inputTokens": 999, "outputTokens": 999})
+    out = run.finish()
+    assert out["input"] == 10
+    assert "999" not in repr(out)
+
+
+def test_stream_baselines_seed_prev_for_a_respawned_client():
+    """A worker respawn swaps in a fresh RunUsage; the persisted per-stream
+    baseline — not zero — is what conversation-cumulative counters delta
+    against."""
+    first = RunUsage("echo")
+    first.reset()
+    first.update({"inputTokens": 60})
+    first.finish()
+    baselines = first.stream_baselines
+    assert baselines == {"": {"input": 60}}
+    second = RunUsage("echo")
+    second.reset(resumed=True, stream_baselines=baselines)
+    second.update({"inputTokens": 75})
+    assert second.finish()["input"] == 15
+    # A counter that restarted low (per-process counters) still counts its
+    # new absolute value — the baseline only ever removes stale counts.
+    third = RunUsage("echo")
+    third.reset(resumed=True, stream_baselines=baselines)
+    third.update({"inputTokens": 7})
+    assert third.finish()["input"] == 7
+
+
+def test_stream_baselines_fill_gaps_but_never_override_live_prev():
+    run = RunUsage("echo")
+    run.reset()
+    run.update({"inputTokens": 50})
+    run.finish()
+    # A persisted baseline staler than the in-memory prev must not regress it.
+    run.reset(stream_baselines={"": {"input": 40}})
+    run.update({"inputTokens": 55})
+    assert run.finish()["input"] == 5
+
+
+def test_post_finish_deltas_carry_into_the_next_run():
+    """A UsageUpdate landing after finish() (a notification trailing the
+    PromptResponse) belongs to no finished run; the next run inherits it."""
+    run = RunUsage("echo")
+    run.reset()
+    run.update({"inputTokens": 10})
+    assert run.finish()["input"] == 10
+    run.update({"inputTokens": 15})  # straggler between runs
+    run.reset()
+    run.update({"inputTokens": 20})
+    out = run.finish()
+    assert out["input"] == 10  # 5 carried + 5 new — nothing lost or doubled
+
+
 def test_stream_counters_win_over_prompt_response_snapshot():
     run = RunUsage("echo")
     run.reset()
@@ -232,6 +343,17 @@ def test_delta_usage_reset_epoch():
     d.update({"input_tokens": 50})
     out = d.run_usage()
     assert out["input"] == 250
+
+
+def test_delta_usage_assumes_a_single_usage_channel():
+    """Pin the agy assumption: payloads carry no per-source discriminator,
+    so one shared prev tracks them — if agy ever interleaves per-source
+    counters this channel needs a stream key first."""
+    assert usage_stream_key({"input_tokens": 10, "output_tokens": 4}) == ""
+    d = DeltaUsage(count_first=True)
+    d.update({"input_tokens": 10})
+    d.update({"input_tokens": 15})
+    assert d.run_usage()["input"] == 15
 
 
 def test_run_usage_from_total_codex_shape():

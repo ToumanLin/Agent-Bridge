@@ -1,11 +1,14 @@
-// Executable behavior tests for the dashboard page's status/duration helpers.
+// Executable behavior tests for the dashboard page's status/duration helpers
+// and its conversation navigation rail.
 //
 // Extracts the real inline <script> from src/agent_bridge/share/dashboard.py's
 // PAGE and runs it inside a vm context with a minimal DOM stub — no jsdom, no
 // npm packages. Covers the centralized proc_state map, latestTask chronology,
-// the taskDur/fmtDur/durText rules end to end, and the bundled i18n layer
-// (en / zh-CN / zh-TW): dictionaries, locale resolution, localized labels,
-// and rerendering on locale switch without a transcript refetch.
+// the taskDur/fmtDur/durText rules end to end, the bundled i18n layer
+// (en / zh-CN / zh-TW), and the nav rail end to end: MARK_SEL taxonomy,
+// layoutRail geometry (cluster spans, rail bounds), updateCurMark, jumpToMark,
+// track-click seeking, roving tabindex, and the MutationObserver/ResizeObserver
+// + rAF-coalesced update loop.
 //
 // Usage: node tests/dashboard_status_behavior.js   (exit 0 = all pass)
 "use strict";
@@ -27,45 +30,114 @@ const code = (page.match(/<script>([\s\S]*?)<\/script>/g) || [])
    pending (and recorded) so no poll mutates `tasks` between assertions.
    querySelector results are cached per selector so tests can observe the
    elements the page owns (#chatstatus, #chatinput, #hwrap, ...); each element
-   records setAttribute values and returns stable children for querySelector. */
+   records setAttribute values and returns stable children for querySelector.
+   classList/children/parent links are real so the nav rail's layout, focus
+   and event wiring run unmodified. */
+const matchSel = (e, sel) => sel.split(",").some((cl) => {
+  const toks = [...cl.matchAll(/(:not\()?\.([\w-]+)\)?/g)];
+  return toks.length > 0 && toks.every((m) =>
+    m[1] ? !e.classList.contains(m[2]) : e.classList.contains(m[2]));
+});
 const created = [];
 const el = () => {
+  const classes = new Set();
+  let cn = "", html = "";
+  const sync = () => { cn = [...classes].join(" "); };
   const e = {
-    innerHTML: "", textContent: "", style: {}, title: "", type: "",
-    className: "",
-    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    textContent: "", style: {}, title: "", type: "", tagName: "",
+    classList: {
+      add: (c) => { classes.add(c); sync(); },
+      remove: (c) => { classes.delete(c); sync(); },
+      toggle: (c, f) => {
+        const on = f === undefined ? !classes.has(c) : f;
+        if (on) classes.add(c); else classes.delete(c);
+        sync(); return on;
+      },
+      contains: (c) => classes.has(c),
+    },
     dataset: {}, disabled: false, value: "", placeholder: "", tabIndex: 0,
     open: false, hidden: false, isConnected: true, offsetTop: 0,
-    children: [], firstChild: null, firstElementChild: null,
+    children: [], _parent: null,
     scrollTop: 0, scrollHeight: 0, clientHeight: 0,
-    attrs: {}, _q: {}, focused: 0,
-    appendChild() {}, insertAdjacentHTML() {}, after() {},
+    attrs: {}, _q: {}, _ls: {}, focused: 0, onclick: null,
+    appendChild(c) {
+      if (c._parent) c._parent.children.splice(c._parent.children.indexOf(c), 1);
+      c._parent = e; e.children.push(c); return c;
+    },
+    insertAdjacentHTML() {},
+    after(sib) {
+      const p = e._parent; if (!p) return;
+      p.children.splice(p.children.indexOf(e) + 1, 0, sib); sib._parent = p;
+    },
     setAttribute(k, v) { e.attrs[k] = String(v); },
     getAttribute(k) { return e.attrs[k]; },
     removeAttribute(k) { delete e.attrs[k]; },
-    replaceChildren() {},
-    addEventListener() {},
+    replaceChildren() {
+      e.children.forEach((c) => { c._parent = null; }); e.children = [];
+    },
+    addEventListener(ev, fn) { (e._ls[ev] || (e._ls[ev] = [])).push(fn); },
+    removeEventListener() {},
     querySelector(s) { return e._q[s] || (e._q[s] = el()); },
-    querySelectorAll: () => [],
-    focus() { e.focused++; },
-    remove() {},
+    querySelectorAll(s) {
+      const out = [];
+      const walk = (k) => {
+        for (const c of k.children) { if (matchSel(c, s)) out.push(c); walk(c); }
+      };
+      walk(e); return out;
+    },
+    focus() { e.focused++; documentStub.activeElement = e; },
+    remove() {
+      const p = e._parent;
+      if (p) { p.children.splice(p.children.indexOf(e), 1); e._parent = null; }
+    },
+    scrollTo(o) {
+      e._scrollToArgs = o;
+      if (o && typeof o.top === "number") e.scrollTop = o.top;
+    },
   };
+  Object.defineProperty(e, "className", {
+    get: () => cn,
+    set: (v) => {
+      cn = String(v); classes.clear();
+      cn.split(/\s+/).filter(Boolean).forEach((c) => classes.add(c));
+    },
+  });
+  Object.defineProperty(e, "innerHTML", {
+    get: () => html,
+    set: (v) => {
+      html = String(v);
+      e.children.forEach((c) => { c._parent = null; }); e.children = [];
+    },
+  });
+  Object.defineProperty(e, "firstChild", { get: () => e.children[0] || null });
+  Object.defineProperty(e, "firstElementChild",
+    { get: () => e.children[0] || null });
   return e;
 };
 const listeners = {};        // captured window/document event listeners
 const elCache = {};
+// #content/#rail are pre-seeded so the rail tests can drive real geometry.
+const contentEl = el();
+const railEl = el();
+elCache["#content"] = contentEl;
+elCache["#rail"] = railEl;
 const documentStub = {
   documentElement: Object.assign(el(), { lang: "" }),
   activeElement: null, title: "", visibilityState: "visible",
   querySelector: (s) => elCache[s] || (elCache[s] = el()),
   querySelectorAll: () => [],
-  createElement() {
-    const e = el(); created.push(e); return e;
+  createElement(tag) {
+    const e = el(); e.tagName = String(tag || "").toUpperCase();
+    created.push(e); return e;
   },
   addEventListener(ev, fn) { (listeners[ev] || (listeners[ev] = [])).push(fn); },
 };
 const pending = () => new Promise(() => {});
 const fetchCalls = [];
+const mediaStubs = {};       // media query -> shared matchMedia stub
+const moCalls = [], roCalls = [];   // observer registrations
+const rafQ = [];             // queued requestAnimationFrame callbacks
+const runRaf = () => { const q = rafQ.splice(0); q.forEach((f) => f()); };
 const store = {};            // mutable localStorage backing
 const sandbox = {
   document: documentStub,
@@ -80,19 +152,27 @@ const sandbox = {
   sessionStorage: { getItem: () => "SHARED", setItem() {} },
   navigator: { sendBeacon() {}, languages: ["en-US"], language: "en-US" },
   crypto: { randomUUID: () => "00000000-0000-0000-0000-000000000000" },
-  matchMedia: () => ({
-    matches: false, media: "", addEventListener() {}, removeEventListener() {},
+  // matchMedia stubs are shared per query so tests can flip .matches later
+  // (the page keeps the object it received for prefers-reduced-motion).
+  matchMedia: (q) => mediaStubs[q] || (mediaStubs[q] = {
+    matches: false, media: q, addEventListener() {}, removeEventListener() {},
     addListener() {}, removeListener() {},
   }),
   addEventListener(ev, fn) { (listeners[ev] || (listeners[ev] = [])).push(fn); },
   removeEventListener() {},
   setInterval: () => 0, clearInterval() {},
   setTimeout: () => 0, clearTimeout() {},
-  requestAnimationFrame: () => 0,
+  // rAF callbacks queue up; tests drain them explicitly via runRaf().
+  requestAnimationFrame: (fn) => { rafQ.push(fn); return rafQ.length; },
   performance: { now: () => 0 },
-  // Observer no-ops: the rail wiring runs but never fires a layout pass.
-  MutationObserver: function () { return { observe() {}, disconnect() {} }; },
-  ResizeObserver: function () { return { observe() {}, disconnect() {} }; },
+  // Observers record their callback/target/options so tests can verify the
+  // wiring and fire a notification on demand.
+  MutationObserver: function (cb) {
+    return { observe(t, o) { moCalls.push({ cb, t, o }); }, disconnect() {} };
+  },
+  ResizeObserver: function (cb) {
+    return { observe(t, o) { roCalls.push({ cb, t, o }); }, disconnect() {} };
+  },
   console,
 };
 sandbox.window = sandbox;
@@ -102,27 +182,30 @@ vm.runInContext(
     "\n;globalThis.__x = { statusOf, latestTask, taskDur, fmtDur, durText," +
     " durSpan, PROC_STATUS, subSeed, agentAvatar, statusGlyph, icon," +
     " usageNums, tokCount, runTok, tokTitle, fmtTok, tokSpan, turnDurMs," +
-    " addTurn, addPrompt, addTool, addToolStatus, clusterYs, markable," +
+    " addTurn, addPrompt, addTool, addToolStatus, clusterYs, applyEvents," +
     " MARK_SEL, MARK_GAP," +
     " scheduleRail, layoutRail, jumpToMark, updateCurMark," +
     " t, LOCALES, LOCALE_PREFS, localePref, resolveSystemLocale," +
     " setLocalePref, applyLocale, rerenderLocale, ago, fmtTs, fmtNum," +
-    " sendKey, sendErrState, setSendState, renderSendStatus," +
+    " sendKey, sendErrState, SEND_ERR, setSendState, renderSendStatus," +
     " refreshComposer, toolKindLabel, stopReasonLabel, renderLive," +
+    " thinkLabel," +
     " select, pollEvents, sendState," +
     " _setTasks: (v) => { tasks = v; }," +
     " _setSessions: (v) => { sessions = v; }," +
     " _cache: () => eventsCache, _polled: () => polled," +
     " _panes: () => panes, _rendered: () => rendered," +
+    " _railBtns: () => railBtns, _setSelected: (v) => { selected = v; }," +
     " _getLocale: () => locale, _getLangPref: () => langPref };",
   sandbox);
 const X = sandbox.__x;
 
 /* ---------- assertions ---------- */
 let failed = 0;
+const fmt = (v) => { try { return JSON.stringify(v); } catch (e) { return String(v); } };
 function eq(got, want, name) {
   const ok = got === want;
-  console.log(`${ok ? "PASS" : "FAIL"} ${name}  got=${JSON.stringify(got)} want=${JSON.stringify(want)}`);
+  console.log(`${ok ? "PASS" : "FAIL"} ${name}  got=${fmt(got)} want=${fmt(want)}`);
   if (!ok) failed++;
 }
 const sess = (proc_state, id = "s1") =>
@@ -389,31 +472,225 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
     src: null });
   X.addTurn({ t: "turn", ts: "2026-01-01T00:00:45Z", stop_reason: "end_turn" });
   eq(spanText(), "turn ended · 40s", "legacy prompt-pair fallback in text");
-  documentStub.createElement = function () {
-    const e = el(); created.push(e); return e;
+  documentStub.createElement = function (tag) {
+    const e = el(); e.tagName = String(tag || "").toUpperCase();
+    created.push(e); return e;
   };
 
-  // --- nav rail: mark predicate mirrors MARK_SEL (user cards excluded) ---
-  const fakeEl = (cls) => ({ classList: { contains: (c) => cls.includes(c) } });
-  eq(X.markable(fakeEl(["block", "card", "msg"])), true,
-    "agent message card is marked");
-  eq(X.markable(fakeEl(["block", "card", "prompt"])), true,
-    "dispatched prompt card is marked");
-  eq(X.markable(fakeEl(["block", "card", "prompt", "user"])), false,
-    "dashboard-authored User Message card is excluded");
-  eq(X.markable(fakeEl(["block", "think"])), false, "think fold excluded");
-  eq(X.markable(fakeEl(["block", "toolgroup"])), false, "tool group excluded");
-  eq(X.markable(fakeEl(["block", "card", "toolgroup"])), false,
-    "card without msg/prompt kind excluded");
-  eq(X.markable(fakeEl(["turnend"])), false, "turn divider excluded");
-  eq(X.markable(fakeEl(["turnend", "err"])), false, "error divider excluded");
-  eq(X.markable(fakeEl(["card", "msg"])), false, "non-block card excluded");
-  eq(X.markable(fakeEl(["empty"])), false, "empty placeholder excluded");
-  eq(X.MARK_SEL.includes(".block.card.msg"), true, "MARK_SEL marks msg cards");
-  eq(X.MARK_SEL.includes(":not(.user)"), true, "MARK_SEL excludes user cards");
-  eq(X.MARK_GAP, 6, "cluster gap is 6px");
+  /* ================= nav rail: marks, geometry, interaction =================
+     contentEl/railEl carry real children, offsetTop values and scroll
+     metrics, so layoutRail/updateCurMark/jumpToMark and the rail's own
+     listeners run unmodified inside the vm. */
+  const yOf = (b) =>
+    parseFloat(b.style.transform.match(/translateY\(([-\d.]+)/)[1]);
+  const hOf = (b) => parseFloat(b.style.height);
+  const fire = (t, ev, arg) => (t._ls[ev] || []).forEach((f) => f(arg));
+  const cardAt = (cls, top) => {
+    const c = el(); c.className = cls; c.offsetTop = top; return c;
+  };
+  // Fresh fixture scene: children + metrics, scroll back to the rest position.
+  const railScene = (clsTops, doc, rh) => {
+    contentEl.children = clsTops.map(([cls, top]) => cardAt(cls, top));
+    contentEl.scrollHeight = doc; contentEl.scrollTop = 0;
+    railEl.clientHeight = rh;
+    X.layoutRail();
+    return X._railBtns();
+  };
 
-  // --- nav rail: clusterYs single-linkage clustering within `gap` px ---
+  // --- taxonomy: normalized events -> DOM -> marks. Only agent message
+  //     cards and MCP-dispatched prompt cards are marked; dashboard-authored
+  //     "User Message" cards, thinking folds, tool groups, turn/error
+  //     dividers, empty states and usage-only events never get one. ---
+  eq(X.MARK_SEL, ".block.card.msg,.block.card.prompt:not(.user)",
+    "MARK_SEL is the pinned taxonomy selector");
+  eq(X.MARK_GAP, 6, "cluster gap is 6px");
+  X._setSelected("rail-sess");
+  X._setTasks([task({})]);
+  contentEl.children = [];
+  X.applyEvents([
+    { t: "prompt", ts: "2026-01-01T00:00:05Z", text: "mcp task", src: "mcp" },
+    { t: "prompt", ts: "2026-01-01T00:00:06Z", text: "typed", src: "dashboard" },
+    { t: "msg", ts: "2026-01-01T00:00:07Z", text: "working on it" },
+    { t: "think", ts: "2026-01-01T00:00:08Z", text: "hmm" },
+    { t: "tool", ts: "2026-01-01T00:00:09Z", id: "tc9", kind: "read",
+      title: "read f" },
+    { t: "tool_status", ts: "2026-01-01T00:00:10Z", id: "tc9",
+      status: "completed" },
+    { t: "turn", ts: "2026-01-01T00:00:42Z", task: "t1",
+      stop_reason: "end_turn" },
+    { t: "error", ts: "2026-01-01T00:00:43Z", text: "boom" },
+    { t: "usage", ts: "2026-01-01T00:00:44Z", consumed: { total: 5 } },
+  ]);
+  eq(contentEl.children.length, 7,
+    "taxonomy: every DOM-producing event kind rendered");
+  contentEl.children.forEach((c, i) => {
+    c.offsetTop = [20, 140, 260, 380, 500, 620, 740][i];
+  });
+  contentEl.scrollHeight = 800; contentEl.clientHeight = 400;
+  railEl.clientHeight = 100;
+  X.layoutRail();
+  let bs = X._railBtns();
+  eq(bs.length, 2, "marks = dispatched prompt + agent message only");
+  eq(bs[0]._els[0], contentEl.children[0], "mark 0 -> dispatched prompt card");
+  eq(bs[1]._els[0], contentEl.children[2], "mark 1 -> agent message card");
+  eq(railEl.hidden, false, "rail shown when markable cards exist");
+  eq(bs[0].attrs["aria-label"].includes("Dispatched message"), true,
+    "dispatched prompt mark gets the localized kind label");
+  eq(bs[1].attrs["aria-label"].includes("Agent message"), true,
+    "agent mark gets the localized kind label");
+  eq(bs[0].title, bs[0].attrs["aria-label"], "title mirrors the aria-label");
+  // Document-fraction positions: offsetTop / scrollHeight * railHeight.
+  eq(yOf(bs[0]), 2.5, "mark y is the card's document fraction (20/800*100)");
+  eq(yOf(bs[1]), 32.5, "mark y is the card's document fraction (260/800*100)");
+  eq(hOf(bs[0]), 3, "a lone mark is 3px tall");
+
+  // --- a sensible current mark exists at scrollTop = 0 ---
+  contentEl.scrollTop = 0;
+  X.updateCurMark();
+  eq(bs[0].classList.contains("cur"), true,
+    "first mark is current at scrollTop=0");
+  eq(bs[0].attrs["aria-current"], "true", "aria-current on the first mark");
+  eq(bs[0].tabIndex, 0, "first mark is the rail's tab stop at rest");
+  eq(bs[1].tabIndex, -1, "other marks leave the tab order at rest");
+
+  // --- the scroll hook tracks the top-of-viewport card ---
+  contentEl.scrollTop = 300;          // probe y=308: card tops 20,260 pass
+  fire(contentEl, "scroll");
+  eq(bs[1].classList.contains("cur"), true, "scrolling moves current to mark 1");
+  eq(bs[0].attrs["aria-current"], undefined, "aria-current leaves mark 0");
+  eq(bs[1].attrs["aria-current"], "true", "aria-current lands on mark 1");
+
+  // --- cluster pills: height covers the member span, never overflow ---
+  bs = railScene([["block card msg", 100], ["block card msg", 400],
+    ["block card msg", 430]], 1000, 100);
+  eq(bs.length, 2, "3px-apart marks cluster, the 30px one stays single");
+  eq(yOf(bs[1]), 40, "cluster anchored at its first member");
+  eq(hOf(bs[1]), 6, "cluster pill covers member span + 3");
+  // A cluster that ends exactly at the rail's bottom edge must not paint past
+  // it: anchor clamps to RH - height instead of hanging over the chatbar.
+  bs = railScene([["block card msg", 100], ["block card msg", 980],
+    ["block card msg", 985], ["block card prompt", 990],
+    ["block card msg", 995]], 1000, 100);
+  eq(bs.length, 2, "four close marks merge into one bottom cluster");
+  bs.forEach((b, i) => eq(
+    yOf(b) >= 0 && yOf(b) + hOf(b) <= railEl.clientHeight, true,
+    `pill ${i} fully inside rail bounds`));
+  eq(yOf(bs[1]) + hOf(bs[1]), 100,
+    "bottom cluster lands exactly on the rail's bottom edge");
+  // Cluster label: localized count + the first member's timestamp.
+  contentEl.children[1].querySelector(".ctime").textContent = "10:00";
+  X.layoutRail();
+  eq(bs[1].attrs["aria-label"], "4 messages · 10:00",
+    "cluster label = localized count + first member time");
+
+  // --- mark buttons are reused across layout passes (no DOM churn) ---
+  const reused = bs[0];
+  X.layoutRail();
+  eq(X._railBtns()[0], reused, "layout passes reuse existing mark buttons");
+
+  // --- jumpToMark: scrolls to the card, keyboard clicks also focus it ---
+  const card0 = bs[0]._els[0];
+  contentEl._scrollToArgs = null;
+  bs[0].onclick({ detail: 1 });
+  eq(contentEl._scrollToArgs.top, 92, "jump scrolls to offsetTop-8");
+  eq(contentEl._scrollToArgs.behavior, "smooth", "smooth scroll by default");
+  eq(card0.focused, 0, "mouse click never moves focus to the card");
+  mediaStubs["(prefers-reduced-motion: reduce)"].matches = true;
+  bs[0].onclick({ detail: 1 });
+  eq(contentEl._scrollToArgs.behavior, "auto",
+    "reduced motion jumps instantly");
+  mediaStubs["(prefers-reduced-motion: reduce)"].matches = false;
+  bs[0].onclick({ detail: 0 });
+  eq(card0.focused, 1, "keyboard-activated click focuses the card");
+  eq(card0.tabIndex, -1, "card takes tabIndex=-1 for programmatic focus");
+  eq(documentStub.activeElement, card0, "card becomes the active element");
+
+  // --- roving tabindex: one tab stop, arrows/Home/End move it ---
+  bs[0].focus();
+  let pd = 0;
+  fire(railEl, "keydown", { key: "ArrowDown", preventDefault: () => pd++ });
+  eq(pd, 1, "ArrowDown is handled");
+  eq(documentStub.activeElement, bs[1], "ArrowDown focuses the next mark");
+  eq(bs[1].tabIndex, 0, "the tab stop moved with focus");
+  eq(bs[0].tabIndex, -1, "the previous mark leaves the tab order");
+  fire(railEl, "keydown", { key: "End", preventDefault: () => pd++ });
+  eq(documentStub.activeElement, bs[1], "End focuses the last mark");
+  fire(railEl, "keydown", { key: "Home", preventDefault: () => pd++ });
+  eq(documentStub.activeElement, bs[0], "Home focuses the first mark");
+  // While the rail is in use the tab stop stays on the focused mark even
+  // when scroll position makes another mark current.
+  bs[1].focus();
+  contentEl.scrollTop = 985;          // probe passes the cluster's first member
+  X.updateCurMark();
+  eq(bs[1].classList.contains("cur"), true, "current mark tracks scroll");
+  contentEl.scrollTop = 0;
+  X.updateCurMark();
+  eq(bs[0].classList.contains("cur"), true, "current mark back to the first");
+  eq(bs[1].tabIndex, 0, "focused mark keeps the tab stop");
+  eq(bs[0].tabIndex, -1,
+    "current mark leaves the tab order while another is focused");
+
+  // --- bare-track click: same document fraction the marks are placed by ---
+  contentEl._scrollToArgs = null;
+  fire(railEl, "click", { target: railEl, offsetY: 50 });
+  eq(contentEl._scrollToArgs.top, 500,
+    "track click seeks to offsetY/RH * scrollHeight");
+  // Clicking level with a mark lands that card at the top of the viewport.
+  fire(railEl, "click", { target: railEl, offsetY: yOf(bs[0]) });
+  eq(contentEl._scrollToArgs.top, bs[0]._els[0].offsetTop,
+    "clicking level with a mark seeks exactly to its card");
+  fire(railEl, "click", { target: railEl, offsetY: 100 });
+  eq(contentEl._scrollToArgs.top, 600, "track bottom clamps to doc - viewport");
+  const lastTop = contentEl._scrollToArgs.top;
+  fire(railEl, "click", { target: bs[0], offsetY: 50 });
+  eq(contentEl._scrollToArgs.top, lastTop,
+    "mark clicks are not double-handled by the track listener");
+
+  // --- live updates: observers schedule one rAF-coalesced layout pass ---
+  eq(moCalls.length, 1, "a single MutationObserver is registered");
+  eq(moCalls[0].t, contentEl, "MutationObserver watches #content");
+  eq(!!(moCalls[0].o.childList && moCalls[0].o.subtree &&
+    moCalls[0].o.characterData), true,
+    "observer watches childList + subtree + characterData");
+  eq(moCalls[0].o.attributeFilter.join(","), "open,class",
+    "only open/class attribute changes trigger a rescan");
+  eq(roCalls.length === 1 && roCalls[0].t === contentEl, true,
+    "ResizeObserver watches #content");
+  runRaf();                    // flush the boot-time scheduleRail callback
+  eq(rafQ.length, 0, "no rail work pending once the queue is drained");
+  moCalls[0].cb();
+  eq(rafQ.length, 1, "a mutation schedules a rail layout pass");
+  moCalls[0].cb(); roCalls[0].cb();
+  eq(rafQ.length, 1, "further notifications coalesce into the same frame");
+  contentEl.children = [cardAt("block card msg", 50)];
+  runRaf();
+  eq(X._railBtns().length, 1, "the scheduled pass re-derives marks");
+
+  // --- rail hides cleanly: nothing markable, or no selected session ---
+  X.layoutRail();
+  eq(railEl.hidden, false, "rail shown for the remaining mark");
+  contentEl.children = [];
+  X.layoutRail();
+  eq(railEl.hidden, true, "rail hides with no markable cards");
+  eq(X._railBtns().length, 0, "stale marks are removed");
+  contentEl.children = [cardAt("block card msg", 50)];
+  X._setSelected(null);
+  X.layoutRail();
+  eq(railEl.hidden, true, "rail hides with no selected session");
+  X._setSelected("rail-sess");
+  X.layoutRail();
+  eq(railEl.hidden, false, "rail restores on selection");
+  // A mark whose card was detached (pane stash) is a safe no-op.
+  const stale = X._railBtns()[0];
+  contentEl.children[0].isConnected = false;
+  contentEl.children = [];
+  X.layoutRail();
+  contentEl._scrollToArgs = null;
+  stale.onclick({ detail: 0 });
+  eq(contentEl._scrollToArgs, null, "detached mark click never scrolls");
+  documentStub.activeElement = null;
+
+  // --- clusterYs single-linkage clustering within `gap` px ---
   let g = X.clusterYs([0, 5, 20, 24, 50], 6);
   eq(g.length, 3, "clusters: [0,5] [20,24] [50]");
   eq(g[0].idx.length, 2, "first cluster holds two marks");
@@ -427,11 +704,6 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   eq(X.clusterYs([], 6).length, 0, "no marks -> no clusters");
   eq(X.clusterYs([0, 0, 0], 0).length, 3,
     "zero gap never clusters (unmeasurable-layout fallback)");
-  // rail wiring degrades safely: helpers callable with an empty DOM stub.
-  X.layoutRail();
-  X.updateCurMark();
-  X.scheduleRail();
-  eq(true, true, "rail helpers run on the DOM stub without throwing");
 
   /* ================= i18n: bundled dictionaries ================= */
 
@@ -552,10 +824,57 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   eq(X.fmtDur(40 * 1000), "40 秒", "duration zh-TW");
   eq(X.tokTitle({ total: 72 }).includes("執行 token 72"), true,
     "token tooltip zh-TW");
+  eq(X.stopReasonLabel("paused"), "已暫停", "paused stop reason zh-TW");
   X.setLocalePref("en");
   eq(X.ago(new Date(Date.now() - 30e3).toISOString()), "30s ago",
     "relative time en");
   eq(X.t("tokens.run", { n: "72" }), "Run tokens 72", "token tooltip en");
+  eq(X.stopReasonLabel("paused"), "paused", "paused stop reason en");
+
+  // --- invalid/missing timestamps render nothing in any locale ---
+  for (const loc of ["en", "zh-CN", "zh-TW"]) {
+    X.setLocalePref(loc);
+    eq(X.fmtTs("garbage"), "", `fmtTs unparseable -> "" (${loc})`);
+    eq(X.fmtTs(undefined), "", `fmtTs undefined -> "" (${loc})`);
+    eq(X.fmtTs(null), "", `fmtTs null -> "" (${loc})`);
+    eq(X.ago("garbage"), "", `ago unparseable -> "" (${loc})`);
+    eq(X.ago(undefined), "", `ago undefined -> "" (${loc})`);
+    eq(X.ago(null), "", `ago null -> "" (${loc})`);
+  }
+  X.setLocalePref("en");
+  eq(X.ago(new Date(Date.now() + 60000).toISOString()), "0s ago",
+    "future timestamp clamps to 0s ago");
+  eq(X.fmtTs("2026-01-01T10:00:00Z") !== "", true,
+    "fmtTs valid timestamp still renders");
+  X.setLocalePref("zh-CN");
+  eq(X.ago(new Date(Date.now() - 30e3).toISOString()), "30 秒前",
+    "valid ago still localizes zh-CN");
+  X.setLocalePref("en");
+
+  // --- thinking fold count: words for space-separated scripts, characters
+  //     for predominantly-CJK text ---
+  eq(X.thinkLabel("hello world foo"), "Thinking · 3 words",
+    "en word count unchanged");
+  eq(X.thinkLabel("分析一下这个问题"), "Thinking · 8 chars",
+    "CJK-dominant text counts characters (en)");
+  eq(X.thinkLabel("ok 分析 done"), "Thinking · 3 words",
+    "Latin-dominant mixed text keeps word counting");
+  X.setLocalePref("zh-CN");
+  eq(X.thinkLabel("hello world foo"), "思考中 · 3 词", "zh-CN word count");
+  eq(X.thinkLabel("分析一下这个问题"), "思考中 · 8 字", "zh-CN char count");
+  X.setLocalePref("zh-TW");
+  eq(X.thinkLabel("分析一下这个问题"), "思考中 · 8 字", "zh-TW char count");
+  X.setLocalePref("en");
+
+  // --- compact token unit comes from the dictionary ---
+  const unitTk = task({ run_usage: { scope: "run", quality: "exact",
+    input: 10, output: 4, total: 14 } });
+  eq(X.tokSpan(unitTk, "stok").includes("14 tok"), true,
+    "en compact unit is 'tok'");
+  X.setLocalePref("zh-CN");
+  eq(X.tokSpan(unitTk, "stok").includes("14 token"), true,
+    "zh-CN unit is the full 'token'");
+  X.setLocalePref("en");
 
   // --- tool kinds / status a11y / stop reasons localize; raw stays raw ---
   X.setLocalePref("zh-CN");
@@ -567,6 +886,7 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
     "end_turn is suppressed upstream, stays raw here");
   eq(X.stopReasonLabel("provider_x"), "provider_x",
     "unknown stop reason stays raw");
+  eq(X.stopReasonLabel("paused"), "已暂停", "paused stop reason zh-CN");
   const beforeTool = created.length;
   X.addTool({ t: "tool", ts: 1, id: "tc1", kind: "execute", title: "run ls",
     input: "ls -la" });
@@ -584,6 +904,16 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
     ts: 9 });
   eq(toolRow._q[".st"].attrs["aria-label"], undefined,
     "unknown tool status drops the a11y label (raw text instead)");
+  // Invalid tool timestamps leave the duration empty — never "NaNms".
+  const beforeTool2 = created.length;
+  X.addTool({ t: "tool", ts: "bogus", id: "tc2", kind: "read", title: "r" });
+  const toolRow2 = created.slice(beforeTool2)
+    .find((e) => e.className === "tool");
+  X.addToolStatus({ t: "tool_status", id: "tc2", status: "completed",
+    ts: 5 });
+  const durEl = toolRow2._q[".dur"];
+  eq(durEl ? durEl.textContent : "", "",
+    "invalid tool timestamp renders no duration (no NaN leak)");
   X.setLocalePref("en");
   eq(X.toolKindLabel("execute"), "Execute", "tool kind execute en");
 
@@ -603,6 +933,32 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   eq(X.sendErrState({ error_code: "nope", error: "weird" }).key,
     "send.failed", "unknown error_code -> generic failed key");
   eq(X.sendErrState({}).key, "send.failed", "no error_code -> generic key");
+  // Registry/endpoint error codes all map to localized labels; the raw
+  // diagnostic stays in the tooltip detail only.
+  for (const [code, key] of [
+    ["invalid_record", "send.err_invalid_record"],
+    ["dispatch_failed", "send.err_dispatch_failed"],
+    ["dispatch_error", "send.err_dispatch_error"],
+    ["bad_name", "send.err_bad_request"],
+  ]) {
+    const st = X.sendErrState({ error_code: code, error: "raw diag" });
+    eq(st.key, key, `error_code ${code} -> ${key}`);
+    eq(st.detail, "raw diag", `${code} keeps raw error as detail`);
+    eq(st.final, true, `${code} is final`);
+  }
+  eq(X.SEND_ERR.not_found, undefined,
+    "not_found stays on the generic fallback (unreachable from the page)");
+  X.setLocalePref("zh-CN");
+  eq(X.t(X.sendErrState({ error_code: "dispatch_failed" }).key), "派发失败",
+    "dispatch_failed label zh-CN");
+  eq(X.t(X.sendErrState({ error_code: "invalid_record" }).key),
+    "无效的队列消息", "invalid_record label zh-CN");
+  X.setLocalePref("zh-TW");
+  eq(X.t(X.sendErrState({ error_code: "dispatch_error" }).key), "派發錯誤",
+    "dispatch_error label zh-TW");
+  eq(X.t(X.sendErrState({ error_code: "invalid_record" }).key),
+    "無效的佇列訊息", "invalid_record label zh-TW");
+  X.setLocalePref("en");
 
   // selected session + send state + placeholder rerender on locale switch
   X._setSessions([{ session_id: "s1", proc_state: "ready", title: "s1",
@@ -635,6 +991,29 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
     params: { task: "task_9" }, final: true });
   eq(elCache["#chatstatus"].textContent, "已派发 · task_9",
     "dispatched task id interpolates verbatim zh-CN");
+  // A bridge-emitted error_code renders the localized label on the status
+  // line; the raw diagnostic lives only in the tooltip.
+  X.setSendState("s1", X.sendErrState({ error_code: "dispatch_error",
+    error: "provider boom" }));
+  eq(elCache["#chatstatus"].textContent, "派发错误",
+    "registry error_code renders the localized label, not raw English");
+  eq(elCache["#chatstatus"].title, "provider boom",
+    "raw diagnostic survives only in the tooltip");
+  X.setLocalePref("zh-TW");
+  eq(elCache["#chatstatus"].textContent, "派發錯誤",
+    "error status re-renders zh-TW from the stored key");
+
+  // --- turn divider with the paused stop reason fully localized ---
+  X._setTasks([task({})]);
+  documentStub.createElement = () => (lastDiv = el());
+  X.addTurn({ t: "turn", task: "t1", ts: "2026-01-01T00:00:42Z",
+    stop_reason: "paused" });
+  eq(spanText(), "回合已結束 · 40 秒 · 已暫停",
+    "paused turn divider fully localized zh-TW");
+  documentStub.createElement = function (tag) {
+    const e = el(); e.tagName = String(tag || "").toUpperCase();
+    created.push(e); return e;
+  };
 
   // transcript re-render from eventsCache — zero refetch, source preserved
   X._cache().s1 = [{ t: "prompt", ts: "2026-01-01T00:00:05Z",

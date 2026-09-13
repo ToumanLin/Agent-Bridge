@@ -410,6 +410,159 @@ async def test_legacy_records_without_owner_fields_are_adopted(bridge_home):
 
 
 @pytest.mark.asyncio
+async def test_failed_turn_keeps_its_accumulated_run_usage(bridge_home, tmp_path, monkeypatch):
+    """A turn that ends in an error TurnResult still lands its accumulated
+    run_usage on the failed task — check_task/wait_task expose it."""
+
+    async def mid_stream_error(self, session, task):
+        return TurnResult(
+            text="partial",
+            stop_reason="error",
+            error="worker blew up",
+            usage={"inputTokens": 60},
+            run_usage={
+                "scope": "run",
+                "quality": "exact",
+                "input": 60,
+                "output": 12,
+                "total": 72,
+            },
+        )
+
+    monkeypatch.setattr(FakeAdapter, "run_turn", mid_stream_error)
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "boom", cwd=str(work.resolve()))
+        waited = await registry.wait_task(dispatched["task_id"], timeout_sec=5)
+        assert waited["status"] == "failed"
+        assert waited["error"] == "worker blew up"
+        assert waited["run_usage"]["total"] == 72
+        checked = registry.check_task(dispatched["task_id"])
+        assert checked["run_usage"]["total"] == 72
+        # `usage` stays the legacy raw snapshot — the total lives in run_usage.
+        assert checked["usage"] == {"inputTokens": 60}
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_orphaned_running_task_recovers_partial_run_usage(bridge_home, monkeypatch):
+    """A running task whose owner bridge died keeps the transcript's last
+    usage snapshot — marked partial — instead of reporting nothing."""
+    monkeypatch.setattr("agent_bridge.registry.owner_alive", lambda pid, create_time: False)
+    cwd = str(Path.cwd())
+    atomic_write_json(
+        state_path(bridge_home),
+        {
+            "sessions": [
+                Session(
+                    session_id="sess_orphan",
+                    agent="fake",
+                    cwd=cwd,
+                    proc_state=ProcState.busy,
+                    owner_pid=9999,
+                    owner_create_time=1.0,
+                ).model_dump(mode="json")
+            ],
+            "tasks": [
+                Task(
+                    task_id="task_orphan",
+                    session_id="sess_orphan",
+                    agent="fake",
+                    message="in flight",
+                    cwd=cwd,
+                    status=TaskStatus.running,
+                    started_at="2000-01-01T00:00:00+00:00",
+                    owner_pid=9999,
+                    owner_create_time=1.0,
+                ).model_dump(mode="json")
+            ],
+        },
+    )
+    append_event(
+        "sess_orphan",
+        "usage",
+        {
+            "update_type": "UsageUpdate",
+            "consumed": {
+                "scope": "run",
+                "quality": "exact",
+                "input": 60,
+                "output": 12,
+                "total": 72,
+            },
+        },
+        bridge_home,
+    )
+    registry = Registry.create(bridge_home, owner_pid=2002, owner_create_time=22.0)
+    await registry.start()
+    try:
+        task = registry.tasks["task_orphan"]
+        assert task.status == TaskStatus.failed
+        assert task.error == "bridge_restarted"
+        assert task.run_usage["total"] == 72
+        assert task.run_usage["partial"] is True
+        snap = registry.check_task("task_orphan")
+        assert snap["run_usage"]["total"] == 72
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_orphaned_task_does_not_inherit_a_prior_runs_usage(bridge_home, monkeypatch):
+    """Usage events older than the adopted task's started_at belong to a
+    prior run on the session — never attributed to this one."""
+    monkeypatch.setattr("agent_bridge.registry.owner_alive", lambda pid, create_time: False)
+    cwd = str(Path.cwd())
+    atomic_write_json(
+        state_path(bridge_home),
+        {
+            "sessions": [
+                Session(
+                    session_id="sess_prior",
+                    agent="fake",
+                    cwd=cwd,
+                    proc_state=ProcState.busy,
+                    owner_pid=9999,
+                    owner_create_time=1.0,
+                ).model_dump(mode="json")
+            ],
+            "tasks": [
+                Task(
+                    task_id="task_prior",
+                    session_id="sess_prior",
+                    agent="fake",
+                    message="in flight",
+                    cwd=cwd,
+                    status=TaskStatus.running,
+                    # The task started after the only usage event on disk.
+                    started_at="2999-01-01T00:00:00+00:00",
+                    owner_pid=9999,
+                    owner_create_time=1.0,
+                ).model_dump(mode="json")
+            ],
+        },
+    )
+    append_event(
+        "sess_prior",
+        "usage",
+        {"update_type": "UsageUpdate", "consumed": {"scope": "run", "quality": "exact", "total": 99}},
+        bridge_home,
+    )
+    registry = Registry.create(bridge_home, owner_pid=2002, owner_create_time=22.0)
+    await registry.start()
+    try:
+        task = registry.tasks["task_prior"]
+        assert task.status == TaskStatus.failed
+        assert task.run_usage == {}
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
 async def test_get_result_includes_workspace_writes(bridge_home, tmp_path, monkeypatch):
     work = tmp_path / "work"
     work.mkdir()

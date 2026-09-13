@@ -109,6 +109,8 @@ Close coordinators that are holding Bridge, then `agent-bridge upgrade`, then re
 | `get_result` | Complete final result in pages + changed files |
 | `get_transcript` | Paged session log |
 | `cancel_task` | Cancel the in-flight turn |
+| `pause_task` | End the turn gracefully; keep it resumable |
+| `resume_task` | Continue a paused/cancelled/failed task on the same session |
 | `list_sessions` | Known sessions |
 | `list_tasks` | This instance's tasks plus sibling-owned ones (`remote` / `owner` metadata) |
 | `end_session` | Shut down a worker process |
@@ -128,10 +130,16 @@ Tasks keep their owning Bridge instance. After a coordinator restart, a task a
 live sibling still owns shows `remote: true` in `list_tasks` / `check_task` /
 `wait_task` / `get_result` — the new instance can poll it and read its result,
 but never runs or cancels it; `owner_lost: true` marks one whose owner died
-mid-run. With opt-in `[server] shutdown_policy = "linger"`, an orderly host
-shutdown (stdin EOF) lets in-flight turns finish first, bounded by
-`linger_max_sec` (default 86400 s); force-killing the Bridge still loses the
-worker pipes, and pausing a turn is not supported.
+mid-run. `pause_task` ends an in-flight turn gracefully — the row lands
+terminal (`cancelled` / `stop_reason: "paused"`) with its partial result,
+transcript, and session intact — and `resume_task` continues it as a new,
+linked task on the same conversation. A dead owner's `resumable` row can be
+resumed too: the next instance adopts the session and reaps its orphaned
+worker before respawning, so two executors never drive one conversation. With
+opt-in `[server] shutdown_policy = "linger"`, an orderly host shutdown (stdin
+EOF) lets in-flight turns finish first, bounded by `linger_max_sec` (default
+86400 s); linger cannot defeat a host force-kill of the Bridge process tree —
+park the turn with `pause_task` first, then `resume_task` after the restart.
 
 ### Remaining quota
 
@@ -270,6 +278,8 @@ revivable = true
 | `get_result` | 分页读取完整结果 + 改过的文件 |
 | `get_transcript` | 分页会话日志 |
 | `cancel_task` | 取消进行中的回合 |
+| `pause_task` | 优雅结束当前回合，保留可续性 |
+| `resume_task` | 在同一会话上继续已暂停/取消/失败的任务 |
 | `list_sessions` | 已知会话 |
 | `list_tasks` | 本实例任务 + 兄弟实例持有的任务（`remote` / `owner` 元数据） |
 | `end_session` | 关掉 worker 进程 |
@@ -285,9 +295,14 @@ Worker 静默超过 `stall_timeout_sec`（默认 1800 秒，可按 Worker 设置
 任务始终归属创建它的 Bridge 实例。协调者重启后，仍由其他存活实例持有的任务在
 `list_tasks` / `check_task` / `wait_task` / `get_result` 中显示 `remote: true`
 ——新实例可以继续跟踪并读取其结果，但不会运行或取消它；`owner_lost: true`
-表示持有方已中途退出。开启 `[server] shutdown_policy = "linger"` 后，正常关闭
+表示持有方已中途退出。`pause_task` 会优雅结束在途回合——任务行落为终态
+（`cancelled` / `stop_reason: "paused"`），部分结果、转录和会话都保留；
+`resume_task` 再以同一会话上的新任务继续。持有方已死的 `resumable` 任务
+也能续：下一个实例会先收养其会话、清掉孤儿 worker 再重新拉起，同一会话不会
+出现两个执行体。开启 `[server] shutdown_policy = "linger"` 后，正常关闭
 宿主（stdin EOF）会先等在途回合跑完，上限为 `linger_max_sec`（默认 86400 秒）；
-强杀 Bridge 仍会丢失 worker 管道，也不支持暂停某个回合。
+linger 无法对抗宿主强杀整个 Bridge 进程树——要跨重启保活，先 `pause_task`，
+重启后再 `resume_task`。
 
 ### 剩余额度
 

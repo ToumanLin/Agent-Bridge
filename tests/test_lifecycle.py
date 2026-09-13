@@ -276,6 +276,39 @@ async def test_linger_deadline_cancels_stragglers(bridge_home, tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_stop_cancelled_mid_linger_still_flushes_state(bridge_home, tmp_path, monkeypatch):
+    """Registry.stop is cancellation-safe: if the hosting task is cancelled
+    while linger waits, the wait is interrupted, in-flight work is cancelled,
+    and flush/save/shutdown still run to completion."""
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "30")
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = Registry.create(bridge_home)
+    registry.config.server.shutdown_policy = "linger"
+    await registry.start()
+    dispatched = await registry.dispatch_task("fake", "slow", cwd=str(work.resolve()))
+    await asyncio.sleep(0.1)
+    assert registry.tasks[dispatched["task_id"]].status == TaskStatus.running
+
+    stopper = asyncio.ensure_future(registry.stop())
+    await asyncio.sleep(0.1)
+    stopper.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopper
+
+    # The interrupt drove the linger wait straight to straggler teardown.
+    task = registry.tasks[dispatched["task_id"]]
+    assert task.status == TaskStatus.cancelled
+    assert task.stop_reason == "cancelled"
+    assert task.finished_at is not None
+    # Teardown really ran: adapters are gone and terminal state is on disk.
+    assert registry._adapters == {}
+    payload = read_json(state_path(bridge_home), {})
+    row = next(item for item in payload["tasks"] if item["task_id"] == dispatched["task_id"])
+    assert row["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_linger_without_in_flight_work_exits_fast(bridge_home, tmp_path):
     work = tmp_path / "work"
     work.mkdir()
