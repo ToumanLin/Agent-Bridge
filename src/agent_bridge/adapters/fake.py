@@ -23,18 +23,33 @@ class FakeAdapter(Adapter):
 
     async def run_turn(self, session: Session, task: Task) -> TurnResult:
         await self.ensure_session(session)
-        append_event(session.session_id, "prompt_sent", {"text": task.message}, self.home)
+        append_event(
+            session.session_id,
+            "prompt_sent",
+            {"text": task.message, "task_id": task.task_id, "source": task.source},
+            self.home,
+        )
         cancel = self._cancel[session.session_id]
         delay = float(os.environ.get("AGENT_BRIDGE_FAKE_DELAY", "0.05"))
         try:
             await asyncio.wait_for(cancel.wait(), timeout=delay)
-            append_event(session.session_id, "turn_end", {"stop_reason": "cancelled"}, self.home)
+            append_event(
+                session.session_id,
+                "turn_end",
+                {"stop_reason": "cancelled", "task_id": task.task_id},
+                self.home,
+            )
             return TurnResult(text="", stop_reason="cancelled")
         except TimeoutError:
             pass
         text = f"[fake:{self.agent.name}] {task.message}"
         append_event(session.session_id, "message_chunk", {"text": text}, self.home)
-        append_event(session.session_id, "turn_end", {"stop_reason": "end_turn"}, self.home)
+        append_event(
+            session.session_id,
+            "turn_end",
+            {"stop_reason": "end_turn", "task_id": task.task_id},
+            self.home,
+        )
         return TurnResult(text=text, files_changed=[], stop_reason="end_turn", native_session_id=session.native_session_id)
 
     async def cancel(self, session: Session) -> None:

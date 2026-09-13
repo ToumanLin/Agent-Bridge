@@ -114,6 +114,9 @@ class Task(BaseModel):
     observed_effort: str | None = None
     status: TaskStatus = TaskStatus.queued
     stop_reason: str | None = None
+    # Origin of the dispatch: "dashboard" for messages sent from the web UI
+    # outbox, None for ordinary MCP dispatches. Surfaced on prompt_sent events.
+    source: str | None = None
     result_text: str = ""
     result_chars: int = 0
     files_changed: list[str] = Field(default_factory=list)

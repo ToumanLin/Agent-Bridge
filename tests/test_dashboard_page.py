@@ -19,9 +19,26 @@ from pathlib import Path
 
 import pytest
 
+from agent_bridge import dashboard as dashboard_launcher
 from agent_bridge.share import dashboard
 
 PAGE = dashboard.PAGE
+
+
+def test_launcher_prefers_bundled_dashboard_over_stale_home_copy(tmp_path, monkeypatch):
+    bundled = tmp_path / "package" / "dashboard.py"
+    bundled.parent.mkdir()
+    bundled.write_text("# bundled", encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "dashboard.py").write_text("# stale", encoding="utf-8")
+    launched = []
+    monkeypatch.setattr(dashboard_launcher, "bundled_dashboard", lambda: bundled)
+    monkeypatch.setattr(dashboard_launcher.subprocess, "Popen", lambda args, **kwargs: launched.append(args))
+
+    assert dashboard_launcher._launch(home, "127.0.0.1", 8787)
+    assert launched[0][1] == str(bundled)
+
 
 SESSION = {
     "session_id": "sess_1",
@@ -38,7 +55,11 @@ SESSION = {
 }
 
 TRANSCRIPT = [
-    {"type": "prompt_sent", "ts": "2026-09-12T10:00:01Z", "data": {"text": "Smoke test only."}},
+    {
+        "type": "prompt_sent",
+        "ts": "2026-09-12T10:00:01Z",
+        "data": {"text": "Smoke test only.", "source": "dashboard", "task_id": "t1"},
+    },
     {"type": "thought_chunk", "ts": "2026-09-12T10:00:02Z", "data": {"text": "thinking about it"}},
     {"type": "message_chunk", "ts": "2026-09-12T10:00:03Z", "data": {"text": "Hello **world**"}},
     {
@@ -56,8 +77,13 @@ TRANSCRIPT = [
         "ts": "2026-09-12T10:00:05Z",
         "data": {"tool_call_id": "tc1", "status": "completed"},
     },
-    {"type": "turn_end", "ts": "2026-09-12T10:00:06Z", "data": {"stop_reason": "end_turn"}},
-    {"type": "raw", "ts": "2026-09-12T10:00:07Z", "data": {"text": "dropped"}},
+    {
+        "type": "turn_end",
+        "ts": "2026-09-12T10:00:06Z",
+        "data": {"stop_reason": "end_turn", "task_id": "t1"},
+    },
+    {"type": "error", "ts": "2026-09-12T10:00:07Z", "data": {"error": "stalled once"}},
+    {"type": "raw", "ts": "2026-09-12T10:00:08Z", "data": {"text": "dropped"}},
 ]
 
 
@@ -357,7 +383,6 @@ def test_subagent_seed_avatars():
         "subav-wrap",
         "subav-l",
         "subav-d",
-        "subav-arc",
         'aria-hidden="true"',
         'draggable="false"',
     ):
@@ -366,16 +391,126 @@ def test_subagent_seed_avatars():
     assert re.search(r'\[data-theme="dark"\] \.subav-d\{display:block\}', PAGE)
     # The gradient <img> itself stays static — no is-working class anywhere.
     assert "is-working" not in PAGE
-    # The Codex arc is a decorative overlay emitted only while proc_state is
-    # busy, never for spawning; it carries the rotation, not the avatar.
+
+
+def test_subagent_busy_pulse_not_ring():
+    """The busy indicator is the avatar icon itself scale-pulsing with the
+    Codex working-dot timing — never a rotating ring/arc overlay."""
+    # The old rotating arc overlay is gone entirely.
+    assert "subav-arc" not in PAGE
+    assert "subav_arc" not in PAGE
     body = re.search(r"function agentAvatar\(s,size\)\{([\s\S]*?)\n\}", PAGE).group(1)
-    assert 'proc_state==="busy"' in body and "subav-arc" in body
-    assert 'subav-l"' in body  # img markup carries no is-working
-    assert re.search(r"\.subav-arc\{[^}]*animation:ui-spin", PAGE)
-    assert re.search(r"\.subav-wrap\{[^}]*position:relative", PAGE)
-    # Overlay must not disturb layout: absolute inside the wrap, clipped free.
-    arc = re.search(r"\.subav-arc\{([^}]*)\}", PAGE).group(1)
-    assert "position:absolute" in arc and "pointer-events:none" in arc
+    # Busy is the only proc_state that animates; spawning stays static.
+    assert 'proc_state==="busy"' in body
+    assert "pulse" in body and "spin" not in body and "arc" not in body
+    # Codex token-pulsing-dot timing: 1.25s ease-in-out scale 1 -> 1.25 -> 1.
+    pulse = re.search(r"\.subav-wrap\.pulse\{([^}]*)\}", PAGE)
+    assert pulse, "pulse rule missing"
+    rule = pulse.group(1)
+    assert "animation:ui-pulse 1.25s ease-in-out infinite" in rule
+    assert "transform-origin:50%" in rule
+    assert "will-change:transform" in rule
+    assert "backface-visibility:hidden" in rule
+    kf = re.search(r"@keyframes ui-pulse\{([\s\S]*?)\}\}", PAGE).group(1)
+    assert "scale(1)" in kf and "scale(1.25)" in kf
+    assert "rotate" not in kf and "translate" not in kf
+    # Reduced motion still disables the pulse.
+    rm = re.search(r"prefers-reduced-motion:reduce\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert ".subav-wrap.pulse{animation:none}" in rm
+
+
+def test_header_icon_has_no_tint_block():
+    avatar = re.search(r"\.avatar\{([^}]*)\}", PAGE)
+    assert avatar, "avatar rule missing"
+    rule = avatar.group(1)
+    assert "background" not in rule and "accent-tint" not in rule
+    # Icon slot stays sized and centered.
+    assert "width:46px" in rule and "height:46px" in rule
+    assert "align-items:center" in rule and "justify-content:center" in rule
+
+
+def test_dark_theme_is_neutral_gray_black():
+    dark = re.search(r'\[data-theme="dark"\]\{([^}]*)\}', PAGE).group(1)
+    # The old GitHub-blue dark palette is gone.
+    for gone in ("#161b22", "#1c2330", "#21262d", "#58a6ff", "#79b8ff", "#1f2e41", "#0d1117"):
+        assert gone not in dark
+    # Neutral gray-black panels + gray accent.
+    for needle in (
+        "--panel:#0f1113",
+        "--panel2:#16181b",
+        "--panel3:#1e2125",
+        "--border:#292d32",
+        "--accent:#8b949e",
+        "--accent-tint:#23262b",
+    ):
+        assert needle in dark
+    # Semantic colors survive.
+    for token in ("--green:", "--amber:", "--red:"):
+        assert token in dark
+    # No bluish hardcoded backdrop tint either.
+    assert "rgba(20,30,50" not in PAGE
+
+
+def test_user_message_card_and_send_status():
+    # Dashboard-authored prompts render a distinct "User Message" card;
+    # coordinator prompts keep "Dispatched Message".
+    assert '"User Message"' in PAGE or "User Message" in PAGE
+    assert "Dispatched Message" in PAGE
+    assert 'e.src==="dashboard"' in PAGE
+    assert re.search(r"\.card\.prompt\.user\{[^}]*accent-tint", PAGE)
+    # Honest send states: queued/waiting/delivering/dispatched — never "sent"
+    # for a bare outbox enqueue, never "delivered" for a task the adapter may
+    # still fail, and no fixed ~300s poll cap.
+    for needle in ("waiting_busy", "waiting_owner", "delivering", "dispatched", "queued"):
+        assert needle in PAGE
+    assert "sent ✓" not in PAGE
+    assert '"delivered' not in PAGE and "`delivered" not in PAGE
+    assert "still queued" not in PAGE
+    assert "sendState" in PAGE and "pollSendStatus" in PAGE
+
+
+def test_turn_end_shows_duration():
+    # turn-end dividers join tasks by task_id for the real task duration and
+    # fall back to the preceding prompt timestamp on legacy transcripts.
+    for needle in ("turnDurMs", "lastPromptTs", "e.task", "taskDur(tk)"):
+        assert needle in PAGE
+    # The redundant "turn ended · end_turn" wording is gone: end_turn is
+    # implied, other stop reasons still render.
+    assert 'e.stop_reason!=="end_turn"' in PAGE
+    body = re.search(r"function addTurn\(e\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    # Visible text is exactly "turn ended · <dur>" (+reason when abnormal);
+    # the wall-clock timestamp lives in the tooltip, not the divider text.
+    assert 'parts=["turn ended"]' in body
+    assert "parts.push(fmtTs" not in body and "d.title" in body
+    # A still-running task's interval ends at the turn ts — validated by
+    # Number.isFinite so a bad timestamp yields no invented duration.
+    dur = re.search(r"function turnDurMs\(e,promptTs\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert "Date.parse(e.ts)" in dur and "Date.now()" not in dur
+    assert "Number.isFinite(end)" in dur
+
+
+def test_token_counter_helpers():
+    for needle in (
+        "usageNums",
+        "tokCount",
+        "fmtTok",
+        "tokSpan",
+        '"stok"',
+        '"htok"',
+        "cognition.ai/inputTokens",
+        "cognition.ai/cachedReadTokens",
+        "cognition.ai/outputTokens",
+        '"input_tokens"',
+        '"inputTokens"',
+        " tok",
+    ):
+        assert needle in PAGE
+    # The sidebar signature fingerprints usage so a finishing turn repaints.
+    sig = re.search(r'const sig=([\s\S]*?)join\("\|"\)', PAGE).group(1)
+    assert "t.usage" in sig
+    # Usage text stays static between overview polls — not joined to the tick.
+    tick = re.search(r"function tickDurations\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert "stok" not in tick and "htok" not in tick
 
 
 def test_perf_architecture_hooks():
@@ -472,6 +607,8 @@ def test_index_and_overview(dash):
         "result_chars",
         "files_changed",
         "error",
+        "source",
+        "usage",
         "created_at",
         "started_at",
         "finished_at",
@@ -487,10 +624,17 @@ def test_events_normalized(dash):
     assert code == 200
     j = json.loads(body)
     kinds = [e["t"] for e in j["events"]]
-    assert kinds == ["prompt", "think", "msg", "tool", "tool_status", "turn"]
+    assert kinds == ["prompt", "think", "msg", "tool", "tool_status", "turn", "error"]
     assert j["offset"] > 0 and j["reset"] is False
     tool = next(e for e in j["events"] if e["t"] == "tool")
     assert tool["kind"] == "execute" and "pwd" in tool["title"]
+    # prompt_sent carries the dispatch origin + task id through normalize_event
+    prompt = j["events"][0]
+    assert prompt["src"] == "dashboard" and prompt["task"] == "t1"
+    turn = next(e for e in j["events"] if e["t"] == "turn")
+    assert turn["task"] == "t1" and turn["stop_reason"] == "end_turn"
+    err = j["events"][-1]
+    assert err["t"] == "error" and "stalled once" in err["text"]
     code, _ = _get(base + "/api/events?session=../evil&offset=0")
     assert code == 400
 
@@ -504,7 +648,32 @@ def test_send_flow_and_status(dash):
     queued = json.loads((home / "outbox" / name).read_text(encoding="utf-8"))
     assert queued["session_id"] == "sess_1" and queued["message"] == "hello agent"
     code, body = _get(base + f"/api/send_status?name={name}")
-    assert code == 404 and json.loads(body)["pending"] is True
+    j = json.loads(body)
+    assert code == 404 and j["pending"] is True and j["state"] == "queued"
+    # A requeued (busy/foreign-waiting) message reports the bridge's state.
+    rec = json.loads((home / "outbox" / name).read_text(encoding="utf-8"))
+    rec.update({"attempts": 3, "state": "waiting_busy"})
+    (home / "outbox" / name).write_text(json.dumps(rec), encoding="utf-8")
+    code, body = _get(base + f"/api/send_status?name={name}")
+    j = json.loads(body)
+    assert code == 404 and j["pending"] is True
+    assert j["state"] == "waiting_busy" and j["attempts"] == 3
+    # An in-flight claim reports "delivering"; a missing file is terminal.
+    (home / "outbox" / name).rename(home / "outbox" / f"{name}.4242.claim")
+    code, body = _get(base + f"/api/send_status?name={name}")
+    j = json.loads(body)
+    assert code == 404 and j["pending"] is True and j["state"] == "delivering"
+    (home / "outbox" / f"{name}.4242.claim").unlink()
+    code, body = _get(base + f"/api/send_status?name={name}")
+    j = json.loads(body)
+    assert code == 404 and j["pending"] is False and j["state"] == "missing"
+    # A done record is returned verbatim and consumed.
+    (home / "outbox" / "done").mkdir(exist_ok=True)
+    done_payload = {"ok": True, "state": "dispatched", "task_id": "task_1", "session_id": "sess_1"}
+    (home / "outbox" / "done" / name).write_text(json.dumps(done_payload), encoding="utf-8")
+    code, body = _get(base + f"/api/send_status?name={name}")
+    assert code == 200 and json.loads(body) == done_payload
+    assert not (home / "outbox" / "done" / name).exists()
     code, body = _post(base + "/api/send", {"session": "nope", "text": "x"})
     assert code == 404
     code, body = _post(base + "/api/send", {"session": "sess_1", "text": "  "})

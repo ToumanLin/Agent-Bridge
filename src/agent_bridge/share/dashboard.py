@@ -76,7 +76,13 @@ def normalize_event(rec):
     d = rec.get("data") or {}
 
     if t == "prompt_sent":
-        return {"t": "prompt", "ts": ts, "text": d.get("text", "")}
+        return {
+            "t": "prompt",
+            "ts": ts,
+            "text": d.get("text", ""),
+            "src": d.get("source"),
+            "task": d.get("task_id"),
+        }
     if t == "message_chunk":
         return {"t": "msg", "ts": ts, "text": d.get("text", "")}
     if t == "thought_chunk":
@@ -106,7 +112,18 @@ def normalize_event(rec):
             return None
         return {"t": "tool_status", "ts": ts, "id": d.get("tool_call_id"), "status": status}
     if t == "turn_end":
-        return {"t": "turn", "ts": ts, "stop_reason": d.get("stop_reason")}
+        return {
+            "t": "turn",
+            "ts": ts,
+            "stop_reason": d.get("stop_reason"),
+            "task": d.get("task_id"),
+            "error": d.get("error"),
+        }
+    if t == "error":
+        text = d.get("error")
+        if not isinstance(text, str) or not text:
+            text = d.get("text") or "error"
+        return {"t": "error", "ts": ts, "text": str(text)}
     return None
 
 
@@ -166,12 +183,12 @@ document.documentElement.setAttribute("data-theme",
 }
 [data-theme="dark"]{
   color-scheme:dark;
-  --text:#e6edf3; --dim:#8b949e; --dimmer:#6e7681;
-  --panel:#161b22; --panel2:#1c2330; --panel3:#21262d;
-  --border:#2d333f; --accent:#58a6ff; --accent-hover:#79b8ff; --accent-tint:#1f2e41;
-  --green:#3fb950; --green-bg:#1a3a22; --amber:#d29922; --amber-bg:#2a2a14;
-  --red:#f85149; --red-bg:#3d1414;
-  --on-accent:#0d1117; --shadow:0 2px 8px rgba(0,0,0,.45);
+  --text:#e4e6e8; --dim:#9ba1a7; --dimmer:#6d7278;
+  --panel:#0f1113; --panel2:#16181b; --panel3:#1e2125;
+  --border:#292d32; --accent:#8b949e; --accent-hover:#adbac4; --accent-tint:#23262b;
+  --green:#4ac26b; --green-bg:#15241a; --amber:#d29922; --amber-bg:#282113;
+  --red:#f85149; --red-bg:#2c1517;
+  --on-accent:#0f1113; --shadow:0 2px 8px rgba(0,0,0,.5);
 }
 *{box-sizing:border-box;
   scrollbar-width:thin;
@@ -242,9 +259,13 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
 .subav-d{display:none}
 [data-theme="dark"] .subav-l{display:none}
 [data-theme="dark"] .subav-d{display:block}
-.subav-arc{position:absolute;left:-2px;top:-2px;color:var(--accent);
-  pointer-events:none;animation:ui-spin 1s linear infinite}
-.sdur,.hdur{color:var(--dimmer);font-variant-numeric:tabular-nums;white-space:nowrap}
+/* Busy sessions pulse the subagent avatar itself (Codex working-dot timing):
+   scale only, 1.25s ease-in-out, transform-origin center. */
+.subav-wrap.pulse{animation:ui-pulse 1.25s ease-in-out infinite;
+  transform-origin:50%;will-change:transform;backface-visibility:hidden}
+@keyframes ui-pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.25)}}
+.sdur,.hdur,.stok,.htok{color:var(--dimmer);font-variant-numeric:tabular-nums;
+  white-space:nowrap}
 /* ---------- pane header ---------- */
 #pane{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--panel)}
 #sesshead{display:flex;align-items:center;gap:14px;padding:16px 26px 14px;
@@ -254,8 +275,8 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
   border-radius:8px;color:var(--dim);cursor:pointer}
 #menubtn:hover{background:var(--panel3)}
 #hwrap{flex:1;display:flex;align-items:center;gap:14px;min-width:0}
-.avatar{flex:none;width:46px;height:46px;border-radius:12px;background:var(--accent-tint);
-  color:var(--accent);display:flex;align-items:center;justify-content:center}
+.avatar{flex:none;width:46px;height:46px;display:flex;align-items:center;
+  justify-content:center}
 .hbody{flex:1;min-width:0}
 .htitle{font-size:17px;font-weight:700;margin:0;line-height:1.3;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -278,6 +299,7 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
   color:var(--dim);margin-bottom:8px}
 .chead .ctime{margin-left:auto;font-weight:400;color:var(--dimmer);font-size:11px}
 .card.prompt .chead{color:var(--accent)}
+.card.prompt.user{background:var(--accent-tint);border-left:3px solid var(--accent)}
 .card pre.ptext{white-space:pre-wrap;word-break:break-word;margin:0;
   font:inherit;font-size:14px}
 .msg-body{font-size:14px}
@@ -331,6 +353,7 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
 .turnend{display:flex;align-items:center;gap:10px;color:var(--dimmer);font-size:11.5px;
   margin:20px auto;max-width:960px}
 .turnend::before,.turnend::after{content:"";flex:1;height:1px;background:var(--border)}
+.turnend.err{color:var(--red)}
 .empty{color:var(--dimmer);text-align:center;margin-top:80px;font-size:14px}
 /* ---------- composer ---------- */
 #chatbar{border-top:1px solid var(--border);background:var(--panel);padding:14px 26px;
@@ -367,13 +390,14 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
     box-shadow:4px 0 24px rgba(0,0,0,.15)}
   #sidebar.open{transform:none}
   #backdrop.open{display:block;position:fixed;inset:0;z-index:35;
-    background:rgba(20,30,50,.3)}
+    background:rgba(0,0,0,.35)}
   #sesshead{padding:12px 16px;min-height:0}
   #content{padding:14px 16px}
   #chatbar{padding:10px 16px}
 }
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
+  .subav-wrap.pulse{animation:none}
 }
 </style>
 </head>
@@ -509,9 +533,9 @@ function agentAvatar(s,size){
   const seed=subSeed(s.session_id||s.title||"");
   const v=SUBAV[seed%SUBAV.length];
   const a=` width="${size}" height="${size}" alt="" aria-hidden="true" draggable="false">`;
-  const arc=s.proc_state==="busy"
-    ?`<span class="subav-arc" aria-hidden="true" style="animation-delay:-${seed%1000}ms">${icon("arc",size+4)}</span>`:"";
-  return `<span class="subav-wrap"><img class="subav subav-l" src="${v.l}"${a}<img class="subav subav-d" src="${v.d}"${a}${arc}</span>`;
+  // Only a busy session animates — the seeded icon itself scale-pulses.
+  const pulse=s.proc_state==="busy"?" pulse":"";
+  return `<span class="subav-wrap${pulse}"><img class="subav subav-l" src="${v.l}"${a}<img class="subav subav-d" src="${v.d}"${a}</span>`;
 }
 
 /* ---------- minimal markdown ---------- */
@@ -613,6 +637,49 @@ function durSpan(t,cls){
   const d=taskDur(t);if(!d)return"";
   return `<span class="${cls}" data-tid="${esc(t.task_id)}">${durText(d)}</span>`;
 }
+
+/* ---------- task token usage (latest task only) ----------
+   Adapters report different shapes; normalize them here once:
+   snake_case  {input_tokens, cached_input_tokens, output_tokens}   (codex)
+   camelCase   {inputTokens, cachedReadTokens, outputTokens}        (ACP)
+   Devin ACP   {_meta:{"cognition.ai/inputTokens", ...}}            (usage_update)
+   Headline tokens = max(input - cached, 0) + output; reasoning output is
+   already inside output and never added separately. When no input/output
+   counters exist, fall back to a trustworthy total ("used" is a context-
+   window occupancy snapshot — an overcount across turns, but the best
+   honest number available). */
+function usageNums(u){
+  if(!u||typeof u!=="object")u={};
+  const m=typeof u._meta==="object"&&u._meta?u._meta:{};
+  const num=v=>Number.isFinite(v)&&v>=0?v:null;
+  const pick=(...keys)=>{for(const k of keys)for(const src of[u,m]){
+    const v=num(src[k]);if(v!==null)return v}return null};
+  return{
+    input:pick("input_tokens","inputTokens","cognition.ai/inputTokens"),
+    cached:pick("cached_input_tokens","cachedInputTokens","cachedReadTokens","cognition.ai/cachedReadTokens"),
+    output:pick("output_tokens","outputTokens","cognition.ai/outputTokens"),
+    total:pick("total_tokens","totalTokens","total","used","cognition.ai/totalTokens"),
+  };
+}
+function tokCount(u){
+  const n=usageNums(u);
+  if(n.input===null&&n.output===null)return n.total;
+  return Math.max(n.input-(n.cached||0),0)+n.output;
+}
+/* Segmented lowercase, matching "1m100k" for 1,100,000. The thousands
+   segment is not zero-padded and drops entirely when it rounds to zero:
+   1,005,000 -> "1m5k", exactly 1,000,000 -> "1m". */
+const fmtTok=n=>{
+  if(!Number.isFinite(n)||n<0)return"";
+  n=Math.floor(n);
+  if(n<1000)return String(n);
+  if(n<1e6)return Math.floor(n/1000)+"k";
+  const m=Math.floor(n/1e6),k=Math.floor(n%1e6/1e3);
+  return k?m+"m"+k+"k":m+"m"};
+function tokSpan(t,cls){
+  const s=t&&t.usage?fmtTok(tokCount(t.usage)):"";
+  return s?`<span class="${cls}"> · ${s} tok</span>`:"";
+}
 function tickDurations(){
   document.querySelectorAll("[data-tid]").forEach(el=>{
     const d=taskDur(tasks.find(x=>x.task_id===el.dataset.tid));
@@ -632,7 +699,7 @@ function renderSidebar(){
     const t=latestTask(s.session_id);
     return [s.session_id,s.proc_state,s.last_active_at,s.title,s.agent,s.cwd,
       t?t.task_id:"",t?t.status:"",t?t.message:"",t?t.started_at:"",
-      t?t.finished_at:"",t?t.created_at:""].join(" ");
+      t?t.finished_at:"",t?t.created_at:"",t?JSON.stringify(t.usage||0):""].join(" ");
   }).join("|");
   if(sig===lastSidebarSig)return;
   lastSidebarSig=sig;
@@ -648,7 +715,7 @@ function renderSidebar(){
       <span class="sicon">${agentAvatar(s,18)}</span>
       <span class="smeta">
         <span class="stitle">${esc(s.title||s.session_id)}</span>
-        <span class="sstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone)}</span><span>${esc(st.label)}</span>${durSpan(t,"sdur")}</span>
+        <span class="sstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone)}</span><span>${esc(st.label)}</span>${durSpan(t,"sdur")}${tokSpan(t,"stok")}</span>
         ${sub?`<span class="ssub">${esc(sub)}</span>`:""}
       </span>
     </button>`}).join("")||'<div class="empty" style="margin-top:40px">No sessions</div>';
@@ -679,7 +746,7 @@ function renderSessionHeader(){
     <div class="hbody">
       <h2 class="htitle">${esc(s.title||s.session_id)}</h2>
       <div class="hsub">
-        <span class="hstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,13)}</span> ${esc(st.label)}${durSpan(t,"hdur")}</span>
+        <span class="hstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,13)}</span> ${esc(st.label)}${durSpan(t,"hdur")}${tokSpan(t,"htok")}</span>
         <span class="badge">${esc(s.agent)}</span>
         ${s.model?`<span class="badge">${esc(s.model)}</span>`:""}
         ${repo?`<span class="hsep">|</span><span class="hrepo" title="${esc(s.cwd||"")}">Working repo · ${esc(repo)}</span>`:""}
@@ -691,6 +758,7 @@ function renderSessionHeader(){
 /* ---------- conversation rendering ---------- */
 const content=$("#content");
 let curMsg=null, curThink=null, curToolGroup=null, tools={}; // open blocks for streaming merge
+let lastPromptTs=null;      // ts of the last prompt rendered — pairs legacy turn_ends
 const dirty=new Set();      // stream blocks whose text changed since last flush
 const panes={};             // id -> stashed {holder,curMsg,curThink,curToolGroup,tools}
 const paneLru=[],cacheLru=[];
@@ -717,9 +785,11 @@ function toolGroup(){
 }
 function addPrompt(e){
   closeBlocks();
-  const d=document.createElement("div");d.className="block card prompt";
+  lastPromptTs=e.ts;
+  const user=e.src==="dashboard";
+  const d=document.createElement("div");d.className="block card prompt"+(user?" user":"");
   const long=e.text.length>900;
-  d.innerHTML=`<div class="chead">${icon("doc",15)}<span>Dispatched Message</span><span class="ctime">${fmtTs(e.ts)}</span></div>
+  d.innerHTML=`<div class="chead">${icon(user?"msg":"doc",15)}<span>${user?"User Message":"Dispatched Message"}</span><span class="ctime">${fmtTs(e.ts)}</span></div>
     <pre class="ptext ${long?"clamp":""}">${esc(e.text)}</pre>`;
   if(long){const x=document.createElement("button");x.type="button";x.className="expand";x.textContent="show more";
     x.onclick=()=>{d.querySelector("pre").classList.remove("clamp");x.remove()};d.appendChild(x)}
@@ -774,14 +844,46 @@ function addToolStatus(e){
     r.el.querySelector(".dur").textContent=s>=1?s.toFixed(1)+"s":Math.round(s*1000)+"ms";
   }
 }
+/* Turn duration: join on the task row via task_id (started_at→finished_at is
+   the true task duration and stays frozen once terminal). A still-running
+   task ends the interval at the turn event's own timestamp — an unparseable
+   one yields no duration rather than an invented now-based value. Legacy
+   transcripts carry no task_id, so fall back to the elapsed time since the
+   preceding prompt event. */
+function turnDurMs(e,promptTs){
+  const tk=e.task?tasks.find(x=>x.task_id===e.task):null;
+  const td=tk?taskDur(tk):null;
+  if(td){
+    const end=td.end===null?Date.parse(e.ts):td.end;
+    return Number.isFinite(end)?end-td.start:null;
+  }
+  const a=Date.parse(e.ts),b=Date.parse(promptTs);
+  return Number.isFinite(a)&&Number.isFinite(b)?a-b:null;
+}
 function addTurn(e){
   closeBlocks();
   const d=document.createElement("div");d.className="turnend";
-  d.innerHTML=`${icon("dot",10)}<span>turn ended · ${esc(e.stop_reason||"unknown")} · ${fmtTs(e.ts)}</span>`;
+  const ms=turnDurMs(e,lastPromptTs);
+  // Visible text: "turn ended · <duration>" — plus the stop reason only when
+  // it is not end_turn. The wall-clock timestamp (and any error detail) live
+  // in the tooltip, not the text.
+  const parts=["turn ended"];
+  const dur=ms===null?"":fmtDur(ms);
+  if(dur)parts.push(dur);
+  if(e.stop_reason&&e.stop_reason!=="end_turn")parts.push(e.stop_reason);
+  const tip=[fmtTs(e.ts),e.error].filter(Boolean).join(" · ");
+  if(tip)d.title=tip;
+  d.innerHTML=`${icon("dot",10)}<span>${esc(parts.join(" · "))}</span>`;
+  content.appendChild(d);
+}
+function addErr(e){
+  closeBlocks();
+  const d=document.createElement("div");d.className="turnend err";
+  d.innerHTML=`${icon("xCircle",10)}<span>${esc(e.text||"error")} · ${fmtTs(e.ts)}</span>`;
   content.appendChild(d);
 }
 const handlers={prompt:addPrompt,msg:addMsg,think:addThink,tool:addTool,
-  tool_status:addToolStatus,turn:addTurn};
+  tool_status:addToolStatus,turn:addTurn,error:addErr};
 
 function applyEvents(evs){
   const nearBottom=content.scrollHeight-content.scrollTop-content.clientHeight<120;
@@ -829,8 +931,8 @@ function stashPane(id){
   flushBlocks();
   const holder=document.createElement("div");
   while(content.firstChild)holder.appendChild(content.firstChild);
-  panes[id]={holder,curMsg,curThink,curToolGroup,tools};
-  curMsg=curThink=curToolGroup=null;tools={};
+  panes[id]={holder,curMsg,curThink,curToolGroup,tools,lastPromptTs};
+  curMsg=curThink=curToolGroup=null;tools={};lastPromptTs=null;
   const i=paneLru.indexOf(id);if(i>=0)paneLru.splice(i,1);
   paneLru.push(id);
   while(paneLru.length>MAX_PANES)dropPane(paneLru[0]);
@@ -869,7 +971,7 @@ async function pollEvents(){
     }
     if(id!==selected)return;          // user switched away mid-flight: keep cache, skip DOM
     if(j.reset){
-      content.innerHTML="";closeBlocks();tools={};
+      content.innerHTML="";closeBlocks();tools={};lastPromptTs=null;
       startReplay(id,true);
       return;
     }
@@ -906,33 +1008,65 @@ async function pollOverview(){
   }catch(e){setLive(false)}
 }
 
-/* ---------- chat bar ---------- */
+/* ---------- chat bar ----------
+   A sent message lives in the bridge outbox until the target session can
+   accept it (busy sessions requeue it, subject to a 24h wall-clock expiry).
+   The poll therefore has no fixed cap: it runs while the page is alive and
+   reports the queue state the bridge recorded — never "sent" for a mere
+   outbox enqueue. Acceptance by dispatch_task is reported as "dispatched ·
+   <task_id>" — it is not called delivery: the adapter may still fail
+   afterwards. Per-session status survives session switches. */
+const sendState={};  // session_id -> {name, text, final}
+const sendPolls={};  // outbox name -> polling loop already running
 function setChatStatus(s){$("#chatstatus").textContent=s||""}
+function sendText(j){
+  const st=j&&j.state;
+  return st==="waiting_busy"?"waiting for agent — session busy…"
+    :st==="waiting_owner"?"waiting for agent's bridge…"
+    :st==="delivering"?"delivering…"
+    :"queued…";
+}
+function setSendState(sid,text,final){
+  sendState[sid]=Object.assign(sendState[sid]||{},{text,final:!!final});
+  if(selected===sid)setChatStatus(text);
+}
 async function sendChat(){
   const ta=$("#chatinput"),text=ta.value.trim();
   if(!text||!selected)return;
-  ta.value="";ta.style.height="";setChatStatus("sending…");
+  const sid=selected;
+  ta.value="";ta.style.height="";setSendState(sid,"sending…");
   try{
     const r=await fetch("/api/send",{method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({session:selected,text})});
+      body:JSON.stringify({session:sid,text})});
     const j=await r.json();
-    if(!j.ok){setChatStatus(j.error||"send failed");return}
-    setChatStatus("queued…");pollSendStatus(j.name);
-  }catch(e){setChatStatus("send failed")}
+    if(!j.ok){setSendState(sid,j.error||"send failed",true);return}
+    setSendState(sid,"queued…");
+    sendState[sid].name=j.name;
+    pollSendStatus(j.name,sid);
+  }catch(e){setSendState(sid,"send failed",true)}
 }
-async function pollSendStatus(name){
-  for(let i=0;i<300;i++){
-    await new Promise(r=>setTimeout(r,1000));
-    try{
-      const r=await fetch(`/api/send_status?name=${encodeURIComponent(name)}`);
-      if(r.status===404)continue;
-      const j=await r.json();
-      setChatStatus(j.ok?"sent ✓":(j.error||"failed"));
+async function pollSendStatus(name,sid){
+  if(sendPolls[name])return;
+  sendPolls[name]=true;
+  const mine=()=>sendState[sid]&&sendState[sid].name===name;
+  try{
+    while(true){
+      await new Promise(r=>setTimeout(r,2000));
+      let j;
+      try{
+        const r=await fetch(`/api/send_status?name=${encodeURIComponent(name)}`);
+        j=await r.json();
+      }catch(e){continue}              // network blip: keep waiting
+      if(!mine())return;              // a newer send to this session owns the status line
+      if(j&&j.pending){setSendState(sid,sendText(j));continue}
+      const done=j||{};
+      setSendState(sid,
+        done.ok?`dispatched${done.task_id?" · "+done.task_id:""}`
+          :(done.error||"send failed"),true);
       return;
-    }catch(e){}
-  }
-  setChatStatus("still queued — is a bridge running?");
+    }
+  }finally{delete sendPolls[name]}
 }
 const chatInput=$("#chatinput");
 chatInput.addEventListener("keydown",e=>{
@@ -997,7 +1131,8 @@ function select(id){
     selected=id;
     if(prev)replayGen[prev]=(replayGen[prev]||0)+1;   // abort the outgoing replay only
     replaying=null;
-    chatInput.disabled=false;$("#chatsend").disabled=false;setChatStatus("");
+    chatInput.disabled=false;$("#chatsend").disabled=false;
+    setChatStatus(sendState[id]?sendState[id].text:"");
     chatInput.placeholder=s?`Send an instruction to ${s.title||s.session_id}…`:"Send an instruction…";
     if(prev){
       const done=(rendered[prev]||0)===(eventsCache[prev]||[]).length;
@@ -1011,10 +1146,11 @@ function select(id){
       const i=paneLru.indexOf(id);if(i>=0)paneLru.splice(i,1);
       while(p.holder.firstChild)content.appendChild(p.holder.firstChild);
       curMsg=p.curMsg;curThink=p.curThink;curToolGroup=p.curToolGroup;tools=p.tools;
+      lastPromptTs=p.lastPromptTs||null;
       content.scrollTop=content.scrollHeight;
       $("#backtop").style.display="none";
     }else{
-      closeBlocks();tools={};rendered[id]=0;
+      closeBlocks();tools={};lastPromptTs=null;rendered[id]=0;
       if(eventsCache[id]&&eventsCache[id].length){
         content.innerHTML="";
         startReplay(id,true);
@@ -1086,6 +1222,8 @@ class Handler(BaseHTTPRequestHandler):
                                 "result_chars",
                                 "files_changed",
                                 "error",
+                                "source",
+                                "usage",
                                 "created_at",
                                 "started_at",
                                 "finished_at",
@@ -1136,7 +1274,37 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     done.unlink(missing_ok=True)
                 return
-            self._json({"pending": True}, 404)
+            # Inspectable pending states: the bridge annotates the requeued
+            # record with "state" so the UI can say *why* it is still waiting.
+            queued = OUTBOX_DIR / name
+            if queued.is_file():
+                rec = {}
+                with contextlib.suppress(OSError, ValueError):
+                    rec = json.loads(queued.read_text(encoding="utf-8", errors="replace"))
+                if not isinstance(rec, dict):
+                    rec = {}
+                self._json(
+                    {
+                        "pending": True,
+                        "state": rec.get("state") or "queued",
+                        "attempts": rec.get("attempts") or 0,
+                        "queued_at": rec.get("ts"),
+                    },
+                    404,
+                )
+                return
+            if any(OUTBOX_DIR.glob(name + ".*.claim")):
+                self._json({"pending": True, "state": "delivering"}, 404)
+                return
+            self._json(
+                {
+                    "pending": False,
+                    "ok": False,
+                    "state": "missing",
+                    "error": "message is no longer queued and no result was recorded",
+                },
+                404,
+            )
             return
         self._json({"error": "not found"}, 404)
 

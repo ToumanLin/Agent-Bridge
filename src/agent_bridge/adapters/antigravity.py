@@ -268,7 +268,12 @@ class AgyAdapter(Adapter):
         kwargs: dict[str, Any] = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        append_event(session.session_id, "prompt_sent", {"text": task.message, "cmd": cmd[:6]}, self.home)
+        append_event(
+            session.session_id,
+            "prompt_sent",
+            {"text": task.message, "cmd": cmd[:6], "task_id": task.task_id, "source": task.source},
+            self.home,
+        )
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -355,7 +360,12 @@ class AgyAdapter(Adapter):
                 await reap_subprocess(proc)
             stderr_tail = await stderr_task
             if session.session_id in self._cancelled:
-                append_event(session.session_id, "turn_end", {"stop_reason": "cancelled"}, self.home)
+                append_event(
+                    session.session_id,
+                    "turn_end",
+                    {"stop_reason": "cancelled", "task_id": task.task_id},
+                    self.home,
+                )
                 return TurnResult(
                     text="".join(text_parts),
                     files_changed=sorted(files),
@@ -380,7 +390,12 @@ class AgyAdapter(Adapter):
                             {"error": err, "code": proc.returncode, "treated_as": "recovered_tool_schema"},
                             self.home,
                         )
-                        append_event(session.session_id, "turn_end", {"stop_reason": "end_turn"}, self.home)
+                        append_event(
+                            session.session_id,
+                            "turn_end",
+                            {"stop_reason": "end_turn", "task_id": task.task_id},
+                            self.home,
+                        )
                         return TurnResult(
                             text=result_text,
                             files_changed=sorted(files),
@@ -398,7 +413,12 @@ class AgyAdapter(Adapter):
                         usage=_scoped_usage(usage, resumed),
                         native_session_id=cid,
                     )
-                append_event(session.session_id, "turn_end", {"stop_reason": "end_turn"}, self.home)
+                append_event(
+                    session.session_id,
+                    "turn_end",
+                    {"stop_reason": "end_turn", "task_id": task.task_id},
+                    self.home,
+                )
                 return TurnResult(
                     text=result_text,
                     files_changed=sorted(files),
@@ -414,7 +434,12 @@ class AgyAdapter(Adapter):
                     error += f": {detail}"
                 return TurnResult(text="", stop_reason="error", error=error)
             session.native_session_id = conversation_id
-            append_event(session.session_id, "turn_end", {"stop_reason": "end_turn"}, self.home)
+            append_event(
+                session.session_id,
+                "turn_end",
+                {"stop_reason": "end_turn", "task_id": task.task_id},
+                self.home,
+            )
             return TurnResult(
                 text="".join(text_parts),
                 files_changed=sorted(files),
@@ -425,7 +450,12 @@ class AgyAdapter(Adapter):
             )
         except asyncio.CancelledError:
             await reap_subprocess(proc)
-            append_event(session.session_id, "turn_end", {"stop_reason": "cancelled"}, self.home)
+            append_event(
+                session.session_id,
+                "turn_end",
+                {"stop_reason": "cancelled", "task_id": task.task_id},
+                self.home,
+            )
             return TurnResult(
                 text="".join(text_parts),
                 files_changed=sorted(files),

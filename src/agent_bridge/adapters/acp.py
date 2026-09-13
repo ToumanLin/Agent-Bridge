@@ -1381,7 +1381,12 @@ class AcpAdapter(Adapter):
                 f"{self.agent.name} has no model/effort selection; "
                 f"model={task.model!r} effort={task.effort!r} were ignored"
             )
-        append_event(session.session_id, "prompt_sent", {"text": task.message}, self.home)
+        append_event(
+            session.session_id,
+            "prompt_sent",
+            {"text": task.message, "task_id": task.task_id, "source": task.source},
+            self.home,
+        )
         prompt = live.conn.prompt(
             session_id=session.native_session_id,
             prompt=[text_block(task.message)],
@@ -1390,7 +1395,12 @@ class AcpAdapter(Adapter):
         try:
             response = await live.prompt_task
         except asyncio.CancelledError:
-            append_event(session.session_id, "turn_end", {"stop_reason": "cancelled"}, self.home)
+            append_event(
+                session.session_id,
+                "turn_end",
+                {"stop_reason": "cancelled", "task_id": task.task_id},
+                self.home,
+            )
             return TurnResult(
                 text="".join(live.client.text_parts),
                 files_changed=sorted(live.client.files),
@@ -1419,7 +1429,12 @@ class AcpAdapter(Adapter):
             dumped_usage = _dump(getattr(response, "usage", None))
             if isinstance(dumped_usage, dict):
                 usage = dumped_usage
-        append_event(session.session_id, "turn_end", {"stop_reason": stop}, self.home)
+        append_event(
+            session.session_id,
+            "turn_end",
+            {"stop_reason": stop, "task_id": task.task_id},
+            self.home,
+        )
         return TurnResult(
             text="".join(live.client.text_parts),
             files_changed=sorted(live.client.files),

@@ -63,6 +63,7 @@ vm.runInContext(
   code +
     "\n;globalThis.__x = { statusOf, latestTask, taskDur, fmtDur, durText," +
     " durSpan, PROC_STATUS, subSeed, agentAvatar, statusGlyph, icon," +
+    " usageNums, tokCount, fmtTok, tokSpan, turnDurMs, addTurn, addPrompt," +
     " _setTasks: (v) => { tasks = v; } };",
   sandbox);
 const X = sandbox.__x;
@@ -174,6 +175,102 @@ const task = (over) =>
   const doneD = X.taskDur(task({}));
   eq(X.durText(doneD) === X.durText(doneD), true,
     "terminal duration freezes at finished_at");
+
+  // --- busy-only avatar pulse; no rotating ring anywhere ---
+  const av = (st) => X.agentAvatar(sess(st), 18);
+  eq(av("busy").includes("subav-wrap pulse"), true, "busy avatar pulses");
+  for (const st of ["spawning", "ready", "idle_unloaded", "dead"])
+    eq(av(st).includes("pulse"), false, `${st} avatar stays static`);
+  eq(av("busy").includes("arc") || av("busy").includes("spin"), false,
+    "no arc/spinner markup on the avatar");
+
+  // --- turnDurMs: task_id join first, prompt-pair fallback for legacy ---
+  X._setTasks([task({})]); // t1: 00:00:02 -> 00:00:42 = 40s
+  eq(X.turnDurMs({ t: "turn", task: "t1",
+    ts: "2026-01-01T00:00:42Z" }, null), 40000,
+    "turn joins task duration via task_id");
+  const runningTk = task({ task_id: "t2", status: "running",
+    started_at: "2026-01-01T00:00:00Z", finished_at: null });
+  X._setTasks([task({}), runningTk]);
+  eq(X.turnDurMs({ t: "turn", task: "t2",
+    ts: "2026-01-01T00:00:30Z" }, null), 30000,
+    "still-running task uses the turn event ts as its end");
+  eq(X.turnDurMs({ t: "turn", ts: "2026-01-01T00:00:45Z" },
+    "2026-01-01T00:00:05Z"), 40000,
+    "legacy transcript: pairs with the preceding prompt ts");
+  eq(X.turnDurMs({ t: "turn", ts: "2026-01-01T00:00:45Z" }, null), null,
+    "no task, no prompt -> no duration");
+  eq(X.turnDurMs({ t: "turn", task: "nope", ts: "garbage" }, "also-bad"), null,
+    "unparseable timestamps -> no duration");
+  eq(X.turnDurMs({ t: "turn", task: "t2", ts: "not-a-date" }, null), null,
+    "running task + invalid turn ts -> null, never Date.now()");
+  eq(X.turnDurMs({ t: "turn", task: "t1", ts: "not-a-date" }, null), 40000,
+    "terminal task ignores the turn ts entirely (finished_at wins)");
+
+  // --- token usage: normalization, headline math, formatting ---
+  eq(X.tokCount({ input_tokens: 108414, cached_input_tokens: 108072,
+    output_tokens: 4763 }), 5105, "snake_case: (input-cached)+output");
+  eq(X.tokCount({ inputTokens: 108414, cachedReadTokens: 108072,
+    outputTokens: 4763 }), 5105, "camelCase: (input-cached)+output");
+  eq(X.tokCount({ _meta: { "cognition.ai/inputTokens": 108414,
+    "cognition.ai/cachedReadTokens": 108072,
+    "cognition.ai/outputTokens": 4763 } }), 5105, "Devin ACP _meta keys");
+  eq(X.tokCount({ input_tokens: 100, cached_input_tokens: 500,
+    output_tokens: 30 }), 30, "all-cached input clamps to 0");
+  eq(X.tokCount({ input_tokens: 100, output_tokens: 50,
+    reasoning_output_tokens: 900 }), 150, "reasoning is never added on top");
+  eq(X.tokCount({ used: 113177, size: 262000 }), 113177,
+    "used-only snapshot is the conservative fallback");
+  eq(X.tokCount({ totalTokens: 42000 }), 42000, "totalTokens fallback");
+  eq(X.tokCount({}), null, "empty usage -> hidden");
+  eq(X.tokCount(null), null, "null usage -> hidden");
+  eq(X.tokCount("junk"), null, "non-object usage -> hidden");
+  eq(X.fmtTok(0), "0", "fmtTok 0");
+  eq(X.fmtTok(842), "842", "fmtTok <1k integer");
+  eq(X.fmtTok(131000), "131k", "fmtTok k");
+  eq(X.fmtTok(1100000), "1m100k", "fmtTok segmented 1m100k");
+  eq(X.fmtTok(1005000), "1m5k", "1,005,000 -> '1m5k' (no zero pad)");
+  eq(X.fmtTok(1001000), "1m1k", "1,001,000 -> '1m1k'");
+  eq(X.fmtTok(1000000), "1m", "exactly 1,000,000 -> '1m', not '1m0k'");
+  eq(X.fmtTok(1000999), "1m", "sub-1k remainder drops -> '1m'");
+  eq(X.fmtTok(10000000), "10m", "10m");
+  eq(X.fmtTok(999999), "999k", "fmtTok just under 1m");
+  eq(X.fmtTok(NaN), "", "fmtTok NaN hides");
+  eq(X.fmtTok(-5), "", "fmtTok negative hides");
+  const tkTask = task({ usage: { input_tokens: 108414,
+    cached_input_tokens: 108072, output_tokens: 4763 } });
+  eq(X.tokSpan(tkTask, "stok"), '<span class="stok"> · 5k tok</span>',
+    "tokSpan renders the headline");
+  eq(X.tokSpan(task({}), "stok"), "", "no usage -> empty span");
+  eq(X.tokSpan(task({ usage: { junk: 1 } }), "stok"), "",
+    "unusable usage -> empty span");
+
+  // --- addTurn: visible text is exactly "turn ended · <dur>" (+reason) ---
+  let lastDiv = null;
+  documentStub.createElement = () => (lastDiv = el());
+  const spanText = () => {
+    const m = lastDiv && lastDiv.innerHTML.match(/<span>([^<]*)<\/span>/);
+    return m ? m[1] : null;
+  };
+  X._setTasks([task({})]); // t1: 00:00:02 -> 00:00:42 = 40s
+  X.addTurn({ t: "turn", task: "t1", ts: "2026-01-01T00:00:42Z",
+    stop_reason: "end_turn" });
+  eq(spanText(), "turn ended · 40s",
+    "end_turn renders exactly 'turn ended · <dur>'");
+  eq(String(lastDiv.title).length > 0, true,
+    "wall-clock timestamp moved to the tooltip");
+  X.addTurn({ t: "turn", task: "t1", ts: "2026-01-01T00:00:42Z",
+    stop_reason: "stalled" });
+  eq(spanText(), "turn ended · 40s · stalled",
+    "abnormal stop reason renders after the duration");
+  X._setTasks([]);
+  X.addTurn({ t: "turn", ts: "2026-01-01T00:00:45Z", stop_reason: "end_turn" });
+  eq(spanText(), "turn ended",
+    "no task, no prompt -> bare 'turn ended', still no ts segment");
+  X.addPrompt({ t: "prompt", ts: "2026-01-01T00:00:05Z", text: "hi",
+    src: null });
+  X.addTurn({ t: "turn", ts: "2026-01-01T00:00:45Z", stop_reason: "end_turn" });
+  eq(spanText(), "turn ended · 40s", "legacy prompt-pair fallback in text");
 
   console.log(failed ? `\n${failed} FAILED` : "\nall assertions passed");
   process.exit(failed ? 1 : 0);

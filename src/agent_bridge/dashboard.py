@@ -33,9 +33,7 @@ _STARTUP_WAIT_SEC = 4.0
 def _client_open(url: str) -> bool | None:
     """True when a dashboard tab is open, False when none, None when unreachable."""
     try:
-        with urllib.request.urlopen(
-            url.rstrip("/") + "/api/client_state", timeout=_CLIENT_STATE_TIMEOUT
-        ) as resp:
+        with urllib.request.urlopen(url.rstrip("/") + "/api/client_state", timeout=_CLIENT_STATE_TIMEOUT) as resp:
             data = json.loads(resp.read())
         return bool(data.get("clients"))
     except Exception:
@@ -46,9 +44,7 @@ def _wait_for_dashboard(url: str) -> bool:
     deadline = time.monotonic() + _STARTUP_WAIT_SEC
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(
-                url.rstrip("/") + "/api/client_state", timeout=0.5
-            ):
+            with urllib.request.urlopen(url.rstrip("/") + "/api/client_state", timeout=0.5):
                 return True
         except Exception:
             time.sleep(0.2)
@@ -56,32 +52,32 @@ def _wait_for_dashboard(url: str) -> bool:
 
 
 def _launch(home: Path, host: str, port: int) -> bool:
-    script = home / "dashboard.py"
+    # Prefer the packaged page so upgrades cannot be shadowed indefinitely by
+    # an old dashboard.py copied into the data directory.  The home copy is a
+    # compatibility fallback for source layouts that have no bundled asset.
+    script = bundled_dashboard()
     if not script.is_file():
-        script = bundled_dashboard()
+        script = home / "dashboard.py"
     if not script.is_file():
         log.warning("dashboard auto-open: no dashboard.py in %s or bundled", home)
         return False
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    out = open(log_dir / "dashboard.log", "ab")
     kwargs: dict = {}
     if sys.platform == "win32":
-        kwargs["creationflags"] = (
-            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-        )
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     else:
         kwargs["start_new_session"] = True
     try:
-        subprocess.Popen(
-            [sys.executable, str(script), "--port", str(port), "--dir", str(home)],
-            stdin=subprocess.DEVNULL,
-            stdout=out,
-            stderr=subprocess.STDOUT,
-            **kwargs,
-        )
+        with open(log_dir / "dashboard.log", "ab") as out:
+            subprocess.Popen(
+                [sys.executable, str(script), "--port", str(port), "--dir", str(home)],
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                **kwargs,
+            )
     except Exception:
-        out.close()
         log.exception("dashboard auto-open: failed to launch %s", script)
         return False
     log.info("dashboard auto-open: launched %s on port %s", script, port)

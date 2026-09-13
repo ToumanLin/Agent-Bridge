@@ -104,7 +104,12 @@ class CodexAdapter(Adapter):
         append_event(
             session.session_id,
             "prompt_sent",
-            {"text": task.message, "cmd": cmd[:8]},
+            {
+                "text": task.message,
+                "cmd": cmd[:8],
+                "task_id": task.task_id,
+                "source": task.source,
+            },
             self.home,
         )
         proc = await asyncio.create_subprocess_exec(
@@ -183,7 +188,12 @@ class CodexAdapter(Adapter):
                 stderr=stderr_tail,
             )
             if stop_reason == "cancelled":
-                append_event(session.session_id, "turn_end", {"stop_reason": "cancelled"}, self.home)
+                append_event(
+                    session.session_id,
+                    "turn_end",
+                    {"stop_reason": "cancelled", "task_id": task.task_id},
+                    self.home,
+                )
                 return TurnResult(
                     text=state.text,
                     files_changed=sorted(state.files),
@@ -207,7 +217,12 @@ class CodexAdapter(Adapter):
                     observed_effort=observed_effort,
                 )
             session.native_session_id = state.thread_id
-            append_event(session.session_id, "turn_end", {"stop_reason": "end_turn"}, self.home)
+            append_event(
+                session.session_id,
+                "turn_end",
+                {"stop_reason": "end_turn", "task_id": task.task_id},
+                self.home,
+            )
             return TurnResult(
                 text=state.text,
                 files_changed=sorted(state.files),
@@ -220,7 +235,12 @@ class CodexAdapter(Adapter):
             )
         except asyncio.CancelledError:
             await interrupt_then_reap(proc)
-            append_event(session.session_id, "turn_end", {"stop_reason": "cancelled"}, self.home)
+            append_event(
+                session.session_id,
+                "turn_end",
+                {"stop_reason": "cancelled", "task_id": task.task_id},
+                self.home,
+            )
             return TurnResult(
                 text=state.text,
                 files_changed=sorted(state.files),

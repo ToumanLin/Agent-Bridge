@@ -89,8 +89,14 @@ OUTBOX_POLL_SEC = 1.0
 # How long a requeued message waits before the next claim attempt.
 OUTBOX_BUSY_RETRY_SEC = 2.0
 OUTBOX_FOREIGN_RETRY_SEC = 10.0
-# A message queued behind a busy session is dropped after this many retries.
-OUTBOX_MAX_ATTEMPTS = 600
+# Wall-clock lifetime of a queued dashboard message. A message behind a busy
+# session (or a live foreign owner) is requeued until it can be delivered; it
+# is only dropped once its total queue age passes this deadline. Kept long so
+# user-typed messages survive even very long turns.
+OUTBOX_MAX_AGE_SEC = 24 * 3600.0
+# A *.claim file older than this is a stranded rename left by a dead bridge;
+# the outbox loop restores it to a plain message so it can be delivered.
+OUTBOX_CLAIM_STALE_SEC = 60.0
 
 
 def _new_id(prefix: str) -> str:
@@ -313,6 +319,7 @@ class Registry:
         """
         outbox = self.home / "outbox"
         outbox.mkdir(exist_ok=True)
+        self._outbox_rescue_claims(outbox)
         cooldown: dict[str, float] = {}
         while True:
             await asyncio.sleep(OUTBOX_POLL_SEC)
@@ -352,6 +359,42 @@ class Registry:
         with contextlib.suppress(OSError):
             atomic_write_json(done_dir / name, payload)
 
+    def _outbox_rescue_claims(self, outbox: Path) -> None:
+        """Restore stranded ``*.claim`` renames left by a crashed bridge.
+
+        A crash between the atomic ``name -> name.<pid>.claim`` rename and the
+        requeue/done step used to drop the message silently: the scan filters
+        on ``*.json`` and never looks back. At startup, stale claims whose
+        owning pid is dead are renamed back to ``msg_*.json`` (or deleted when
+        a ``done/`` result was already recorded).
+        """
+        cutoff = time.time() - OUTBOX_CLAIM_STALE_SEC
+        try:
+            claims = [p for p in outbox.iterdir() if p.is_file() and p.name.endswith(".claim")]
+        except OSError:
+            return
+        for claim in claims:
+            try:
+                if claim.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+            base = claim.name[: -len(".claim")].rsplit(".", 1)[0]
+            if (outbox / "done" / base).exists() or (outbox / base).exists():
+                claim.unlink(missing_ok=True)
+                continue
+            try:
+                pid = int(claim.name[: -len(".claim")].rsplit(".", 1)[1])
+            except (IndexError, ValueError):
+                pid = 0
+            if pid and owner_alive(pid, None):
+                continue  # another live bridge still holds this claim
+            try:
+                os.replace(claim, outbox / base)
+                log.info("outbox rescued stranded claim %s", claim.name)
+            except OSError:
+                log.warning("could not rescue outbox claim %s", claim.name)
+
     def _adopt_outbox_session(self, session_id: str) -> tuple[Session | None, bool]:
         """(session, foreign) — adopt a session whose owner bridge is gone."""
         disk = read_json(state_path(self.home), {})
@@ -380,7 +423,24 @@ class Registry:
         session_id = str(rec.get("session_id") or "")
         text = str(rec.get("message") or "").strip()
         if not session_id or not text:
-            self._outbox_done(outbox, name, {"ok": False, "error": "missing session_id or message"})
+            self._outbox_done(outbox, name, {"ok": False, "state": "error", "error": "missing session_id or message"})
+            return None
+        # Queue age counts from the dashboard's enqueue timestamp. Senders that
+        # omit it get stamped once here so the wall-clock deadline still applies.
+        queued_ts = rec.get("ts")
+        if not isinstance(queued_ts, (int, float)):
+            queued_ts = time.time()
+            rec["ts"] = queued_ts
+        if time.time() - queued_ts > OUTBOX_MAX_AGE_SEC:
+            self._outbox_done(
+                outbox,
+                name,
+                {
+                    "ok": False,
+                    "state": "error",
+                    "error": "message expired in queue (24h limit); nothing was delivered",
+                },
+            )
             return None
         session = self.sessions.get(session_id)
         foreign = False
@@ -388,8 +448,13 @@ class Registry:
             session, foreign = self._adopt_outbox_session(session_id)
         if session is None:
             if foreign:
+                # Requeued without an attempts increment, but the persisted
+                # ts still bounds total queue age via the check above.
+                rec["state"] = "waiting_owner"
+                with contextlib.suppress(OSError):
+                    atomic_write_json(claimed, rec)
                 return OUTBOX_FOREIGN_RETRY_SEC
-            self._outbox_done(outbox, name, {"ok": False, "error": f"unknown session {session_id}"})
+            self._outbox_done(outbox, name, {"ok": False, "state": "error", "error": f"unknown session {session_id}"})
             return None
         try:
             result = await self.dispatch_task(
@@ -398,28 +463,29 @@ class Registry:
                 cwd=session.cwd,
                 session_id=session.session_id,
                 user_requested=True,
+                source="dashboard",
             )
         except RuntimeError as exc:
             if "is busy with" not in str(exc):
-                self._outbox_done(outbox, name, {"ok": False, "error": str(exc)})
+                self._outbox_done(outbox, name, {"ok": False, "state": "error", "error": str(exc)})
                 return None
-            attempts = int(rec.get("attempts") or 0) + 1
-            if attempts > OUTBOX_MAX_ATTEMPTS:
-                self._outbox_done(
-                    outbox, name, {"ok": False, "error": "session stayed busy; message dropped"}
-                )
-                return None
-            rec["attempts"] = attempts
+            rec["attempts"] = int(rec.get("attempts") or 0) + 1
+            rec["state"] = "waiting_busy"
             with contextlib.suppress(OSError):
                 atomic_write_json(claimed, rec)
             return OUTBOX_BUSY_RETRY_SEC
         except Exception as exc:
-            self._outbox_done(outbox, name, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            self._outbox_done(outbox, name, {"ok": False, "state": "error", "error": f"{type(exc).__name__}: {exc}"})
             return None
         self._outbox_done(
             outbox,
             name,
-            {"ok": True, "task_id": result.get("task_id"), "session_id": session.session_id},
+            {
+                "ok": True,
+                "state": "dispatched",
+                "task_id": result.get("task_id"),
+                "session_id": session.session_id,
+            },
         )
         log.info(
             "outbox_dispatch name=%s session_id=%s task_id=%s",
@@ -636,6 +702,7 @@ class Registry:
         title: str | None = None,
         user_requested: bool = False,
         request_id: str | None = None,
+        source: str | None = None,
     ) -> dict:
         if not self.dispatch_enabled:
             raise RuntimeError(NESTED_DISPATCH_ERROR)
@@ -660,7 +727,17 @@ class Registry:
         effort = normalize_effort(effort)
         self.config.get(agent)
         # Compare supplied arguments, not selections inherited from a mutable session.
-        request = (agent, message, str(cwd_path.resolve()), session_id, model, effort, title, user_requested)
+        request = (
+            agent,
+            message,
+            str(cwd_path.resolve()),
+            session_id,
+            model,
+            effort,
+            title,
+            user_requested,
+            source,
+        )
         async with self._lock:
             if request_id is not None and request_id in self._requests:
                 previous, task_id = self._requests[request_id]
@@ -722,6 +799,7 @@ class Registry:
                 model=model or session.model,
                 effort=effort or session.effort,
                 status=TaskStatus.queued,
+                source=source,
             )
             self._stamp_owner(task)
             self.tasks[task.task_id] = task
@@ -832,6 +910,20 @@ class Registry:
                 task.status = TaskStatus.failed
                 task.error = str(exc)
                 task.stop_reason = "error"
+            # A turn that dies before/inside run_turn leaves no transcript
+            # boundary — the dashboard would show a silently empty transcript
+            # for a message it believes was delivered. Close it out here.
+            with contextlib.suppress(OSError):
+                append_event(
+                    session.session_id,
+                    "turn_end",
+                    {
+                        "stop_reason": "error",
+                        "task_id": task.task_id,
+                        "error": str(exc)[:500],
+                    },
+                    self.home,
+                )
         finally:
             if watch is not None:
                 watch.cancel()

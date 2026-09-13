@@ -131,7 +131,9 @@ const overview = {
     { task_id: "task_done", session_id: streams[0].id, agent: "devin",
       status: "completed", message: "finished work",
       created_at: "2026-01-01T00:00:00Z", started_at: "2026-01-01T00:00:02Z",
-      finished_at: "2026-01-01T00:00:42Z" },
+      finished_at: "2026-01-01T00:00:42Z",
+      usage: { input_tokens: 108414, cached_input_tokens: 108072,
+        output_tokens: 4763 } },
     { task_id: "task_run", session_id: streams[1].id, agent: "devin",
       status: "running", message: "still working",
       created_at: new Date(Date.now() - 70000).toISOString(),
@@ -349,6 +351,8 @@ async function waitStable() {
     runAdvanced: runDur0 !== null && runDur1 !== null && runDur1 !== runDur0,
     statusLabels: statusText(streams[0].id).includes("Done")
       && statusText(streams[1].id).includes("Running"),
+    // task_done usage: (108414-108072)+4763 = 5105 -> " · 5k tok"
+    tokensShown: statusText(streams[0].id).includes("5k tok"),
   });
 
   probing = false;
@@ -371,7 +375,8 @@ async function waitStable() {
     (r.raceCompletedOnce === undefined || r.raceCompletedOnce) &&
     (r.doneFrozen === undefined || r.doneFrozen) &&
     (r.runAdvanced === undefined || r.runAdvanced) &&
-    (r.statusLabels === undefined || r.statusLabels)) &&
+    (r.statusLabels === undefined || r.statusLabels) &&
+    (r.tokensShown === undefined || r.tokensShown)) &&
     sesslistSetsOnStablePolls === 0 && !jsError;
   process.exit(ok ? 0 : 1);
 })().catch((e) => { console.error(e); probing = false; process.exit(1); });

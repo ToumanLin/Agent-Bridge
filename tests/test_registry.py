@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -1538,5 +1539,220 @@ async def test_outbox_unknown_session_reports_error(bridge_home, tmp_path, monke
         result = json.loads(done.read_text(encoding="utf-8"))
         assert result["ok"] is False
         assert "unknown session" in result["error"]
+    finally:
+        await registry.stop()
+
+
+async def _outbox_wait_done(outbox: Path, name: str, tries: int = 100) -> dict:
+    done = outbox / "done" / name
+    for _ in range(tries):
+        if done.exists():
+            return json.loads(done.read_text(encoding="utf-8"))
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"outbox message {name} was never resolved")
+
+
+@pytest.mark.asyncio
+async def test_outbox_busy_survives_old_attempt_cap_then_delivers(bridge_home, tmp_path, monkeypatch):
+    """A queued message behind a busy session is not dropped at the old
+    ~600-attempt cadence budget: it stays requeued (waiting_busy) and is
+    delivered once the session frees."""
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_BUSY_RETRY_SEC", 0.05)
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "2")
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        first = await registry.dispatch_task("fake", "slow", cwd=str(work.resolve()))
+        outbox = bridge_home / "outbox"
+        outbox.mkdir(exist_ok=True)
+        name = "msg_3_abcdef12.json"
+        # attempts far beyond the retired 600-retry cap: under the old code the
+        # very next claim would drop the message.
+        (outbox / name).write_text(
+            json.dumps(
+                {
+                    "session_id": first["session_id"],
+                    "message": "still there?",
+                    "ts": time.time(),
+                    "attempts": 700,
+                }
+            ),
+            encoding="utf-8",
+        )
+        await asyncio.sleep(0.4)  # several claim/requeue cycles while busy
+        assert not (outbox / "done" / name).exists(), "busy message was dropped at the old cap"
+        rec = None
+        for _ in range(40):  # the file is briefly claimed each cycle
+            path = outbox / name
+            if path.exists():
+                rec = json.loads(path.read_text(encoding="utf-8"))
+                if int(rec.get("attempts") or 0) > 700:
+                    break
+            await asyncio.sleep(0.05)
+        assert rec is not None, "message vanished instead of being requeued"
+        assert rec["state"] == "waiting_busy" and int(rec["attempts"]) > 700
+        awaited = await registry.wait_task(first["task_id"], timeout_sec=8)
+        assert awaited["status"] == "completed"
+        result = await _outbox_wait_done(outbox, name)
+        assert result["ok"], result
+        waited = await registry.wait_task(result["task_id"], timeout_sec=5)
+        assert waited["status"] == "completed"
+        assert "still there?" in waited["result_text"]
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbox_message_expires_past_deadline(bridge_home, tmp_path, monkeypatch):
+    """The only drop for a queued message is the wall-clock expiry."""
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "30")  # stays busy the whole test
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        first = await registry.dispatch_task("fake", "slow", cwd=str(work.resolve()))
+        outbox = bridge_home / "outbox"
+        outbox.mkdir(exist_ok=True)
+        name = "msg_4_abcdef12.json"
+        (outbox / name).write_text(
+            json.dumps(
+                {
+                    "session_id": first["session_id"],
+                    "message": "stale",
+                    "ts": time.time() - 25 * 3600,  # past the 24h queue deadline
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = await _outbox_wait_done(outbox, name)
+        assert result["ok"] is False
+        assert "expired" in result["error"]
+        await registry.cancel_task(first["task_id"])
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbox_source_and_task_id_reach_transcript(bridge_home, tmp_path, monkeypatch):
+    """Dashboard-dispatched tasks carry source=dashboard onto the prompt card."""
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        first = await registry.dispatch_task("fake", "hi", cwd=str(work.resolve()))
+        await registry.wait_task(first["task_id"], timeout_sec=5)
+        outbox = bridge_home / "outbox"
+        outbox.mkdir(exist_ok=True)
+        name = "msg_5_abcdef12.json"
+        (outbox / name).write_text(
+            json.dumps(
+                {
+                    "session_id": first["session_id"],
+                    "message": "from the dashboard",
+                    "ts": time.time(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = await _outbox_wait_done(outbox, name)
+        assert result["ok"], result
+        task = registry.tasks[result["task_id"]]
+        assert task.source == "dashboard"
+        # dispatch returns at queue time; wait for the turn so the buffered
+        # prompt_sent/turn_end events are flushed to the transcript.
+        await registry.wait_task(result["task_id"], timeout_sec=5)
+        events = read_events(first["session_id"], bridge_home)
+        prompts = [e for e in events if e["type"] == "prompt_sent"]
+        assert prompts[-1]["data"]["source"] == "dashboard"
+        assert prompts[-1]["data"]["task_id"] == result["task_id"]
+        turns = [e for e in events if e["type"] == "turn_end"]
+        assert turns[-1]["data"]["task_id"] == result["task_id"]
+        # The ordinary MCP dispatch earlier stayed source-less.
+        assert registry.tasks[first["task_id"]].source is None
+        assert prompts[0]["data"].get("source") is None
+        assert prompts[0]["data"]["task_id"] == first["task_id"]
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbox_stranded_claim_is_rescued(bridge_home, tmp_path, monkeypatch):
+    """A stale *.claim left by a crashed bridge is restored and delivered."""
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    # Deterministic owner liveness: only pid 4242 counts as a live claim owner.
+    monkeypatch.setattr("agent_bridge.registry.owner_alive", lambda pid, create_time=None: pid == 4242)
+    work = tmp_path / "work"
+    work.mkdir()
+    outbox = bridge_home / "outbox"
+    outbox.mkdir(parents=True, exist_ok=True)
+    name = "msg_6_abcdef12.json"
+    body = json.dumps({"session_id": "sess_pending", "message": "rescued", "ts": time.time()})
+    claim = outbox / f"{name}.9999.claim"
+    claim.write_text(body, encoding="utf-8")
+    old = time.time() - 120
+    os.utime(claim, (old, old))
+    # A claim held by a *live* pid must not be touched.
+    held = outbox / "msg_7_abcdef12.json.4242.claim"
+    held.write_text(
+        json.dumps({"session_id": "sess_pending", "message": "not yours"}),
+        encoding="utf-8",
+    )
+    os.utime(held, (old, old))
+    registry = Registry.create(bridge_home)
+    # The session the rescued message targets must exist before start so the
+    # loop can deliver immediately after the rescue.
+    session = Session(
+        session_id="sess_pending",
+        agent="fake",
+        cwd=str(work.resolve()),
+        proc_state=ProcState.idle_unloaded,
+    )
+    registry.sessions[session.session_id] = session
+    await registry.start()
+    try:
+        for _ in range(100):  # the rescue sweep runs at outbox-loop startup
+            if not claim.exists():
+                break
+            await asyncio.sleep(0.05)
+        assert not claim.exists(), "stranded claim was not rescued"
+        assert held.exists(), "a live owner's claim was stolen"
+        result = await _outbox_wait_done(outbox, name)
+        assert result["ok"], result
+        waited = await registry.wait_task(result["task_id"], timeout_sec=5)
+        assert "rescued" in waited["result_text"]
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_task_writes_turn_end_boundary(bridge_home, tmp_path, monkeypatch):
+    """A task that dies inside the adapter still gets a transcript boundary so
+    the dashboard shows a finished turn instead of a silent gap."""
+    work = tmp_path / "work"
+    work.mkdir()
+
+    async def boom(self, session, task):
+        raise RuntimeError("spawn exploded")
+
+    monkeypatch.setattr(FakeAdapter, "run_turn", boom)
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "go", cwd=str(work.resolve()))
+        waited = await registry.wait_task(dispatched["task_id"], timeout_sec=5)
+        assert waited["status"] == "failed"
+        events = read_events(dispatched["session_id"], bridge_home)
+        turns = [e for e in events if e["type"] == "turn_end"]
+        assert len(turns) == 1
+        assert turns[0]["data"]["stop_reason"] == "error"
+        assert turns[0]["data"]["task_id"] == dispatched["task_id"]
+        assert "spawn exploded" in turns[0]["data"]["error"]
     finally:
         await registry.stop()
