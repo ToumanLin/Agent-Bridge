@@ -1269,10 +1269,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             done = OUTBOX_DIR / "done" / name
             if done.exists():
+                # Consume the record before responding so a second poll can
+                # never observe the same done payload.
                 try:
-                    self._json(json.loads(done.read_text(encoding="utf-8", errors="replace")))
+                    payload = json.loads(done.read_text(encoding="utf-8", errors="replace"))
                 finally:
                     done.unlink(missing_ok=True)
+                self._json(payload)
                 return
             # Inspectable pending states: the bridge annotates the requeued
             # record with "state" so the UI can say *why* it is still waiting.

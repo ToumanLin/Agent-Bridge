@@ -9,6 +9,7 @@ from agent_bridge.config import (
     AppConfig,
     _coordinator_span,
     load_config,
+    normalize_coordinator_mode,
     write_coordinator_overlay,
 )
 from agent_bridge.paths import bundled_agents_toml
@@ -194,6 +195,26 @@ def test_coordinator_invalid_mode_falls_back_to_auto(tmp_path, monkeypatch):
     (tmp_path / "agents.toml").write_text('[coordinator]\nmode = "turbo"\n', encoding="utf-8")
     cfg = load_config(tmp_path)
     assert cfg.coordinator.mode == "auto"
+    assert cfg.warnings == ["unknown coordinator mode 'turbo'; using auto"]
+
+
+def test_coordinator_mode_normalization_warnings(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENT_BRIDGE_MODE", raising=False)
+    # Unknown non-empty values warn; valid modes and aliases stay silent.
+    (tmp_path / "agents.toml").write_text('[coordinator]\nmode = "eagre"\n', encoding="utf-8")
+    cfg = load_config(tmp_path)
+    assert cfg.coordinator.mode == "auto"
+    assert "eagre" in cfg.warnings[0]
+    (tmp_path / "agents.toml").write_text('[coordinator]\nmode = "safe"\n', encoding="utf-8")
+    cfg = load_config(tmp_path)
+    assert cfg.coordinator.mode == "manual"
+    assert not any("unknown coordinator mode" in w for w in cfg.warnings)
+    cfg = load_config(tmp_path / "empty")
+    assert cfg.coordinator.mode == "auto"
+    assert not any("unknown coordinator mode" in w for w in cfg.warnings)
+    # Strict validation is unaffected.
+    with pytest.raises(ValueError, match="unknown coordinator mode"):
+        normalize_coordinator_mode("eagre", strict=True)
 
 
 def test_coordinator_env_override_wins_with_yolo_alias(tmp_path, monkeypatch):

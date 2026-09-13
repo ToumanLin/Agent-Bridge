@@ -493,6 +493,50 @@ async def test_get_result_reads_complete_unicode_result_in_pages(
 
 
 @pytest.mark.asyncio
+async def test_get_result_pages_artifact_without_full_read(bridge_home, tmp_path, monkeypatch):
+    """get_result must decode only the requested window, not the whole artifact."""
+    work = tmp_path / "work"
+    work.mkdir()
+    full_text = "汉🙂abc\n" * 25_000
+
+    async def long_turn(self, session, task):
+        return TurnResult(text=full_text)
+
+    monkeypatch.setattr(FakeAdapter, "run_turn", long_turn)
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "long", cwd=str(work.resolve()))
+        await registry.wait_task(dispatched["task_id"], timeout_sec=5)
+        artifact = result_path(dispatched["task_id"], bridge_home)
+        assert artifact.is_file()
+
+        real_read_text = Path.read_text
+
+        def no_full_artifact_read(self, *args, **kwargs):
+            if self == artifact:
+                raise AssertionError("get_result must not read the whole artifact")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", no_full_artifact_read)
+        page = registry.get_result(dispatched["task_id"], cursor=0, max_chars=1000)
+        assert page["result_text"] == full_text[:1000]
+        assert page["result_total_chars"] == len(full_text)
+        assert page["has_more"] is True
+        assert page["next_cursor"] == 1000
+        tail = registry.get_result(dispatched["task_id"], cursor=len(full_text) - 10)
+        assert tail["result_text"] == full_text[-10:]
+        assert tail["has_more"] is False
+        assert tail["next_cursor"] is None
+        edge = registry.get_result(dispatched["task_id"], cursor=len(full_text))
+        assert edge["result_text"] == "" and edge["has_more"] is False
+        with pytest.raises(ValueError, match="cursor exceeds"):
+            registry.get_result(dispatched["task_id"], cursor=len(full_text) + 1)
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
 async def test_task_lifecycle_logging_is_sparse(bridge_home, tmp_path, caplog):
     work = tmp_path / "work"
     work.mkdir()
@@ -709,6 +753,49 @@ async def test_old_terminal_tasks_are_pruned(bridge_home, tmp_path, monkeypatch)
         assert result_path(task_ids[-1], bridge_home).is_file()
         terminal = [t for t in registry.tasks.values() if t.session_id == first["session_id"]]
         assert len(terminal) <= 3  # 2 kept terminal + possibly the newest
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_wait_task_survives_prune_before_waiter_resumes(bridge_home, tmp_path, monkeypatch):
+    """A dispatch-time _prune can evict a task between its done event and the
+    waiter's wakeup; wait_task must still return the completed snapshot."""
+    monkeypatch.setattr("agent_bridge.registry.TASK_KEEP_PER_SESSION", 0)
+    gate = asyncio.Event()
+    real_run_turn = FakeAdapter.run_turn
+
+    async def gated(self, session, task):
+        await gate.wait()
+        return await real_run_turn(self, session, task)
+
+    monkeypatch.setattr(FakeAdapter, "run_turn", gated)
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "one", cwd=str(tmp_path))
+        task_id = dispatched["task_id"]
+        waiter = asyncio.create_task(registry.wait_task(task_id, timeout_sec=5))
+        for _ in range(3):
+            await asyncio.sleep(0)  # let wait_task bind the task and park on _done
+        assert not waiter.done()
+
+        schedule_idle = registry._schedule_idle
+
+        def prune_before_waiter_resumes(session_id):
+            # _run_task sets _done before _schedule_idle with no await in
+            # between, so the waiter cannot run until this returns.
+            registry._prune()
+            schedule_idle(session_id)
+
+        monkeypatch.setattr(registry, "_schedule_idle", prune_before_waiter_resumes)
+        gate.set()
+        waited = await waiter
+        assert task_id not in registry.tasks
+        assert waited["timed_out"] is False
+        assert waited["task_id"] == task_id
+        assert waited["status"] == "completed"
+        assert "[fake:fake] one" in waited["result_text"]
     finally:
         await registry.stop()
 
@@ -1199,6 +1286,28 @@ def test_get_transcript_survives_pruned_session(bridge_home):
     assert page["events"][0]["data"]["text"] == "kept"
     with pytest.raises(KeyError, match="unknown session"):
         registry.get_transcript("sess_never")
+
+
+def test_get_transcript_rejects_unsafe_session_ids(bridge_home):
+    # A *.jsonl outside transcripts/ must not be reachable through the id.
+    outside = bridge_home / "outside.jsonl"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_text(
+        '{"ts":"2026-01-01T00:00:00+00:00","type":"message_chunk","data":{"text":"x"}}\n',
+        encoding="utf-8",
+    )
+    registry = Registry.create(bridge_home)
+    for bad in ("../outside", "..\\outside", "..", "a/b", "a\\b", "", "sess x", ".hidden"):
+        with pytest.raises(KeyError, match="unknown session"):
+            registry.get_transcript(bad)
+    # Valid [A-Za-z0-9_-]+ ids keep the pruned-session transcript fallback.
+    kept = transcript_path("sess_OK-1_2", bridge_home)
+    kept.parent.mkdir(parents=True, exist_ok=True)
+    kept.write_text(
+        '{"ts":"2026-01-01T00:00:00+00:00","type":"message_chunk","data":{"text":"kept"}}\n',
+        encoding="utf-8",
+    )
+    assert registry.get_transcript("sess_OK-1_2")["total_matching"] == 1
 
 
 @pytest.mark.asyncio

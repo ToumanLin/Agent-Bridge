@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from agent_bridge.config import DEFAULT_INHERIT_KEYS, EnvConfig
+from agent_bridge.config import EnvConfig
 from agent_bridge.paths import (
     WORKER_CONTEXT_ENV,
     WORKER_CONTEXT_VALUE,
@@ -373,7 +373,7 @@ def resolve_env(
     machine_env: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     cfg = config or EnvConfig()
-    inherit = cfg.inherit or list(DEFAULT_INHERIT_KEYS)
+    inherit = cfg.inherit
     env = dict(os.environ if base is None else base)
     origin: dict[str, str] = {}
     for key in inherit:

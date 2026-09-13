@@ -97,7 +97,10 @@ class CodexAdapter(Adapter):
 
     async def run_turn(self, session: Session, task: Task) -> TurnResult:
         env = self._worker_env()
-        cmd = self._build_cmd(session, task, env)
+        # _build_cmd resolves the binary by spawning "<exe> --version" and
+        # "<exe> exec --help" probes on a cold capability cache — keep that
+        # off the event loop so a slow or hung binary cannot wedge the bridge.
+        cmd = await asyncio.to_thread(self._build_cmd, session, task, env)
         kwargs: dict[str, Any] = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP

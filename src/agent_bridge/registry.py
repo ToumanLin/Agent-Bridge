@@ -34,7 +34,7 @@ from agent_bridge.models import (
     iso,
     normalize_effort,
 )
-from agent_bridge.paths import ensure_home, result_path, state_path, transcript_path
+from agent_bridge.paths import ensure_home, is_safe_id, result_path, state_path, transcript_path
 from agent_bridge.persist import atomic_write_json, atomic_write_text, read_json
 from agent_bridge.probes import probe_agent
 from agent_bridge.processes import count_sibling_servers, owner_alive, process_create_time, reap_orphans
@@ -73,6 +73,9 @@ NESTED_END_SESSION_ERROR = (
 RESULT_TAIL = 6000
 # Explicit get_result calls can read up to this many characters per page.
 RESULT_PAGE_MAX_CHARS = 60000
+# get_result decodes at most this many characters per read() while locating a
+# page window, so paging never materializes the whole artifact.
+RESULT_READ_CHUNK_CHARS = 65536
 # Retained only as a fallback if the one-time result artifact write fails.
 RESULT_STORE_MAX = 30000
 # Terminal tasks kept per session; older ones are pruned so state.json does
@@ -123,6 +126,28 @@ def _tail(text: str, limit: int = RESULT_TAIL) -> str:
         return text
     encoded = text.encode("utf-8")
     return encoded[-limit:].decode("utf-8", errors="ignore")
+
+
+def _read_result_window(path: Path, cursor: int, max_chars: int) -> str:
+    """Decode only the ``[cursor, cursor + max_chars)`` character window of a
+    UTF-8 result artifact. Character cursors cannot be byte-seeked, so the
+    skip is chunked: a page never holds more than one extra chunk in memory."""
+    with path.open("r", encoding="utf-8") as fh:
+        remaining = cursor
+        while remaining > 0:
+            skipped = fh.read(min(remaining, RESULT_READ_CHUNK_CHARS))
+            if not skipped:
+                break
+            remaining -= len(skipped)
+        parts: list[str] = []
+        needed = max_chars
+        while needed > 0:
+            chunk = fh.read(needed)
+            if not chunk:
+                break
+            parts.append(chunk)
+            needed -= len(chunk)
+        return "".join(parts)
 
 
 class Registry:
@@ -1222,8 +1247,10 @@ class Registry:
             try:
                 await asyncio.wait_for(event.wait(), timeout=timeout_sec)
             except TimeoutError:
-                return {"timed_out": True, **self._task_snapshot(self.tasks[task_id])}
-        return {"timed_out": False, **self._task_snapshot(self.tasks[task_id], include_result=True)}
+                return {"timed_out": True, **self._task_snapshot(task)}
+        # Snapshot the held Task: a dispatch-time _prune may have evicted it
+        # from self.tasks while this waiter slept on the done event.
+        return {"timed_out": False, **self._task_snapshot(task, include_result=True)}
 
     def check_task(self, task_id: str) -> dict:
         return self._task_snapshot(self._require_task(task_id))
@@ -1241,22 +1268,36 @@ class Registry:
         task = self._require_task(task_id)
         path = result_path(task.task_id, self.home)
         artifact = path.is_file()
-        try:
-            text = path.read_text(encoding="utf-8") if artifact else task.result_text
-        except OSError as exc:
-            log.warning("could not read full result for task %s: %s", task.task_id, exc)
-            artifact = False
+        if artifact:
+            # result_chars is len(result.text), recorded with the artifact
+            # write, so the artifact's character count is already known and
+            # only the requested window is decoded. An artifact persisted
+            # without result_chars falls back to counting it once.
+            total = task.result_chars
+            try:
+                if not total:
+                    total = len(path.read_text(encoding="utf-8"))
+                if cursor > total:
+                    raise ValueError(f"cursor exceeds result length ({total})")
+                page = _read_result_window(path, cursor, max_chars)
+            except OSError as exc:
+                log.warning("could not read full result for task %s: %s", task.task_id, exc)
+                artifact = False
+        if not artifact:
             text = task.result_text
-        if cursor > len(text):
-            raise ValueError(f"cursor exceeds result length ({len(text)})")
-        end = min(len(text), cursor + max_chars)
-        has_more = end < len(text)
+            total = task.result_chars or len(text)
+            if cursor > len(text):
+                raise ValueError(f"cursor exceeds result length ({len(text)})")
+            page = text[cursor : min(len(text), cursor + max_chars)]
+        bound = total if artifact else len(text)
+        end = min(bound, cursor + max_chars)
+        has_more = end < bound
         payload = self._task_snapshot(task)
         payload.update(
             {
-                "result_text": text[cursor:end],
+                "result_text": page,
                 "result_offset": cursor,
-                "result_total_chars": len(text) if artifact else (task.result_chars or len(text)),
+                "result_total_chars": total,
                 "next_cursor": end if has_more else None,
                 "has_more": has_more,
                 "result_truncated": has_more,
@@ -1273,7 +1314,9 @@ class Registry:
         return payload
 
     def get_transcript(self, session_id: str, offset: int = 0, limit: int = 50, kinds: list[str] | None = None) -> dict:
-        if session_id not in self.sessions and not transcript_path(session_id, self.home).is_file():
+        if not is_safe_id(session_id) or (
+            session_id not in self.sessions and not transcript_path(session_id, self.home).is_file()
+        ):
             raise KeyError(f"unknown session {session_id}")
         events = read_events(session_id, self.home)
         return page_events(events, offset=offset, limit=limit, kinds=kinds)

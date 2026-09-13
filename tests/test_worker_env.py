@@ -128,6 +128,26 @@ def test_process_proxy_beats_inherit_when_unpinned():
     assert origin["HTTPS_PROXY"] == "process"
 
 
+def test_explicit_empty_inherit_inherits_nothing():
+    env, _origin = resolve_env(
+        EnvConfig(inherit=[], discover_proxy=False),
+        base={"PATH": "x"},
+        user_env={"DEEPSEEK_API_KEY": "sk-user"},
+        machine_env={"KIMI_API_KEY": "sk-machine"},
+    )
+    assert "DEEPSEEK_API_KEY" not in env
+    assert "KIMI_API_KEY" not in env
+    # The model default still supplies the usual keys when inherit is unset.
+    env, _ = resolve_env(
+        EnvConfig(discover_proxy=False),
+        base={"PATH": "x"},
+        user_env={"DEEPSEEK_API_KEY": "sk-user"},
+        machine_env={"KIMI_API_KEY": "sk-machine"},
+    )
+    assert env["DEEPSEEK_API_KEY"] == "sk-user"
+    assert env["KIMI_API_KEY"] == "sk-machine"
+
+
 def test_describe_env_direct_network_has_empty_warnings():
     status = describe_env(
         EnvConfig(discover_proxy=False, inherit=[]),

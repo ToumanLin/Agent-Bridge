@@ -488,7 +488,11 @@ def load_config(home: Path | None = None) -> AppConfig:
     env_mode = os.environ.get("AGENT_BRIDGE_MODE")
     if env_mode:
         coord_raw["mode"] = env_mode
-    coord_raw["mode"] = normalize_coordinator_mode(coord_raw.get("mode"))
+    raw_mode = str(coord_raw.get("mode") or "")
+    normalized_mode = normalize_coordinator_mode(raw_mode)
+    if normalized_mode == "auto" and raw_mode.strip().lower() != "auto" and raw_mode.strip():
+        warnings.append(f"unknown coordinator mode {raw_mode!r}; using auto")
+    coord_raw["mode"] = normalized_mode
     coordinator = CoordinatorConfig.model_validate(coord_raw)
     quota = QuotaConfig.model_validate({**_coerce_quota(bundled_raw), **_coerce_quota(overlay_raw)})
     dashboard = DashboardConfig.model_validate(

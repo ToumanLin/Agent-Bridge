@@ -674,6 +674,11 @@ def test_send_flow_and_status(dash):
     code, body = _get(base + f"/api/send_status?name={name}")
     assert code == 200 and json.loads(body) == done_payload
     assert not (home / "outbox" / "done" / name).exists()
+    # The record is consumed before the response is written, so a follow-up
+    # poll can never observe the same done payload twice.
+    code, body = _get(base + f"/api/send_status?name={name}")
+    j = json.loads(body)
+    assert code == 404 and j["state"] == "missing"
     code, body = _post(base + "/api/send", {"session": "nope", "text": "x"})
     assert code == 404
     code, body = _post(base + "/api/send", {"session": "sess_1", "text": "  "})

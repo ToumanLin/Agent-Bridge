@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -235,6 +236,38 @@ def test_resolve_rejects_binary_missing_flags(tmp_path: Path):
     launcher = _launcher(tmp_path, stub)
     with pytest.raises(FileNotFoundError):
         resolve_codex_command([str(launcher)], extra=[])
+
+
+@pytest.mark.asyncio
+async def test_run_turn_resolves_command_off_the_event_loop(tmp_path: Path, monkeypatch):
+    """Capability probing spawns "<exe> --version" / "exec --help" subprocesses
+    on a cold cache; it must run in a worker thread or a hung binary wedges the
+    whole bridge event loop."""
+    loop_thread = threading.get_ident()
+    resolved_on: list[int] = []
+
+    def resolve(*args, **kwargs):
+        resolved_on.append(threading.get_ident())
+        return [sys.executable, str(FAKE)]
+
+    monkeypatch.setattr("agent_bridge.adapters.codex.resolve_codex_command", resolve)
+    adapter = CodexAdapter(
+        AgentConfig(name="codex", protocol="codex", command=["codex"]),
+        tmp_path,
+    )
+    session = Session(session_id="s-probe", agent="codex", cwd=str(tmp_path))
+    result = await adapter.run_turn(
+        session,
+        Task(
+            task_id="t-probe",
+            session_id="s-probe",
+            agent="codex",
+            message="hi",
+            cwd=str(tmp_path),
+        ),
+    )
+    assert result.stop_reason == "end_turn"
+    assert resolved_on and all(t != loop_thread for t in resolved_on)
 
 
 @pytest.mark.asyncio

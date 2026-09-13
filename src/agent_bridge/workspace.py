@@ -120,15 +120,13 @@ def _relative_to_cwd(raw: str, root: Path) -> str | None:
         if text.startswith("/") and len(text) >= 3 and text[2] == ":":
             text = text[1:]
     path = Path(text)
-    rel: str | None
     try:
         resolved = path.resolve() if path.is_absolute() else (root / path).resolve()
         rel = resolved.relative_to(root).as_posix()
     except (OSError, ValueError):
-        rel = path.as_posix().lstrip("./") if not path.is_absolute() else None
-        if rel in {".", "..", ""}:
-            return None
-        return rel
+        # Cannot resolve, or resolves outside root — never relabel an escaped
+        # path (e.g. "../outside/x.py") as an in-workspace change.
+        return None
     if rel in {".", "..", ""}:
         return None
     return rel

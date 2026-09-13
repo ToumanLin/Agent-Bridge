@@ -70,6 +70,31 @@ def test_root_prefix_len_at_drive_root_and_normal_path(tmp_path: Path):
     assert _root_prefix_len(str(tmp_path)) == len(str(tmp_path)) + 1
 
 
+def test_normalize_drops_paths_escaping_cwd(tmp_path: Path):
+    inside = tmp_path / "src" / "app.py"
+    inside.parent.mkdir()
+    inside.write_text("x\n", encoding="utf-8")
+    raw = [
+        "../outside/x.py",
+        "../.env",
+        "..",
+        str(tmp_path.parent / "sibling.py"),
+        "./src/app.py",
+        "a.b/c.py",
+        str(inside),
+    ]
+    assert normalize_changed_paths(tmp_path, raw) == ["src/app.py", "a.b/c.py"]
+
+
+def test_normalize_backslash_escape_dropped_on_windows(tmp_path: Path):
+    # On Windows "..\\x" resolves outside the workspace; on POSIX it is a
+    # literal in-workspace filename and must not be mangled either way.
+    if os.sep == "\\":
+        assert normalize_changed_paths(tmp_path, ["..\\outside\\x.py", "..\\.env"]) == []
+    else:
+        assert normalize_changed_paths(tmp_path, ["..\\outside\\x.py"]) == ["..\\outside\\x.py"]
+
+
 def test_normalize_ignores_skip_dirs_at_any_depth(tmp_path: Path):
     assert normalize_changed_paths(
         tmp_path,

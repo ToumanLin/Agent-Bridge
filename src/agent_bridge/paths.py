@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,17 @@ def state_path(home: Path | None = None) -> Path:
 
 def pids_path(home: Path | None = None) -> Path:
     return ensure_home(home) / "pids.json"
+
+
+# Ids that end up as file-name components under the data dir. Anything else —
+# separators, "..", whitespace, unicode tricks — must be rejected before a
+# path is built. The dashboard enforces the same shape via SAFE_ID.
+_SAFE_ID = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def is_safe_id(value: str | None) -> bool:
+    """True when ``value`` is safe to embed as a single file-name component."""
+    return _SAFE_ID.fullmatch(value or "") is not None
 
 
 def transcript_path(session_id: str, home: Path | None = None) -> Path:
