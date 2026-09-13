@@ -894,6 +894,7 @@ class Registry:
             task.files_changed = full_changed[:FILES_CHANGED_MAX]
             task.files_changed_truncated = len(full_changed) > FILES_CHANGED_MAX
             task.usage = result.usage
+            task.run_usage = result.run_usage
             if session.agent == "grok":
                 observed = await asyncio.to_thread(observe_grok_session, session.cwd, session.native_session_id)
                 task.observed_model = observed["model"]
@@ -1204,6 +1205,8 @@ class Registry:
             "files_changed": task.files_changed,
             "files_changed_total": task.files_changed_total,
             "files_changed_truncated": task.files_changed_truncated,
+            "usage": task.usage,
+            "run_usage": task.run_usage,
             "model": task.model,
             "effort": task.effort,
             "observed_model": task.observed_model,
@@ -1213,6 +1216,21 @@ class Registry:
             "finished_at": task.finished_at,
             "recent_activity": recent_activity(events),
         }
+        # While the task is still running its persisted run_usage is empty;
+        # surface the latest normalized "usage" transcript event as a marked
+        # live partial instead. Events older than started_at belong to a
+        # prior run on this reusable session. The final Task.run_usage
+        # written at finalization stays the authoritative record.
+        if task.status == TaskStatus.running and task.started_at and not task.run_usage:
+            for event in reversed(events):
+                if event.get("type") != "usage":
+                    continue
+                if str(event.get("ts") or "") < task.started_at:
+                    break
+                consumed = (event.get("data") or {}).get("consumed")
+                if isinstance(consumed, dict) and consumed:
+                    payload["run_usage"] = {**consumed, "partial": True}
+                break
         if task.started_at:
             start = datetime.fromisoformat(task.started_at)
             end = datetime.fromisoformat(task.finished_at) if task.finished_at else datetime.fromisoformat(iso())
@@ -1225,7 +1243,6 @@ class Registry:
             payload["result_text"] = preview
             payload["result_total_chars"] = total_chars
             payload["result_truncated"] = total_chars > len(preview)
-            payload["usage"] = task.usage
             payload["hint"] = self._result_hint(
                 task,
                 "Use get_result for the complete final result and get_transcript "
@@ -1303,7 +1320,6 @@ class Registry:
                 "result_truncated": has_more,
                 "result_complete": artifact,
                 "result_source": "artifact" if artifact else "legacy_state",
-                "usage": task.usage,
                 "hint": self._result_hint(
                     task,
                     "Continue with next_cursor while has_more is true. "

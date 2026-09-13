@@ -254,6 +254,8 @@ def recent_activity(events: list[dict[str, Any]], limit: int = 5) -> list[str]:
     summaries: list[str] = []
     for event in reversed(events):
         kind = event.get("type", "event")
+        if kind == "usage":
+            continue  # token telemetry is not user-facing activity
         data = event.get("data") or {}
         text = data.get("text") or data.get("title") or data.get("path") or data.get("summary")
         if text:

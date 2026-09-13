@@ -93,6 +93,9 @@ class Session(BaseModel):
     effort: str | None = None
     title: str | None = None
     turns: int = 0
+    # Persisted conversation-cumulative usage counters so a resumed session can
+    # attribute only this run's delta (agy / ACP PromptResponse fallback).
+    usage_baseline: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=iso)
     last_active_at: str = Field(default_factory=iso)
     pid: int | None = None
@@ -123,6 +126,9 @@ class Task(BaseModel):
     files_changed_total: int = 0
     files_changed_truncated: bool = False
     usage: dict[str, Any] = Field(default_factory=dict)
+    # Accumulated token consumption for this run (one task / one worker turn,
+    # root agent plus subagent streams). `usage` stays the last raw snapshot.
+    run_usage: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     warnings: list[str] = Field(default_factory=list)
     created_at: str = Field(default_factory=iso)
@@ -143,6 +149,7 @@ class TurnResult(BaseModel):
     files_changed: list[str] = Field(default_factory=list)
     stop_reason: str = "end_turn"
     usage: dict[str, Any] = Field(default_factory=dict)
+    run_usage: dict[str, Any] = Field(default_factory=dict)
     native_session_id: str | None = None
     error: str | None = None
     warnings: list[str] = Field(default_factory=list)

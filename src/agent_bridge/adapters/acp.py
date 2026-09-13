@@ -43,6 +43,7 @@ from agent_bridge.processes import (
     resolve_command,
 )
 from agent_bridge.transcript import append_event
+from agent_bridge.usage import RunUsage
 from agent_bridge.worker_env import build_worker_env
 from agent_bridge.workspace import collect_update_paths
 
@@ -450,19 +451,28 @@ def _pick_permission_option(options: Iterable[PermissionOption]) -> PermissionOp
 
 
 class _BridgeClient:
-    def __init__(self, session_id: str, home: Path) -> None:
+    def __init__(self, session_id: str, home: Path, agent: str = "") -> None:
         self.session_id = session_id
         self.home = home
         self.text_parts: list[str] = []
         self.files: set[str] = set()
         self.usage: dict[str, Any] = {}
         self.tool_kinds: dict[str, str] = {}
+        self.run = RunUsage(agent)
+        self._usage_emit: tuple | None = None
 
-    def reset_turn(self) -> None:
+    def reset_turn(
+        self,
+        *,
+        resumed: bool = False,
+        conv_baseline: dict[str, Any] | None = None,
+    ) -> None:
         self.text_parts = []
         self.files = set()
         self.usage = {}
         self.tool_kinds = {}
+        self._usage_emit = None
+        self.run.reset(resumed=resumed, conv_baseline=conv_baseline)
 
     async def request_permission(
         self,
@@ -513,8 +523,21 @@ class _BridgeClient:
         elif type_name in {"AgentPlanUpdate", "AgentPlanContentUpdate"}:
             event_type = "plan"
         elif type_name == "UsageUpdate":
-            event_type = "raw"
+            # Keep `usage` as the last raw snapshot for compat, but feed every
+            # update into the run accumulator. Transcript gets a normalized
+            # "usage" event whenever the consumed/context totals move.
             self.usage = dumped if isinstance(dumped, dict) else {"raw": dumped}
+            update_norm = self.run.update(dumped)
+            consumed = self.run.snapshot()
+            emit_key = tuple(sorted(consumed.items()))
+            if emit_key == self._usage_emit:
+                return
+            self._usage_emit = emit_key
+            evt = {"update_type": type_name, "consumed": consumed}
+            if update_norm:
+                evt["usage"] = update_norm
+            append_event(self.session_id, "usage", evt, self.home)
+            return
         if should_collect_tool_paths(type_name, dumped, self.tool_kinds):
             _collect_paths(dumped, self.files)
         data: dict[str, Any] = {"update_type": type_name}
@@ -770,7 +793,7 @@ class AcpAdapter(Adapter):
             raise RuntimeError(f"{self.agent.name} did not expose stdio")
         live = _Live()
         live.proc = proc
-        live.client = _BridgeClient(session.session_id, self.home)
+        live.client = _BridgeClient(session.session_id, self.home, self.agent.name)
         live.conn = connect_to_agent(live.client, proc.stdin, proc.stdout)
         live.stderr_task = asyncio.create_task(
             self._drain_stderr(proc, session.session_id, live)
@@ -1369,10 +1392,24 @@ class AcpAdapter(Adapter):
         await self._sync_selection(live, session)
 
     async def run_turn(self, session: Session, task: Task) -> TurnResult:
+        # A native session id / prior turn means this turn resumes a
+        # conversation — must be decided before ensure_session, which sets
+        # native_session_id even for a brand-new conversation.
+        resumed = bool(session.native_session_id) or session.turns > 0
         await self.ensure_session(session)
         live = self._live[session.session_id]
         assert live.conn is not None and live.client is not None
-        live.client.reset_turn()
+        # The persisted baseline only applies to the same conversation; a
+        # re-created native session must not delta against stale counters.
+        base = session.usage_baseline
+        live.client.reset_turn(
+            resumed=resumed,
+            conv_baseline=(
+                base.get("counters")
+                if base.get("cid") == session.native_session_id
+                else None
+            ),
+        )
         live.stderr_tail = ""
         warnings: list[str] = live.pending_warnings
         live.pending_warnings = []
@@ -1405,6 +1442,8 @@ class AcpAdapter(Adapter):
                 text="".join(live.client.text_parts),
                 files_changed=sorted(live.client.files),
                 stop_reason="cancelled",
+                usage=live.client.usage,
+                run_usage=self._finish_usage(session, live.client),
                 warnings=warnings,
                 observed_model=live.applied_model,
                 observed_effort=live.applied_effort,
@@ -1424,11 +1463,15 @@ class AcpAdapter(Adapter):
         if hasattr(stop, "value"):
             stop = stop.value
         stop = str(stop)
+        # PromptResponse.usage is conversation-cumulative; the accumulator
+        # deltas it against the previous turn's snapshot as a fallback when no
+        # UsageUpdate counters arrived (never double-counting stream data).
+        response_usage = _dump(getattr(response, "usage", None))
+        if isinstance(response_usage, dict):
+            live.client.run.note_conversation_snapshot(response_usage)
         usage = live.client.usage
-        if not usage:
-            dumped_usage = _dump(getattr(response, "usage", None))
-            if isinstance(dumped_usage, dict):
-                usage = dumped_usage
+        if not usage and isinstance(response_usage, dict):
+            usage = response_usage
         append_event(
             session.session_id,
             "turn_end",
@@ -1440,11 +1483,24 @@ class AcpAdapter(Adapter):
             files_changed=sorted(live.client.files),
             stop_reason=stop,
             usage=usage,
+            run_usage=self._finish_usage(session, live.client),
             native_session_id=session.native_session_id,
             warnings=warnings,
             observed_model=live.applied_model,
             observed_effort=live.applied_effort,
         )
+
+    def _finish_usage(self, session: Session, client: _BridgeClient) -> dict[str, Any]:
+        """Final run_usage; persist the conversation baseline so the next
+        turn's delta is attributable even across a bridge restart."""
+        run_usage = client.run.finish()
+        baseline = client.run.conversation_baseline
+        if baseline:
+            session.usage_baseline = {
+                "cid": session.native_session_id,
+                "counters": baseline,
+            }
+        return run_usage
 
     async def cancel(self, session: Session) -> None:
         live = self._live.get(session.session_id)

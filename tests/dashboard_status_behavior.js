@@ -63,8 +63,8 @@ vm.runInContext(
   code +
     "\n;globalThis.__x = { statusOf, latestTask, taskDur, fmtDur, durText," +
     " durSpan, PROC_STATUS, subSeed, agentAvatar, statusGlyph, icon," +
-    " usageNums, tokCount, fmtTok, tokSpan, turnDurMs, addTurn, addPrompt," +
-    " _setTasks: (v) => { tasks = v; } };",
+    " usageNums, tokCount, runTok, tokTitle, fmtTok, tokSpan, turnDurMs," +
+    " addTurn, addPrompt, _setTasks: (v) => { tasks = v; } };",
   sandbox);
 const X = sandbox.__x;
 
@@ -237,10 +237,68 @@ const task = (over) =>
   eq(X.fmtTok(999999), "999k", "fmtTok just under 1m");
   eq(X.fmtTok(NaN), "", "fmtTok NaN hides");
   eq(X.fmtTok(-5), "", "fmtTok negative hides");
+  // --- run_usage is the displayed metric: exact aggregate, not a snapshot ---
+  const runTask = task({ run_usage: { scope: "run", quality: "exact",
+    input: 60, output: 12, total: 72, streams: 2, used: 12, size: 100 } });
+  const runHtml = X.tokSpan(runTask, "stok");
+  eq(runHtml.includes("72 tok"), true, "run_usage headline total renders");
+  eq(runHtml.includes("~"), false, "exact run_usage is not marked estimate");
+  eq(runHtml.includes("Run tokens 72"), true, "title states the run total");
+  eq(runHtml.includes("in 60") && runHtml.includes("out 12"), true,
+    "title carries the input/output breakdown");
+  eq(runHtml.includes("context 12/100"), true,
+    "context occupancy shows as metadata only");
+  eq(runHtml.includes('aria-label="Run tokens 72'), true,
+    "aria-label mirrors the tooltip");
+
+  // run_usage beats a raw usage snapshot on the same task — `used` is never
+  // mistaken for the consumed total.
+  const bothTk = task({ usage: { used: 999999, size: 1000000 },
+    run_usage: { scope: "run", quality: "exact", input: 10, output: 4,
+      total: 14 } });
+  const bothHtml = X.tokSpan(bothTk, "stok");
+  eq(bothHtml.includes("14 tok"), true, "run_usage preferred over raw usage");
+  eq(bothHtml.includes("999"), false, "context used never becomes the total");
+
+  // An estimate without computable run counters renders nothing rather than
+  // surfacing the whole conversation total as this run's usage.
+  eq(X.tokSpan(task({ run_usage: { scope: "run", quality: "estimate",
+    conversation_total: { total: 500 } } }), "stok"), "",
+    "estimate without run counters -> hidden, not the conversation total");
+  const convTk = task({ run_usage: { scope: "run", quality: "exact",
+    input: 30, output: 10, total: 40,
+    conversation_total: { input: 130, output: 60, total: 190 } } });
+  eq(X.tokSpan(convTk, "stok").includes("conversation 190"), true,
+    "resumed-with-baseline tooltip keeps the conversation total separate");
+
+  // Live usage-event snapshot renders for a running task only; terminal
+  // tasks always read the persisted run_usage.
+  const liveTk = task({ task_id: "tl", status: "running", finished_at: null });
+  const liveHtml = X.tokSpan(liveTk, "stok",
+    { input: 7, output: 3, total: 10, used: 9, size: 100 });
+  eq(liveHtml.includes("10 tok"), true, "live partial renders while running");
+  eq(liveHtml.includes("live"), true, "live tooltip marks the snapshot");
+  const doneTk = task({ run_usage: { scope: "run", quality: "exact",
+    input: 10, output: 4, total: 14 } });
+  eq(X.tokSpan(doneTk, "stok",
+    { input: 999, output: 999, total: 1998 }).includes("14 tok"), true,
+    "terminal task ignores the stale live snapshot");
+
+  // Legacy usage-only fallback: marked estimate, context-only stays honest.
   const tkTask = task({ usage: { input_tokens: 108414,
     cached_input_tokens: 108072, output_tokens: 4763 } });
-  eq(X.tokSpan(tkTask, "stok"), '<span class="stok"> · 5k tok</span>',
-    "tokSpan renders the headline");
+  const legacyHtml = X.tokSpan(tkTask, "stok");
+  eq(legacyHtml.includes("~5k tok"), true,
+    "legacy snapshot renders the headline as an estimate");
+  eq(legacyHtml.includes("estimate"), true, "legacy tooltip marks estimate");
+  eq(legacyHtml.includes("in 108,414"), true,
+    "legacy tooltip keeps the breakdown");
+  const ctxHtml = X.tokSpan(task({ usage: { used: 113177, size: 262000 } }),
+    "stok");
+  eq(ctxHtml.includes("~113k tok"), true,
+    "context-only snapshot renders as estimate");
+  eq(ctxHtml.includes("Context in use"), true,
+    "context-only title never claims a run total");
   eq(X.tokSpan(task({}), "stok"), "", "no usage -> empty span");
   eq(X.tokSpan(task({ usage: { junk: 1 } }), "stok"), "",
     "unusable usage -> empty span");

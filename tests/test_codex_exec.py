@@ -293,6 +293,9 @@ async def test_adapter_new_resume_fail_and_long_stdin(tmp_path: Path, monkeypatc
     assert first.text.startswith("done:")
     assert first.files_changed == ["src/app.py"]
     assert first.observed_effort == "none"
+    # turn.completed.usage is already per-run; run_usage is the normalized copy.
+    assert first.run_usage["quality"] == "exact"
+    assert first.run_usage["total"] == first.run_usage["input"] + first.run_usage["output"] + first.run_usage["cached_read"]
     payload = json.loads(dump.read_text(encoding="utf-8"))
     assert payload["prompt"] == long_prompt
     assert payload["argv"][-1] == "-"

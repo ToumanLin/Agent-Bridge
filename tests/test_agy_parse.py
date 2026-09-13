@@ -234,6 +234,12 @@ async def test_run_turn_sends_prompt_over_stdin(tmp_path, monkeypatch):
     assert report.read_text(encoding="utf-8") == "50000"
     assert session.native_session_id == "conv-fake-agy"
     assert result.usage["scope"] == "turn"
+    # scope="turn" counters are this run's total — exact, and persisted as
+    # the conversation baseline for the next resumed turn's delta.
+    assert result.run_usage["total"] == 1
+    assert result.run_usage["quality"] == "exact"
+    assert session.usage_baseline["cid"] == "conv-fake-agy"
+    assert session.usage_baseline["counters"]["total"] == 1
 
 
 @pytest.mark.asyncio
@@ -255,6 +261,36 @@ async def test_run_turn_labels_resumed_usage_as_conversation(tmp_path, monkeypat
     result = await adapter.run_turn(session, task)
     assert result.stop_reason == "end_turn"
     assert result.usage["scope"] == "conversation"
+    # Resumed with no baseline: the prior conversation's counters cannot be
+    # attributed to this run — estimate, conversation total kept separate.
+    assert result.run_usage["quality"] == "estimate"
+    assert "total" not in result.run_usage
+    assert result.run_usage["conversation_total"]["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_turn_resumed_with_baseline_reports_delta(tmp_path, monkeypatch):
+    adapter = _agy_adapter(tmp_path, monkeypatch)
+    session = Session(
+        session_id="sess_resumed_base",
+        agent="antigravity",
+        cwd=str(tmp_path),
+        native_session_id="conv-fake-agy",
+        usage_baseline={"cid": "conv-fake-agy", "counters": {"total": 1}},
+    )
+    task = Task(
+        task_id="task_resumed_base",
+        session_id=session.session_id,
+        agent="antigravity",
+        message="again",
+        cwd=str(tmp_path),
+    )
+    result = await adapter.run_turn(session, task)
+    assert result.stop_reason == "end_turn"
+    # Same cumulative snapshot -> zero run delta, exact quality.
+    assert result.run_usage["quality"] == "exact"
+    assert "total" not in result.run_usage
+    assert result.run_usage["conversation_total"]["total"] == 1
 
 
 def test_scoped_usage_leaves_empty_dict_alone():

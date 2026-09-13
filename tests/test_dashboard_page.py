@@ -78,6 +78,24 @@ TRANSCRIPT = [
         "data": {"tool_call_id": "tc1", "status": "completed"},
     },
     {
+        "type": "usage",
+        "ts": "2026-09-12T10:00:05Z",
+        "data": {
+            "update_type": "UsageUpdate",
+            "consumed": {
+                "scope": "run",
+                "quality": "exact",
+                "input": 25,
+                "output": 9,
+                "total": 34,
+                "streams": 1,
+                "used": 8,
+                "size": 100,
+            },
+            "usage": {"input": 25, "output": 9, "used": 8, "size": 100},
+        },
+    },
+    {
         "type": "turn_end",
         "ts": "2026-09-12T10:00:06Z",
         "data": {"stop_reason": "end_turn", "task_id": "t1"},
@@ -493,8 +511,11 @@ def test_token_counter_helpers():
     for needle in (
         "usageNums",
         "tokCount",
+        "runTok",
+        "tokTitle",
         "fmtTok",
         "tokSpan",
+        "liveUsage",
         '"stok"',
         '"htok"',
         "cognition.ai/inputTokens",
@@ -505,9 +526,15 @@ def test_token_counter_helpers():
         " tok",
     ):
         assert needle in PAGE
-    # The sidebar signature fingerprints usage so a finishing turn repaints.
+    # The sidebar signature fingerprints run_usage (preferred), legacy usage,
+    # and the live usage-event snapshot so a finishing/running turn repaints.
     sig = re.search(r'const sig=([\s\S]*?)join\("\|"\)', PAGE).group(1)
-    assert "t.usage" in sig
+    assert "t.run_usage" in sig and "t.usage" in sig and "liveUsage" in sig
+    # tokSpan prefers the persisted per-run aggregate over the raw last
+    # snapshot; legacy usage is only an estimate fallback.
+    body = re.search(r"function tokSpan\(t,cls,live\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert "t.run_usage" in body and "runTok" in body
+    assert 'quality:"estimate"' in body
     # Usage text stays static between overview polls — not joined to the tick.
     tick = re.search(r"function tickDurations\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
     assert "stok" not in tick and "htok" not in tick
@@ -609,6 +636,7 @@ def test_index_and_overview(dash):
         "error",
         "source",
         "usage",
+        "run_usage",
         "created_at",
         "started_at",
         "finished_at",
@@ -624,7 +652,12 @@ def test_events_normalized(dash):
     assert code == 200
     j = json.loads(body)
     kinds = [e["t"] for e in j["events"]]
-    assert kinds == ["prompt", "think", "msg", "tool", "tool_status", "turn", "error"]
+    assert kinds == ["prompt", "think", "msg", "tool", "tool_status", "usage", "turn", "error"]
+    usage = next(e for e in j["events"] if e["t"] == "usage")
+    # Only the normalized consumed snapshot reaches the client — never the
+    # raw provider _meta bag or stream/subagent routing keys.
+    assert usage["consumed"]["total"] == 34
+    assert "_meta" not in json.dumps(usage) and "stream" not in usage["consumed"]
     assert j["offset"] > 0 and j["reset"] is False
     tool = next(e for e in j["events"] if e["t"] == "tool")
     assert tool["kind"] == "execute" and "pwd" in tool["title"]

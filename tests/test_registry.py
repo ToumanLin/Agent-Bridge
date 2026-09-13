@@ -1865,3 +1865,136 @@ async def test_failed_task_writes_turn_end_boundary(bridge_home, tmp_path, monke
         assert "spawn exploded" in turns[0]["data"]["error"]
     finally:
         await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_run_usage_persists_survives_prune_and_reload(bridge_home, tmp_path, monkeypatch):
+    """Task.run_usage is the accumulated per-run token metric: persisted at
+    finalization, exposed by every task API, unchanged by reload + pruning."""
+    work = tmp_path / "work"
+    work.mkdir()
+    real_run_turn = FakeAdapter.run_turn
+
+    async def with_usage(self, session, task):
+        result = await real_run_turn(self, session, task)
+        result.usage = {"input_tokens": 10, "output_tokens": 4}
+        result.run_usage = {
+            "scope": "run",
+            "quality": "exact",
+            "input": 10,
+            "output": 4,
+            "total": 14,
+        }
+        return result
+
+    monkeypatch.setattr(FakeAdapter, "run_turn", with_usage)
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "count me", cwd=str(work.resolve()))
+        waited = await registry.wait_task(dispatched["task_id"], timeout_sec=5)
+        assert waited["status"] == "completed"
+        assert waited["run_usage"]["total"] == 14
+        assert waited["usage"]["input_tokens"] == 10
+        assert registry.check_task(dispatched["task_id"])["run_usage"]["total"] == 14
+        assert registry.get_result(dispatched["task_id"])["run_usage"]["total"] == 14
+        task = registry.tasks[dispatched["task_id"]]
+        assert task.run_usage["total"] == 14
+    finally:
+        await registry.stop()
+
+    state = json.loads((bridge_home / "state.json").read_text(encoding="utf-8"))
+    row = next(t for t in state["tasks"] if t["task_id"] == dispatched["task_id"])
+    assert row["run_usage"]["total"] == 14
+
+    registry2 = Registry.create(bridge_home)
+    await registry2.start()
+    try:
+        reloaded = registry2.tasks[dispatched["task_id"]]
+        assert reloaded.run_usage["total"] == 14
+        # Task pruning drops old terminal tasks but never mutates survivors.
+        for i in range(30):
+            old = Task(
+                task_id=f"old-{i}",
+                session_id=dispatched["session_id"],
+                agent="fake",
+                message="old",
+                cwd=str(work.resolve()),
+                status=TaskStatus.completed,
+                created_at=f"2020-01-01T00:{i // 60:02d}:{i % 60:02d}",
+            )
+            registry2.tasks[old.task_id] = old
+        registry2._prune_tasks()
+        assert registry2.tasks[dispatched["task_id"]].run_usage["total"] == 14
+    finally:
+        await registry2.stop()
+
+
+def test_run_usage_defaults_empty_for_old_state():
+    """state.json written before run_usage existed loads with empty dicts."""
+    task = Task.model_validate(
+        {
+            "task_id": "t_old",
+            "session_id": "s_old",
+            "agent": "devin",
+            "message": "x",
+            "cwd": ".",
+            "usage": {"used": 500, "size": 1000},
+        }
+    )
+    assert task.run_usage == {}
+    assert task.usage["used"] == 500
+    result = TurnResult.model_validate({"text": "ok"})
+    assert result.run_usage == {}
+
+
+def test_task_snapshot_exposes_live_partial_run_usage(bridge_home):
+    """A running task's snapshot surfaces the latest normalized usage event
+    as a marked partial; the persisted Task.run_usage is untouched, and a
+    stale event from a previous run is never attributed to the new one."""
+    registry = Registry.create(bridge_home)
+    session = Session(
+        session_id="sess_live", agent="fake", cwd=".", proc_state=ProcState.busy
+    )
+    task = Task(
+        task_id="t_live",
+        session_id="sess_live",
+        agent="fake",
+        message="x",
+        cwd=".",
+        status=TaskStatus.running,
+        started_at=iso(),
+    )
+    registry.sessions[session.session_id] = session
+    registry.tasks[task.task_id] = task
+    append_event(
+        "sess_live",
+        "usage",
+        {
+            "update_type": "UsageUpdate",
+            "consumed": {
+                "scope": "run",
+                "quality": "exact",
+                "input": 40,
+                "output": 9,
+                "total": 49,
+            },
+        },
+        bridge_home,
+    )
+    snap = registry._task_snapshot(task)
+    assert snap["run_usage"]["total"] == 49
+    assert snap["run_usage"]["partial"] is True
+    assert task.run_usage == {}  # persisted record untouched
+
+    late = Task(
+        task_id="t_late",
+        session_id="sess_live",
+        agent="fake",
+        message="x",
+        cwd=".",
+        status=TaskStatus.running,
+        started_at="2999-01-01T00:00:00Z",
+    )
+    registry.tasks[late.task_id] = late
+    assert registry._task_snapshot(late)["run_usage"] == {}

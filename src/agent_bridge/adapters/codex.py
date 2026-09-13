@@ -29,6 +29,7 @@ from agent_bridge.processes import (
     record_pid,
 )
 from agent_bridge.transcript import append_event
+from agent_bridge.usage import run_usage_from_total
 from agent_bridge.worker_env import build_worker_env
 
 log = logging.getLogger(__name__)
@@ -203,6 +204,7 @@ class CodexAdapter(Adapter):
                     stop_reason="cancelled",
                     native_session_id=state.thread_id,
                     usage=state.usage,
+                    run_usage=run_usage_from_total(state.usage),
                     observed_model=observed_model,
                     observed_effort=observed_effort,
                 )
@@ -214,6 +216,7 @@ class CodexAdapter(Adapter):
                     stop_reason="error",
                     error=error,
                     usage=state.usage,
+                    run_usage=run_usage_from_total(state.usage),
                     native_session_id=state.thread_id,
                     warnings=warnings,
                     observed_model=observed_model,
@@ -231,6 +234,7 @@ class CodexAdapter(Adapter):
                 files_changed=sorted(state.files),
                 stop_reason="end_turn",
                 usage=state.usage,
+                run_usage=run_usage_from_total(state.usage),
                 native_session_id=state.thread_id,
                 warnings=warnings,
                 observed_model=observed_model,
@@ -250,6 +254,7 @@ class CodexAdapter(Adapter):
                 stop_reason="cancelled",
                 native_session_id=state.thread_id,
                 usage=state.usage,
+                run_usage=run_usage_from_total(state.usage),
                 observed_model=observed_model,
                 observed_effort=observed_effort,
             )

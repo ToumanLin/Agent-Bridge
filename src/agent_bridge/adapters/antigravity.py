@@ -21,6 +21,7 @@ from agent_bridge.processes import (
     resolve_command,
 )
 from agent_bridge.transcript import append_event
+from agent_bridge.usage import DeltaUsage
 from agent_bridge.worker_env import build_worker_env
 
 log = logging.getLogger(__name__)
@@ -257,6 +258,23 @@ class AgyAdapter(Adapter):
             with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
                 proc.stdin.close()
 
+    def _finish_usage(
+        self,
+        session: Session,
+        tracker: DeltaUsage,
+        conversation_id: str | None,
+        resumed: bool,
+    ) -> dict[str, Any]:
+        """Final run_usage; persist the conversation counters so the next
+        resumed turn's delta is attributable even across a bridge restart."""
+        if tracker.seen:
+            prev = session.usage_baseline.get("counters")
+            same_conv = session.usage_baseline.get("cid") == conversation_id
+            merged = dict(prev) if same_conv and isinstance(prev, dict) else {}
+            merged.update(tracker.latest)
+            session.usage_baseline = {"cid": conversation_id, "counters": merged}
+        return tracker.run_usage(resumed=resumed)
+
     async def run_turn(self, session: Session, task: Task) -> TurnResult:
         """Drive one agy turn.
 
@@ -300,6 +318,12 @@ class AgyAdapter(Adapter):
         conversation_id = session.native_session_id
         resumed = bool(session.native_session_id)
         usage: dict[str, Any] = {}
+        # Resumed conversations report conversation-cumulative counters; the
+        # persisted baseline from the previous turn isolates this run's delta.
+        base = session.usage_baseline
+        stored = base.get("counters") if isinstance(base.get("counters"), dict) else {}
+        baseline = stored if resumed and base.get("cid") == session.native_session_id else {}
+        tracker = DeltaUsage(baseline=baseline, count_first=not resumed)
         files: set[str] = set()
         last_result: dict[str, Any] | None = None
         try:
@@ -349,8 +373,10 @@ class AgyAdapter(Adapter):
                 payload = unwrap_result(obj) if is_result_event(obj) else obj
                 if isinstance(payload.get("usage"), dict):
                     usage = payload["usage"]
+                    tracker.update(usage)
                 elif isinstance(step.get("usage"), dict):
                     usage = step["usage"]
+                    tracker.update(usage)
                 if is_result_event(obj):
                     last_result = unwrap_result(obj)
             try:
@@ -370,6 +396,8 @@ class AgyAdapter(Adapter):
                     text="".join(text_parts),
                     files_changed=sorted(files),
                     stop_reason="cancelled",
+                    usage=_scoped_usage(usage, resumed),
+                    run_usage=self._finish_usage(session, tracker, conversation_id, resumed),
                     native_session_id=conversation_id,
                 )
             exit_warnings: list[str] = []
@@ -381,6 +409,7 @@ class AgyAdapter(Adapter):
                 cid = conversation_id_of(last_result) or conversation_id
                 if isinstance(last_result.get("usage"), dict):
                     usage = last_result["usage"]
+                    tracker.update(usage)
                 session.native_session_id = cid
                 if err and last_result.get("status") != "SUCCESS":
                     if recovered_agy_tool_error(last_result, result_text, proc.returncode):
@@ -401,6 +430,7 @@ class AgyAdapter(Adapter):
                             files_changed=sorted(files),
                             stop_reason="end_turn",
                             usage=_scoped_usage(usage, resumed),
+                            run_usage=self._finish_usage(session, tracker, cid, resumed),
                             native_session_id=cid,
                             warnings=[err, *exit_warnings],
                         )
@@ -411,6 +441,7 @@ class AgyAdapter(Adapter):
                         stop_reason="error",
                         error=err,
                         usage=_scoped_usage(usage, resumed),
+                        run_usage=self._finish_usage(session, tracker, cid, resumed),
                         native_session_id=cid,
                     )
                 append_event(
@@ -424,6 +455,7 @@ class AgyAdapter(Adapter):
                     files_changed=sorted(files),
                     stop_reason="end_turn",
                     usage=_scoped_usage(usage, resumed),
+                    run_usage=self._finish_usage(session, tracker, cid, resumed),
                     native_session_id=cid,
                     warnings=exit_warnings,
                 )
@@ -432,7 +464,13 @@ class AgyAdapter(Adapter):
                 error = f"agy exit {proc.returncode}"
                 if detail:
                     error += f": {detail}"
-                return TurnResult(text="", stop_reason="error", error=error)
+                return TurnResult(
+                    text="",
+                    stop_reason="error",
+                    error=error,
+                    usage=_scoped_usage(usage, resumed),
+                    run_usage=self._finish_usage(session, tracker, conversation_id, resumed),
+                )
             session.native_session_id = conversation_id
             append_event(
                 session.session_id,
@@ -445,6 +483,7 @@ class AgyAdapter(Adapter):
                 files_changed=sorted(files),
                 stop_reason="end_turn",
                 usage=_scoped_usage(usage, resumed),
+                run_usage=self._finish_usage(session, tracker, conversation_id, resumed),
                 native_session_id=conversation_id,
                 warnings=exit_warnings,
             )
@@ -460,6 +499,8 @@ class AgyAdapter(Adapter):
                 text="".join(text_parts),
                 files_changed=sorted(files),
                 stop_reason="cancelled",
+                usage=_scoped_usage(usage, resumed),
+                run_usage=self._finish_usage(session, tracker, conversation_id, resumed),
                 native_session_id=conversation_id,
             )
         except Exception:

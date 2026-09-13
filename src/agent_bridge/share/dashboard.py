@@ -111,6 +111,8 @@ def normalize_event(rec):
         if not status:
             return None
         return {"t": "tool_status", "ts": ts, "id": d.get("tool_call_id"), "status": status}
+    if t == "usage":
+        return {"t": "usage", "ts": ts, "consumed": d.get("consumed")}
     if t == "turn_end":
         return {
             "t": "turn",
@@ -452,6 +454,7 @@ const $=s=>document.querySelector(s);
 let sessions=[], tasks=[], selected=null;
 let offsets={};            // per-session byte offset for incremental reads
 let eventsCache={};        // per-session array of normalized events (for fast re-render)
+let liveUsage={};          // session_id -> latest consumed snapshot from "usage" events
 let pollTimer=null, ovTimer=null;
 
 /* ---------- presence heartbeat (bridge pops us up only when no tab is open) ---------- */
@@ -639,15 +642,15 @@ function durSpan(t,cls){
 }
 
 /* ---------- task token usage (latest task only) ----------
-   Adapters report different shapes; normalize them here once:
-   snake_case  {input_tokens, cached_input_tokens, output_tokens}   (codex)
-   camelCase   {inputTokens, cachedReadTokens, outputTokens}        (ACP)
-   Devin ACP   {_meta:{"cognition.ai/inputTokens", ...}}            (usage_update)
-   Headline tokens = max(input - cached, 0) + output; reasoning output is
-   already inside output and never added separately. When no input/output
-   counters exist, fall back to a trustworthy total ("used" is a context-
-   window occupancy snapshot — an overcount across turns, but the best
-   honest number available). */
+   `run_usage` is the accumulated token consumption of one run — one task /
+   one worker turn, root agent plus subagent streams. Headline = input +
+   output: conventional accounting where cached reads are part of input and
+   reasoning output is already inside output. `used`/`size` are context-
+   window occupancy snapshots — metadata only, never the consumed total.
+   `quality:"estimate"` marks degraded derivations (resumed conversation
+   counters without a baseline). Legacy `usage` rows are last-snapshot data:
+   usable only as a marked estimate, and a `used`-only snapshot is context
+   occupancy, never a run total. */
 function usageNums(u){
   if(!u||typeof u!=="object")u={};
   const m=typeof u._meta==="object"&&u._meta?u._meta:{};
@@ -655,16 +658,32 @@ function usageNums(u){
   const pick=(...keys)=>{for(const k of keys)for(const src of[u,m]){
     const v=num(src[k]);if(v!==null)return v}return null};
   return{
-    input:pick("input_tokens","inputTokens","cognition.ai/inputTokens"),
-    cached:pick("cached_input_tokens","cachedInputTokens","cachedReadTokens","cognition.ai/cachedReadTokens"),
-    output:pick("output_tokens","outputTokens","cognition.ai/outputTokens"),
-    total:pick("total_tokens","totalTokens","total","used","cognition.ai/totalTokens"),
+    input:pick("input","input_tokens","inputTokens","cognition.ai/inputTokens"),
+    cached:pick("cached_read","cached_input_tokens","cachedInputTokens","cachedReadTokens","cognition.ai/cachedReadTokens"),
+    cachedWrite:pick("cached_write","cached_write_tokens","cachedWriteTokens","cognition.ai/cachedWriteTokens"),
+    output:pick("output","output_tokens","outputTokens","cognition.ai/outputTokens"),
+    total:pick("total","total_tokens","totalTokens","used","cognition.ai/totalTokens"),
+    used:pick("used"),
+    size:pick("size"),
   };
 }
 function tokCount(u){
   const n=usageNums(u);
   if(n.input===null&&n.output===null)return n.total;
   return Math.max(n.input-(n.cached||0),0)+n.output;
+}
+/* Canonical run_usage -> display row. Headline is input + output (or the
+   persisted total); `used` never feeds it. */
+function runTok(u){
+  if(!u||typeof u!=="object")return null;
+  const n=usageNums(u);
+  const total=(n.input!==null||n.output!==null)?(n.input||0)+(n.output||0)
+    :(Number.isFinite(u.total)?u.total:null);
+  if(total===null)return null;
+  const conv=u.conversation_total;
+  return{total,input:n.input,cached:n.cached,output:n.output,used:n.used,size:n.size,
+    quality:u.quality==="estimate"?"estimate":"exact",
+    conv:conv&&Number.isFinite(conv.total)?conv.total:null};
 }
 /* Segmented lowercase, matching "1m100k" for 1,100,000. The thousands
    segment is not zero-padded and drops entirely when it rounds to zero:
@@ -676,9 +695,50 @@ const fmtTok=n=>{
   if(n<1e6)return Math.floor(n/1000)+"k";
   const m=Math.floor(n/1e6),k=Math.floor(n%1e6/1e3);
   return k?m+"m"+k+"k":m+"m"};
-function tokSpan(t,cls){
-  const s=t&&t.usage?fmtTok(tokCount(t.usage)):"";
-  return s?`<span class="${cls}"> · ${s} tok</span>`:"";
+/* Single place composing the token tooltip/aria text (i18n-ready). */
+function tokTitle(o){
+  const nf=v=>v.toLocaleString("en-US");
+  if(o.ctxOnly)
+    return `Context in use ~${nf(o.total)} — last snapshot only, not a run total`;
+  const seg=[];
+  if(o.input!=null)seg.push(`in ${nf(o.input)}`);
+  if(o.cached)seg.push(`cached ${nf(o.cached)}`);
+  if(o.output!=null)seg.push(`out ${nf(o.output)}`);
+  const parts=[`Run tokens ${nf(o.total)}${seg.length?" ("+seg.join(", ")+")":""}`];
+  if(o.used!=null)parts.push(`context ${nf(o.used)}${o.size?"/"+nf(o.size):""}`);
+  if(o.conv!=null)parts.push(`conversation ${nf(o.conv)}`);
+  if(o.live)parts.push("live");
+  if(o.estimate)parts.push("estimate");
+  return parts.join(" · ");
+}
+/* Token span for the latest/current task. Priority while running: live
+   `usage` event snapshot, then the persisted run_usage. A present run_usage
+   is authoritative — when it has no computable run total (estimate without
+   counters) nothing renders rather than showing the conversation total.
+   Old state falls back to raw `usage`, always marked as an estimate. */
+function tokSpan(t,cls,live){
+  let info=null,isLive=false,ctxOnly=false;
+  if(t&&(t.status==="running"||t.status==="queued")&&live){
+    info=runTok(live);isLive=!!info;
+  }
+  const hasRun=t&&t.run_usage&&Object.keys(t.run_usage).length>0;
+  if(!info&&hasRun)info=runTok(t.run_usage);
+  if(!info&&!hasRun&&t&&t.usage&&typeof t.usage==="object"){
+    const m=tokCount(t.usage);
+    if(m!==null){
+      const n=usageNums(t.usage);
+      ctxOnly=n.input===null&&n.output===null&&t.usage.total===undefined&&
+        t.usage.total_tokens===undefined&&t.usage.totalTokens===undefined&&
+        !(t.usage._meta&&t.usage._meta["cognition.ai/totalTokens"]!==undefined);
+      info={total:m,input:n.input,cached:n.cached,output:n.output,
+        used:n.used,size:n.size,quality:"estimate"};
+    }
+  }
+  if(!info||!Number.isFinite(info.total))return"";
+  const s=fmtTok(info.total);if(!s)return"";
+  const est=info.quality==="estimate";
+  const title=tokTitle({...info,live:isLive,estimate:est,ctxOnly});
+  return `<span class="${cls}" title="${esc(title)}" aria-label="${esc(title)}"> · ${est?"~":""}${s} tok</span>`;
 }
 function tickDurations(){
   document.querySelectorAll("[data-tid]").forEach(el=>{
@@ -699,7 +759,8 @@ function renderSidebar(){
     const t=latestTask(s.session_id);
     return [s.session_id,s.proc_state,s.last_active_at,s.title,s.agent,s.cwd,
       t?t.task_id:"",t?t.status:"",t?t.message:"",t?t.started_at:"",
-      t?t.finished_at:"",t?t.created_at:"",t?JSON.stringify(t.usage||0):""].join(" ");
+      t?t.finished_at:"",t?t.created_at:"",t?JSON.stringify(t.run_usage||t.usage||0):"",
+      JSON.stringify(liveUsage[s.session_id]||0)].join(" ");
   }).join("|");
   if(sig===lastSidebarSig)return;
   lastSidebarSig=sig;
@@ -715,7 +776,7 @@ function renderSidebar(){
       <span class="sicon">${agentAvatar(s,18)}</span>
       <span class="smeta">
         <span class="stitle">${esc(s.title||s.session_id)}</span>
-        <span class="sstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone)}</span><span>${esc(st.label)}</span>${durSpan(t,"sdur")}${tokSpan(t,"stok")}</span>
+        <span class="sstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone)}</span><span>${esc(st.label)}</span>${durSpan(t,"sdur")}${tokSpan(t,"stok",liveUsage[s.session_id])}</span>
         ${sub?`<span class="ssub">${esc(sub)}</span>`:""}
       </span>
     </button>`}).join("")||'<div class="empty" style="margin-top:40px">No sessions</div>';
@@ -746,7 +807,7 @@ function renderSessionHeader(){
     <div class="hbody">
       <h2 class="htitle">${esc(s.title||s.session_id)}</h2>
       <div class="hsub">
-        <span class="hstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,13)}</span> ${esc(st.label)}${durSpan(t,"hdur")}${tokSpan(t,"htok")}</span>
+        <span class="hstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,13)}</span> ${esc(st.label)}${durSpan(t,"hdur")}${tokSpan(t,"htok",liveUsage[s.session_id])}</span>
         <span class="badge">${esc(s.agent)}</span>
         ${s.model?`<span class="badge">${esc(s.model)}</span>`:""}
         ${repo?`<span class="hsep">|</span><span class="hrepo" title="${esc(s.cwd||"")}">Working repo · ${esc(repo)}</span>`:""}
@@ -948,6 +1009,7 @@ function touchCache(id){
 }
 function dropCache(id){
   delete eventsCache[id];delete offsets[id];delete rendered[id];delete replayGen[id];
+  delete liveUsage[id];
   const i=cacheLru.indexOf(id);if(i>=0)cacheLru.splice(i,1);
   dropPane(id);
 }
@@ -963,6 +1025,16 @@ async function pollEvents(){
     if(j.reset)eventsCache[id]=[];
     eventsCache[id]=(eventsCache[id]||[]).concat(j.events);
     offsets[id]=j.offset;
+    // "usage" events carry the live run-consumption snapshot; a prompt or
+    // turn boundary clears it so a finished run never shows stale partials.
+    let usageDirty=false;
+    for(const e of j.events){
+      if(e.t==="usage"&&e.consumed){liveUsage[id]=e.consumed;usageDirty=true}
+      else if(e.t==="prompt"||e.t==="turn"){
+        if(liveUsage[id]){delete liveUsage[id];usageDirty=true}
+      }
+    }
+    if(usageDirty){renderSidebar();renderSessionHeader()}
     touchCache(id);
     if(j.reset){                      // transcript rotated: that session's pane/replay
       dropPane(id);                   // are invalid — other sessions' replays are not
@@ -1224,6 +1296,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "error",
                                 "source",
                                 "usage",
+                                "run_usage",
                                 "created_at",
                                 "started_at",
                                 "finished_at",
