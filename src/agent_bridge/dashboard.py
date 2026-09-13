@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -28,6 +29,9 @@ _LAST_OPEN = 0.0
 _OPEN_DEBOUNCE_SEC = 30.0
 _CLIENT_STATE_TIMEOUT = 0.8
 _STARTUP_WAIT_SEC = 4.0
+_CONFIRM_SEC = 2.0
+_OPEN_MARKER = ".dashboard-open"
+_OPEN_COOLDOWN_SEC = 60.0
 
 
 def _client_open(url: str) -> bool | None:
@@ -84,6 +88,50 @@ def _launch(home: Path, host: str, port: int) -> bool:
     return True
 
 
+def _claim_open(home: Path) -> bool:
+    """True when this process should perform the browser open.
+
+    ``home/.dashboard-open`` is a cooldown marker shared by every Bridge
+    instance using this home; its mtime is the last open time. Claiming is
+    atomic-enough on Windows and POSIX — an O_EXCL create after pruning a
+    stale marker — and a leftover marker simply expires instead of wedging
+    auto-open. Filesystem trouble degrades to "allowed" rather than
+    disabling the dashboard popup.
+    """
+    marker = home / _OPEN_MARKER
+    try:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        pass
+    except OSError:
+        return True
+    else:
+        os.close(fd)
+        return True
+    try:
+        fresh = time.time() - marker.stat().st_mtime < _OPEN_COOLDOWN_SEC
+    except FileNotFoundError:
+        return False  # vanished mid-check: a sibling is claiming the slot
+    except OSError:
+        return True
+    if fresh:
+        return False
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False  # a sibling won the re-claim
+    except OSError:
+        return True
+    os.close(fd)
+    return True
+
+
 def _auto_open(home: Path, host: str, port: int) -> None:
     global _LAST_OPEN
     url = f"http://{host}:{port}/"
@@ -97,8 +145,17 @@ def _auto_open(home: Path, host: str, port: int) -> None:
             if not _wait_for_dashboard(url):
                 log.warning("dashboard auto-open: no response from %s", url)
                 return
+        # A tab can (re)appear while we wait: reload/bfcache gaps, a
+        # throttled heartbeat landing late, or a client that registered
+        # during launch. Open only when a reachable server still reports
+        # zero clients a moment later.
+        time.sleep(_CONFIRM_SEC)
+        if _client_open(url) is not False:
+            return
         now = time.monotonic()
         if now - _LAST_OPEN < _OPEN_DEBOUNCE_SEC:
+            return
+        if not _claim_open(home):
             return
         _LAST_OPEN = now
         webbrowser.open(url)

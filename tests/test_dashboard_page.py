@@ -154,7 +154,7 @@ def dash(tmp_path, monkeypatch):
     monkeypatch.setattr(dashboard, "STATE_FILE", home / "state.json")
     monkeypatch.setattr(dashboard, "TRANSCRIPT_DIR", home / "transcripts")
     monkeypatch.setattr(dashboard, "OUTBOX_DIR", home / "outbox")
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+    srv = dashboard.DashboardServer(("127.0.0.1", 0), dashboard.Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         yield home, f"http://127.0.0.1:{srv.server_address[1]}"
@@ -992,3 +992,57 @@ def test_presence_and_client_state(dash):
     assert j["clients"] >= 1 and j["open"] is True
     code, body = _get(base + "/api/presence?id=testclient&bye=1")
     assert code == 200
+
+
+def test_presence_survives_throttled_heartbeat(monkeypatch):
+    """A hidden tab's ~60s intensive-throttle cadence must never expire the
+    lease between beats; a genuinely gone client still expires past the TTL."""
+    assert dashboard.PRESENCE_TTL >= 120.0  # spans a fully missed 60s wake-up
+    clock = [1000.0]
+    monkeypatch.setattr(dashboard.time, "monotonic", lambda: clock[0])
+    dashboard.PRESENCE.clear()
+    try:
+        dashboard.presence_update("tab", False)
+        clock[0] += 60
+        assert dashboard.presence_count() == 1  # throttled beat still alive
+        clock[0] += 60
+        assert dashboard.presence_count() == 1  # one missed wake-up tolerated
+        clock[0] += dashboard.PRESENCE_TTL
+        assert dashboard.presence_count() == 0  # stale presence expires
+        dashboard.presence_update("tab", False)
+        dashboard.presence_update("tab", True)
+        assert dashboard.presence_count() == 0  # pagehide bye removes at once
+    finally:
+        dashboard.PRESENCE.clear()
+
+
+def test_second_dashboard_bind_fails(dash):
+    """A second server on the same port must fail — Windows SO_REUSEADDR once
+    let a duplicate dashboard coexist with a split PRESENCE table."""
+    _, base = dash
+    port = int(base.rsplit(":", 1)[1])
+    with pytest.raises(OSError):
+        dashboard.DashboardServer(("127.0.0.1", port), dashboard.Handler)
+    # Even a plain SO_REUSEADDR server must not steal the exclusive bind.
+    with pytest.raises(OSError):
+        ThreadingHTTPServer(("127.0.0.1", port), dashboard.Handler)
+
+
+def test_presence_heartbeat_lifecycle():
+    """The heartbeat block keeps the presence contract: fresh per-page id,
+    immediate re-registration on every lifecycle recovery event."""
+    beat = re.search(r"presence heartbeat.*?\*/([\s\S]*?)const esc=", PAGE)
+    assert beat, "presence heartbeat block missing"
+    js = beat.group(1)
+    # Per-page id: no sessionStorage carry-over — a duplicated tab gets its
+    # own lease and its bye cannot remove the original's presence.
+    assert "sessionStorage" not in js
+    assert "crypto.randomUUID" in js
+    for ev in ('"pageshow"', '"focus"', '"online"', '"visibilitychange"', '"pagehide"'):
+        assert f"addEventListener({ev}" in js
+    assert "sendBeacon" in js
+    # The lease must comfortably outlive the throttled cadence: TTL >= 2x the
+    # ~60s Chrome intensive-throttle bucket, beat interval far under the TTL.
+    assert dashboard.PRESENCE_TTL >= 120.0
+    ms = int(re.search(r"setInterval\(\(\)=>ping\(0\),(\d+)\)", js).group(1))
+    assert ms * 10 <= dashboard.PRESENCE_TTL * 1000

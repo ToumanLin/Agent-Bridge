@@ -52,21 +52,21 @@ const el = () => {
   };
   return e;
 };
+const listeners = {};        // captured window/document event listeners
 const elCache = {};
 const documentStub = {
   documentElement: Object.assign(el(), { lang: "" }),
-  activeElement: null, title: "",
+  activeElement: null, title: "", visibilityState: "visible",
   querySelector: (s) => elCache[s] || (elCache[s] = el()),
   querySelectorAll: () => [],
   createElement() {
     const e = el(); created.push(e); return e;
   },
-  addEventListener() {},
+  addEventListener(ev, fn) { (listeners[ev] || (listeners[ev] = [])).push(fn); },
 };
 const pending = () => new Promise(() => {});
 const fetchCalls = [];
 const store = {};            // mutable localStorage backing
-const listeners = {};        // captured window-level event listeners
 const sandbox = {
   document: documentStub,
   fetch: (u) => { fetchCalls.push(String(u)); return pending(); },
@@ -75,7 +75,9 @@ const sandbox = {
     setItem: (k, v) => { store[k] = String(v); },
     removeItem: (k) => { delete store[k]; },
   },
-  sessionStorage: { getItem: () => null, setItem() {} },
+  // Sentinel: a presence id sourced from storage would carry "SHARED" —
+  // the heartbeat must mint a fresh per-page id instead.
+  sessionStorage: { getItem: () => "SHARED", setItem() {} },
   navigator: { sendBeacon() {}, languages: ["en-US"], language: "en-US" },
   crypto: { randomUUID: () => "00000000-0000-0000-0000-000000000000" },
   matchMedia: () => ({
@@ -660,6 +662,34 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   X._cache().s2 = [];
   X._polled().s2 = false;
   eq(true, true, "polled flag is test-controllable");
+
+  /* ================= presence heartbeat lifecycle ================= */
+
+  // The initial ping(0) already ran during script eval; every lifecycle
+  // recovery event must re-register the tab immediately.
+  const beats = () => apiCalls("/api/presence");
+  const b0 = beats();
+  eq(b0 >= 1, true, "initial presence ping fired on load");
+  eq(fetchCalls.filter((u) => u.includes("id=SHARED")).length, 0,
+    "presence id is per-page, never the cloned sessionStorage id");
+  (listeners.pageshow || []).forEach((f) => f());
+  eq(beats(), b0 + 1, "pageshow re-pings presence (reload/bfcache)");
+  (listeners.focus || []).forEach((f) => f());
+  eq(beats(), b0 + 2, "focus re-pings presence");
+  (listeners.online || []).forEach((f) => f());
+  eq(beats(), b0 + 3, "online re-pings presence");
+  documentStub.visibilityState = "hidden";
+  (listeners.visibilitychange || []).forEach((f) => f());
+  eq(beats(), b0 + 3, "visibilitychange to hidden does not ping");
+  documentStub.visibilityState = "visible";
+  (listeners.visibilitychange || []).forEach((f) => f());
+  eq(beats(), b0 + 4, "visibilitychange to visible re-pings");
+  let beacons = [];
+  sandbox.navigator.sendBeacon = (u) => { beacons.push(String(u)); };
+  (listeners.pagehide || []).forEach((f) => f());
+  eq(beacons.length, 1, "pagehide sends exactly one beacon");
+  eq(beacons[0].includes("/api/presence") && beacons[0].includes("bye=1"),
+    true, "pagehide beacon carries bye=1");
 
   console.log(failed ? `\n${failed} FAILED` : "\nall assertions passed");
   process.exit(failed ? 1 : 0);

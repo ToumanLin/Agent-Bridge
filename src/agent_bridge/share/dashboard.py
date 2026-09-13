@@ -15,6 +15,7 @@ import contextlib
 import json
 import os
 import re
+import socket
 import threading
 import time
 import uuid
@@ -31,7 +32,12 @@ OUTBOX_DIR = BRIDGE_DIR / "outbox"
 # /api/client_state to decide whether to pop the dashboard up.
 PRESENCE: dict[str, float] = {}  # client_id -> last-seen monotonic timestamp
 PRESENCE_LOCK = threading.Lock()
-PRESENCE_TTL = 45.0
+# Chrome/Edge intensively throttle hidden-tab timers to ~one wake-up per
+# minute (and sleeping/frozen tabs can miss one entirely), so the lease must
+# span well over 60s or a backgrounded tab expires between beats and the
+# bridge opens a duplicate. 150s covers a fully missed wake-up plus jitter;
+# a genuinely closed tab still leaves promptly via the pagehide beacon.
+PRESENCE_TTL = 150.0
 
 
 def presence_update(client_id, bye):
@@ -507,15 +513,21 @@ let liveUsage={};          // session_id -> latest consumed snapshot from "usage
 let pollTimer=null, ovTimer=null;
 
 /* ---------- presence heartbeat (bridge pops us up only when no tab is open) ---------- */
-const clientId=sessionStorage.getItem("abClient")||
-  (crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random());
-sessionStorage.setItem("abClient",clientId);
+// Fresh id per page load: a duplicated tab must not share the lease or let
+// its pagehide beacon remove a sibling's presence.
+const clientId=crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random();
 function ping(bye){
   if(bye){try{navigator.sendBeacon(`/api/presence?id=${clientId}&bye=1`)}catch(e){}}
   else fetch(`/api/presence?id=${clientId}`).catch(()=>{});
 }
 ping(0);setInterval(()=>ping(0),4000);
 addEventListener("pagehide",()=>ping(1));
+// A throttled/frozen interval can lag ~60s; re-register as soon as the tab
+// runs again (bfcache restore or reload, resurfacing, network recovery).
+addEventListener("pageshow",()=>ping(0));
+addEventListener("focus",()=>ping(0));
+addEventListener("online",()=>ping(0));
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")ping(0)});
 
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
@@ -2059,6 +2071,27 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found", "error_code": "not_found"}, 404)
 
 
+class DashboardServer(ThreadingHTTPServer):
+    """HTTP server that never shares its listen port.
+
+    Windows treats SO_REUSEADDR as "bind alongside the existing listener", so
+    a second dashboard could coexist with a split /api/presence table and
+    report clients:0 while tabs heartbeat into the other process. Leaving the
+    option off plus SO_EXCLUSIVEADDRUSE fails the second bind in both
+    directions. On Unix SO_REUSEADDR only covers TIME_WAIT rebinding and the
+    kernel already rejects dual listeners, so the default stays.
+    """
+
+    allow_reuse_address = os.name != "nt"
+
+    if os.name == "nt":
+
+        def server_bind(self):
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8787)
@@ -2070,7 +2103,12 @@ def main():
         STATE_FILE = BRIDGE_DIR / "state.json"
         TRANSCRIPT_DIR = BRIDGE_DIR / "transcripts"
         OUTBOX_DIR = BRIDGE_DIR / "outbox"
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    try:
+        srv = DashboardServer(("127.0.0.1", args.port), Handler)
+    except OSError as exc:
+        print(f"Agent Bridge dashboard: cannot bind 127.0.0.1:{args.port}: {exc}")
+        print("Another dashboard is already serving this port; not starting a second one.")
+        raise SystemExit(1) from exc
     print(f"Agent Bridge dashboard → http://127.0.0.1:{args.port}")
     print(f"data dir: {BRIDGE_DIR}")
     with contextlib.suppress(KeyboardInterrupt):
