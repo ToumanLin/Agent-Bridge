@@ -47,8 +47,10 @@ const html = (() => {
 /* ---------- synthetic streams (deterministic, no real transcript data) ---------- */
 function synthPathological() {
   // One giant single-block chunk stream + tail — the O(chunks x block) killer.
+  // 1200 chunks is enough to expose per-chunk md()+innerHTML (msgBodySets >> slices)
+  // while keeping even the unoptimized path to tens of seconds, not minutes.
   const evs = [{ t: "prompt", ts: 1, text: "synthetic prompt" }];
-  for (let i = 0; i < 4000; i++)
+  for (let i = 0; i < 1200; i++)
     evs.push({ t: "msg", ts: 2 + i, text: `chunk-${i} **bold** \`code\` ` });
   evs.push({ t: "turn", ts: 9999, stop_reason: "end_turn" });
   return { events: evs, offset: evs.length };
@@ -73,15 +75,24 @@ function synthWide() {
 }
 
 function synthRace() {
-  // Big multi-block stream so a cold chunked replay spans many rAF slices —
-  // enough to observe an abort as a mid-replay freeze.
+  // ~3.1K events over 10 turns: under an ~8ms-capped rAF replay this spans
+  // several slices (~2x margin over single-slice capacity) yet completes in
+  // well under a second under jsdom. The old 40x600 fixture (24K events)
+  // took minutes.
   const evs = [];
-  for (let turn = 0; turn < 40; turn++) {
-    for (let i = 0; i < 300; i++)
-      evs.push({ t: "think", ts: turn * 1000 + i, text: `thought ${turn}.${i} ` });
-    for (let i = 0; i < 300; i++)
-      evs.push({ t: "msg", ts: turn * 1000 + i + 300, text: `msg ${turn}.${i} ` });
-    evs.push({ t: "turn", ts: turn * 1000 + 700, stop_reason: "end_turn" });
+  for (let turn = 0; turn < 10; turn++) {
+    evs.push({ t: "prompt", ts: turn * 1000, text: `task ${turn}` });
+    for (let i = 0; i < 150; i++)
+      evs.push({ t: "think", ts: turn * 1000 + i + 1, text: `thought ${turn}.${i} ` });
+    for (let i = 0; i < 150; i++)
+      evs.push({ t: "msg", ts: turn * 1000 + i + 200, text: `msg ${turn}.${i} ` });
+    for (let i = 0; i < 4; i++) {
+      const id = `rt${turn}_${i}`;
+      evs.push({ t: "tool", ts: turn * 1000 + 400 + i, id, kind: "execute",
+        title: `tool ${i}`, input: `{"cmd":"x ${i}"}` });
+      evs.push({ t: "tool_status", ts: turn * 1000 + 401 + i, id, status: "completed" });
+    }
+    evs.push({ t: "turn", ts: turn * 1000 + 500, stop_reason: "end_turn" });
   }
   return { events: evs, offset: evs.length };
 }
@@ -96,15 +107,15 @@ const streams = argStreams.length
      { id: "sess_wide", stream: synthWide() }];
 if (streams.length < 2)
   streams.push({ id: "sess_extra", stream: synthWide() });
-// Regression-scenario actors: filler sessions to force pane-LRU eviction, a
-// small "stale" session whose reset lands mid-switch, and a big "race"
-// session whose cold replay must not be cancelled by that reset.
-for (let i = 0; i < 5; i++)
-  streams.push({ id: `sess_fill${i}`,
-    stream: { events: [{ t: "prompt", ts: 1, text: `f${i}` }], offset: 1 } });
+// Regression-scenario actors: a small "stale" session whose reset lands
+// mid-switch, and two identical "race" sessions. sess_race_a provides the
+// baseline element count; sess_race_b is never rendered before its replay is
+// raced against the reset, so its select() is a guaranteed cold chunked
+// replay — no dependence on the pane-LRU capacity to force a second replay.
+streams.push({ id: "sess_race_a", stream: synthRace() });
+streams.push({ id: "sess_race_b", stream: synthRace() });
 streams.push({ id: "sess_stale",
   stream: { events: [{ t: "prompt", ts: 1, text: "stale" }], offset: 1 } });
-streams.push({ id: "sess_race", stream: synthRace() });
 
 const overview = {
   sessions: streams.map((s, i) => ({
@@ -113,7 +124,19 @@ const overview = {
     turns: 3, created_at: "2026-01-01T00:00:00Z",
     last_active_at: "2026-01-01T00:0" + i + ":00Z",
   })),
-  tasks: [],
+  // Fixed timestamps make durations deterministic: the dead session's task is
+  // frozen at 40s (finished-started); the busy session's task started ~65s ago
+  // so its .sdur keeps ticking under the 1s tickDurations interval.
+  tasks: [
+    { task_id: "task_done", session_id: streams[0].id, agent: "devin",
+      status: "completed", message: "finished work",
+      created_at: "2026-01-01T00:00:00Z", started_at: "2026-01-01T00:00:02Z",
+      finished_at: "2026-01-01T00:00:42Z" },
+    { task_id: "task_run", session_id: streams[1].id, agent: "devin",
+      status: "running", message: "still working",
+      created_at: new Date(Date.now() - 70000).toISOString(),
+      started_at: new Date(Date.now() - 65000).toISOString() },
+  ],
 };
 
 /* ---------- jsdom harness ---------- */
@@ -197,12 +220,17 @@ let probing = true, lastTick = performance.now();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitStable() {
-  let last = -1, stable = 0;
-  for (let i = 0; i < 400 && stable < 4; i++) {
-    await sleep(50);
+  // "Done" = element count AND rAF counter both unchanged for 3 consecutive
+  // 25ms samples. rAF must be in the signature: inside a long chunk run the
+  // element count can sit flat while replay slices keep firing, so count-only
+  // sampling can declare stability mid-replay. Idle panes settle in ~75ms;
+  // the loop hard-caps at ~15s so a stuck replay fails instead of hanging.
+  let last = -1, lastRaf = -1, stable = 0;
+  for (let i = 0; i < 600 && stable < 3; i++) {
+    await sleep(25);
     const n = w.document.querySelector("#content").querySelectorAll("*").length;
-    stable = n === last ? stable + 1 : 0;
-    last = n;
+    stable = n === last && stats.raf === lastRaf ? stable + 1 : 0;
+    last = n; lastRaf = stats.raf;
   }
   return last;
 }
@@ -251,32 +279,40 @@ async function waitStable() {
       w.document.querySelectorAll("#content details[open]").length >= openCount,
   });
 
-  // ---- regression: a stale session's reset must not cancel the live replay ----
-  // Fill sess_race's cache, evict its pane via the stash LRU (5 filler
-  // selects + the stale select). Then, while sess_stale is selected, arm a
-  // delayed reset response and start its fetch; switch to sess_race so its
-  // cold chunked replay is running (and its own poll has early-returned on
-  // replaying===id) when the stale reset lands. Under a global abort token
-  // the reset kills the replay, which then stays frozen until the next poll.
+  // ---- regression: a stale session's reset must not cancel a live replay ----
+  // sess_race_a's cold replay establishes the baseline element count and
+  // proves multi-slice replay. sess_race_b is an identical stream that has
+  // never been rendered, so its select() below is deterministically a cold
+  // chunked replay — no pane-LRU eviction needed. While sess_stale is
+  // selected we arm a delayed reset and start its fetch; switching to
+  // sess_race_b starts its replay, and the reset resolves a few dozen
+  // microtasks later — deterministically mid-replay for any multi-slice
+  // stream, since rAF slices are macrotasks and the reset cannot outrun the
+  // first frame. A global (non-per-session) abort token would let the stale
+  // reset kill sess_race_b's replay, freezing the element count mid-stream.
   const elCount = () =>
     w.document.querySelector("#content").querySelectorAll("*").length;
-  w.select("sess_race");
+  stats.raf = 0;
+  w.select("sess_race_a");
   const raceElements = await waitStable();
-  for (let i = 0; i < 5; i++) { w.select(`sess_fill${i}`); await waitStable(); }
+  const raceASlices = stats.raf;
   w.select("sess_stale");
   await waitStable();
   resetArm["sess_stale"] = true;
-  delayArm["sess_stale"] = 10;         // let sess_race's own poll settle first
+  delayArm["sess_stale"] = 25;         // lands after race_b's replay starts, before frame 2
   const staleFetch = w.pollEvents();   // in-flight fetch for the stale session
-  w.select("sess_race");               // cold chunked replay begins (slice 1 sync)
+  stats.raf = 0;
+  w.select("sess_race_b");             // cold chunked replay begins
   await staleFetch;                    // stale reset lands mid-replay — must be inert
   const c0 = elCount(), r0 = stats.raf;
   await sleep(160); const c1 = elCount(), r1 = stats.raf;
   await sleep(160); const c2 = elCount(), r2 = stats.raf;
   const raceProgressed = c1 > c0 || c2 > c1 || r1 > r0 || r2 > r1;
   const raceFinal = await waitStable();
+  const raceBSlices = stats.raf;
   results.push({
     regression: "stale-reset-mid-replay",
+    raceASlices, raceBSlices,
     raceProgressed,
     raceCompletedOnce: raceFinal === raceElements,
     raceFinalElements: raceFinal, raceExpectedElements: raceElements,
@@ -287,6 +323,33 @@ async function waitStable() {
   await w.pollOverview();
   await w.pollOverview();
   const sesslistSetsOnStablePolls = stats.sesslistSets;
+
+  // ---- task working durations: a completed task freezes at
+  // finished_at - started_at ("40s" per the fixture); a running task ticks
+  // live via the 1s tickDurations interval — textContent only, so the
+  // sidebar signature gate above is unaffected.
+  const sessRow = (sid) =>
+    [...w.document.querySelectorAll(".sess")].find((r) => r.dataset.id === sid);
+  const durOf = (sid) => {
+    const d = sessRow(sid) && sessRow(sid).querySelector(".sdur");
+    return d ? d.textContent : null;
+  };
+  const statusText = (sid) => {
+    const el = sessRow(sid) && sessRow(sid).querySelector(".sstatus");
+    return el ? el.textContent : "";
+  };
+  const doneDur0 = durOf(streams[0].id);
+  const runDur0 = durOf(streams[1].id);
+  await sleep(1100);
+  const doneDur1 = durOf(streams[0].id);
+  const runDur1 = durOf(streams[1].id);
+  results.push({
+    durations: { doneDur0, doneDur1, runDur0, runDur1 },
+    doneFrozen: doneDur0 === " · 40s" && doneDur1 === " · 40s",
+    runAdvanced: runDur0 !== null && runDur1 !== null && runDur1 !== runDur0,
+    statusLabels: statusText(streams[0].id).includes("Done")
+      && statusText(streams[1].id).includes("Running"),
+  });
 
   probing = false;
   for (const r of results) console.log(JSON.stringify(r));
@@ -302,8 +365,13 @@ async function waitStable() {
     // md()+innerHTML parse is once-per-replay inherent work (jsdom parses far
     // slower than a browser — the pre-fix code produced multi-second gaps).
     (r.maxTimerGapMs === undefined || r.maxTimerGapMs < 400) &&
+    (r.raceASlices === undefined || r.raceASlices > 1) &&
+    (r.raceBSlices === undefined || r.raceBSlices > 1) &&
     (r.raceProgressed === undefined || r.raceProgressed) &&
-    (r.raceCompletedOnce === undefined || r.raceCompletedOnce)) &&
+    (r.raceCompletedOnce === undefined || r.raceCompletedOnce) &&
+    (r.doneFrozen === undefined || r.doneFrozen) &&
+    (r.runAdvanced === undefined || r.runAdvanced) &&
+    (r.statusLabels === undefined || r.statusLabels)) &&
     sesslistSetsOnStablePolls === 0 && !jsError;
   process.exit(ok ? 0 : 1);
 })().catch((e) => { console.error(e); probing = false; process.exit(1); });

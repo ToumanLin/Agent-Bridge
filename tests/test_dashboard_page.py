@@ -98,6 +98,9 @@ def dash(tmp_path, monkeypatch):
                 "agent": "devin",
                 "status": "failed",
                 "message": "boom",
+                "created_at": "2026-09-12T10:00:00Z",
+                "started_at": "2026-09-12T10:00:02Z",
+                "finished_at": "2026-09-12T10:01:42Z",
             }
         ],
     }
@@ -120,7 +123,17 @@ def dash(tmp_path, monkeypatch):
 
 
 def test_page_dom_ids_and_endpoints():
-    for dom_id in ("sidebar", "sesslist", "sesshead", "content", "chatinput", "chatsend", "chatstatus", "live", "backtop"):
+    for dom_id in (
+        "sidebar",
+        "sesslist",
+        "sesshead",
+        "content",
+        "chatinput",
+        "chatsend",
+        "chatstatus",
+        "live",
+        "backtop",
+    ):
         assert f'id="{dom_id}"' in PAGE
     for ep in ("/api/overview", "/api/events", "/api/send", "/api/send_status", "/api/presence"):
         assert ep in PAGE
@@ -153,10 +166,25 @@ def test_inline_svg_icon_policy():
 
 
 def test_status_mapping_labels():
-    for label in ('"Running"', '"Starting"', '"Waiting"', '"Done"', '"Failed"'):
-        assert label in PAGE
-    for state in ("busy", "spawning", "ready", "idle_unloaded", "dead"):
-        assert state in PAGE
+    # Centralized, immutable proc_state -> {label, tone} table; statusOf only
+    # applies the dead latest-task Failed/Done override on top of it.
+    m = re.search(r"const PROC_STATUS=Object\.freeze\(\{([\s\S]*?)\}\)", PAGE)
+    assert m, "PROC_STATUS freeze map missing"
+    body = m.group(1)
+    for entry in (
+        'busy:{label:"Running",tone:"running"}',
+        'spawning:{label:"Starting",tone:"running"}',
+        'ready:{label:"Ready",tone:"neutral"}',
+        'idle_unloaded:{label:"Idle",tone:"neutral"}',
+    ):
+        assert entry in body
+    assert '"Waiting"' not in PAGE
+    assert "PROC_STATUS[st]" in PAGE
+    dead = re.search(r'if\(st==="dead"\)\{([\s\S]*?)\}', PAGE).group(1)
+    assert "latestTask" in dead and '"failed"' in dead
+    # Executable coverage of all six state/result scenarios (and the duration
+    # rules) lives in tests/dashboard_status_behavior.js, run by
+    # test_dashboard_status_behavior_node below.
 
 
 def test_accessibility_and_responsive_hooks():
@@ -212,9 +240,21 @@ def test_theme_dark_tokens_and_color_scheme():
     dark = re.search(r'\[data-theme="dark"\]\{([^}]*)\}', PAGE)
     assert dark, "dark token block missing"
     body = dark.group(1)
-    for token in ("--text", "--dim", "--panel", "--panel2", "--panel3", "--border",
-                  "--accent", "--accent-tint", "--green", "--amber", "--red",
-                  "--on-accent", "--shadow"):
+    for token in (
+        "--text",
+        "--dim",
+        "--panel",
+        "--panel2",
+        "--panel3",
+        "--border",
+        "--accent",
+        "--accent-tint",
+        "--green",
+        "--amber",
+        "--red",
+        "--on-accent",
+        "--shadow",
+    ):
         assert token + ":" in body
     assert "color-scheme:dark" in body
     assert "color-scheme:light" in PAGE
@@ -228,11 +268,114 @@ def test_theme_radiogroup_control():
     assert 'aria-labelledby="themelbl"' in PAGE
     for pref in ("system", "light", "dark"):
         assert f'data-theme-pref="{pref}"' in PAGE
-    for needle in ('role="radio"', "aria-checked", "tabIndex", "ArrowRight",
-                   'matchMedia("(prefers-color-scheme: dark)")',
-                   'addEventListener("change"', '"storage"', "themePref",
-                   "applyTheme", "setThemePref"):
+    for needle in (
+        'role="radio"',
+        "aria-checked",
+        "tabIndex",
+        "ArrowRight",
+        'matchMedia("(prefers-color-scheme: dark)")',
+        'addEventListener("change"',
+        '"storage"',
+        "themePref",
+        "applyTheme",
+        "setThemePref",
+    ):
         assert needle in PAGE
+
+
+def test_theme_control_compact_layout():
+    # Sidebar footer is a single compact row: label inline, horizontal icon+label radios.
+    foot = re.search(r"\.side-foot\{([^}]*)\}", PAGE).group(1)
+    assert "display:flex" in foot and "align-items:center" in foot
+    # ~33px total: 4px vertical padding + ~24px radio + 1px border. Pin the
+    # compact values so the footer can't creep back to ~43px.
+    assert "padding:4px 12px" in foot and "gap:8px" in foot
+    label = re.search(r"\.side-foot-label\{([^}]*)\}", PAGE).group(1)
+    assert "margin:0" in label and "display:block" not in label
+    btn = re.search(r'\.theme-options \[role="radio"\]\{([^}]*)\}', PAGE).group(1)
+    assert "flex-direction:row" in btn and "flex-direction:column" not in btn
+    # Radios stay ~24px tall (3px padding + 1px border each side) with readable
+    # 11px text — a reasonable click target, not a shrunken strip.
+    assert "padding:3px 4px" in btn and "font-size:11px" in btn
+    assert re.search(r'\.theme-options \[role="radio"\]:focus-visible\{[^}]*outline:2px', PAGE)
+    # Icons still injected ahead of each radio label from the existing icon set.
+    assert "THEME_ICONS" in PAGE and "insertAdjacentHTML" in PAGE
+
+
+def test_themed_scrollbars():
+    # Standard properties (Firefox + modern Chromium/Safari) applied to every scroller.
+    assert "scrollbar-width:thin" in PAGE
+    sb = re.search(r"scrollbar-color:([^;}]+)", PAGE).group(1)
+    assert "--dimmer" in sb and "transparent" in sb  # theme-aware thumb, invisible track
+    # Chromium/WebKit pseudo-elements mirror the same tokens.
+    for needle in (
+        "::-webkit-scrollbar{",
+        "::-webkit-scrollbar-track",
+        "::-webkit-scrollbar-thumb",
+        "::-webkit-scrollbar-thumb:hover",
+    ):
+        assert needle in PAGE
+    # Chromium/WebKit scrollbars are pinned at exactly 6px.
+    assert "::-webkit-scrollbar{width:6px;height:6px}" in PAGE
+    # Thumb/track still resolve through theme tokens, not fixed colors.
+    thumb = re.search(r"::-webkit-scrollbar-thumb\{([^}]*)\}", PAGE).group(1)
+    assert "--dimmer" in thumb
+
+
+def test_task_duration_plumbing():
+    # Task timing fields are shipped and rendered next to the status label at
+    # both sites (sidebar row + session header) as "<label> · <dur>".
+    for needle in ("taskDur", "fmtDur", "durText", "durSpan", "tickDurations", '"sdur"', '"hdur"', "data-tid", '" · "'):
+        assert needle in PAGE
+    assert re.search(r"setInterval\(tickDurations,1000\)", PAGE)
+    body = re.search(r"function taskDur\(t\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    # The clock starts strictly at a valid started_at — never created_at,
+    # queue time, or session age.
+    assert "Date.parse(t.started_at)" in body
+    assert "created_at" not in body and "last_active_at" not in body
+    # Only queued/running may be live; terminal statuses require finished_at.
+    assert 't.status==="queued"||t.status==="running"' in body
+    assert "Date.parse(t.finished_at)" in body
+    # Whole-second floor math; the old Math.round/padStart version is gone.
+    fmt = re.search(r"const fmtDur=([\s\S]*?)\nfunction taskDur", PAGE).group(1)
+    assert "Math.floor" in fmt and "Math.round" not in fmt and "padStart" not in fmt
+    # Live-ticking text must not join the sidebar signature (it would force a
+    # #sesslist rebuild every second); only static task timestamps may.
+    sig = re.search(r'const sig=([\s\S]*?)join\("\|"\)', PAGE).group(1)
+    assert "Date.now" not in sig and "fmtDur" not in sig
+    assert "started_at" in sig and "finished_at" in sig
+
+
+def test_subagent_seed_avatars():
+    # Codex-style seeded gradient avatars replace the provider glyph at both
+    # icon sites; light/dark variants are resolved by CSS, not re-renders.
+    for needle in (
+        "SUBAV",
+        "function subSeed(",
+        "function agentAvatar(",
+        "data:image/svg+xml,",
+        "subav-wrap",
+        "subav-l",
+        "subav-d",
+        "subav-arc",
+        'aria-hidden="true"',
+        'draggable="false"',
+    ):
+        assert needle in PAGE
+    assert re.search(r'\[data-theme="dark"\] \.subav-l\{display:none\}', PAGE)
+    assert re.search(r'\[data-theme="dark"\] \.subav-d\{display:block\}', PAGE)
+    # The gradient <img> itself stays static — no is-working class anywhere.
+    assert "is-working" not in PAGE
+    # The Codex arc is a decorative overlay emitted only while proc_state is
+    # busy, never for spawning; it carries the rotation, not the avatar.
+    body = re.search(r"function agentAvatar\(s,size\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert 'proc_state==="busy"' in body and "subav-arc" in body
+    assert 'subav-l"' in body  # img markup carries no is-working
+    assert re.search(r"\.subav-arc\{[^}]*animation:ui-spin", PAGE)
+    assert re.search(r"\.subav-wrap\{[^}]*position:relative", PAGE)
+    # Overlay must not disturb layout: absolute inside the wrap, clipped free.
+    arc = re.search(r"\.subav-arc\{([^}]*)\}", PAGE).group(1)
+    assert "position:absolute" in arc and "pointer-events:none" in arc
 
 
 def test_perf_architecture_hooks():
@@ -244,12 +387,19 @@ def test_perf_architecture_hooks():
     assert "md(" not in msg and "innerHTML" not in msg
     # Chunked replay with per-session abort token + rAF slicing: a reset for
     # one session must not cancel another session's in-flight replay.
-    for needle in ("replayGen[id]", "requestAnimationFrame", "startReplay",
-                   "performance.now()", "replaying===id"):
+    for needle in ("replayGen[id]", "requestAnimationFrame", "startReplay", "performance.now()", "replaying===id"):
         assert needle in PAGE
     # Per-session pane stash + bounded caches.
-    for needle in ("function stashPane(", "function dropPane(", "function dropCache(",
-                   "paneLru", "cacheLru", "MAX_PANES", "MAX_CACHE", "rendered"):
+    for needle in (
+        "function stashPane(",
+        "function dropPane(",
+        "function dropCache(",
+        "paneLru",
+        "cacheLru",
+        "MAX_PANES",
+        "MAX_CACHE",
+        "rendered",
+    ):
         assert needle in PAGE
     # Sidebar render signature gates the 3s overview poll rebuild.
     assert "lastSidebarSig" in PAGE
@@ -273,6 +423,19 @@ def _jsdom_available():
     return None
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_dashboard_status_behavior_node():
+    """Executable behavior coverage for the page's status/duration helpers.
+
+    Runs the real inline <script> from PAGE inside a stubbed node vm context —
+    no jsdom or npm packages — and exercises PROC_STATUS/statusOf, latestTask
+    chronology, and the taskDur/fmtDur/durText rules end to end.
+    """
+    script = Path(__file__).parent / "dashboard_status_behavior.js"
+    r = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
 @pytest.mark.skipif(_jsdom_available() is None, reason="node/jsdom not installed")
 def test_dashboard_replay_benchmark():
     """Executable check: chunked replay, batch flush, warm stash, sidebar sig.
@@ -282,9 +445,7 @@ def test_dashboard_replay_benchmark():
     """
     script = Path(__file__).parent.parent / "scripts" / "bench_dashboard_replay.js"
     env = {**os.environ, "NODE_PATH": _jsdom_available()}
-    r = subprocess.run(
-        ["node", str(script)], capture_output=True, text=True, timeout=120, env=env
-    )
+    r = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=120, env=env)
     assert r.returncode == 0, r.stdout + r.stderr
 
 
@@ -311,7 +472,13 @@ def test_index_and_overview(dash):
         "result_chars",
         "files_changed",
         "error",
+        "created_at",
+        "started_at",
+        "finished_at",
     }
+    # task timing fields round-trip so the page can compute working durations
+    assert j["tasks"][0]["started_at"] == "2026-09-12T10:00:02Z"
+    assert j["tasks"][0]["finished_at"] == "2026-09-12T10:01:42Z"
 
 
 def test_events_normalized(dash):
