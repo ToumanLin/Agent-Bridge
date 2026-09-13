@@ -85,6 +85,12 @@ TASK_KEEP_TOTAL = 200
 STOP_TASK_GRACE_SEC = 15
 STALL_POLL_SEC = 30
 STALL_CANCEL_GRACE_SEC = 15
+OUTBOX_POLL_SEC = 1.0
+# How long a requeued message waits before the next claim attempt.
+OUTBOX_BUSY_RETRY_SEC = 2.0
+OUTBOX_FOREIGN_RETRY_SEC = 10.0
+# A message queued behind a busy session is dropped after this many retries.
+OUTBOX_MAX_ATTEMPTS = 600
 
 
 def _new_id(prefix: str) -> str:
@@ -135,6 +141,7 @@ class Registry:
         self._lock = asyncio.Lock()
         self._last_activity = time.monotonic()
         self._watchdog: asyncio.Task[None] | None = None
+        self._outbox_task: asyncio.Task[None] | None = None
         self._owner_pid = os.getpid() if owner_pid is None else owner_pid
         self._owner_create_time = (
             process_create_time(os.getpid()) if owner_create_time is None else owner_create_time
@@ -296,6 +303,132 @@ class Registry:
         except asyncio.CancelledError:
             raise
 
+    async def _outbox_loop(self) -> None:
+        """Deliver dashboard chat messages dropped into ``home/outbox``.
+
+        Each message is a ``msg_*.json`` file ``{session_id, message}``.
+        Claiming is an atomic rename; only the instance owning the session
+        keeps the file — siblings requeue it so the right owner picks it up.
+        Delivery results land in ``outbox/done/`` for the dashboard to read.
+        """
+        outbox = self.home / "outbox"
+        outbox.mkdir(exist_ok=True)
+        cooldown: dict[str, float] = {}
+        while True:
+            await asyncio.sleep(OUTBOX_POLL_SEC)
+            now = time.monotonic()
+            for name, until in list(cooldown.items()):
+                if until <= now:
+                    del cooldown[name]
+            try:
+                names = sorted(
+                    p.name
+                    for p in outbox.iterdir()
+                    if p.is_file() and p.suffix == ".json" and p.name not in cooldown
+                )
+            except OSError:
+                continue
+            for name in names:
+                claimed = outbox / f"{name}.{os.getpid()}.claim"
+                try:
+                    os.replace(outbox / name, claimed)
+                except OSError:
+                    continue
+                try:
+                    retry_after = await self._outbox_deliver(outbox, claimed, name)
+                except Exception:
+                    log.exception("outbox delivery failed for %s", name)
+                    retry_after = OUTBOX_BUSY_RETRY_SEC
+                if retry_after is None:
+                    claimed.unlink(missing_ok=True)
+                else:
+                    with contextlib.suppress(OSError):
+                        os.replace(claimed, outbox / name)
+                    cooldown[name] = time.monotonic() + retry_after
+
+    def _outbox_done(self, outbox: Path, name: str, payload: dict) -> None:
+        done_dir = outbox / "done"
+        done_dir.mkdir(exist_ok=True)
+        with contextlib.suppress(OSError):
+            atomic_write_json(done_dir / name, payload)
+
+    def _adopt_outbox_session(self, session_id: str) -> tuple[Session | None, bool]:
+        """(session, foreign) — adopt a session whose owner bridge is gone."""
+        disk = read_json(state_path(self.home), {})
+        for raw in (disk or {}).get("sessions") or []:
+            if not isinstance(raw, dict) or raw.get("session_id") != session_id:
+                continue
+            if self._foreign_live(raw.get("owner_pid"), raw.get("owner_create_time")):
+                return None, True
+            try:
+                session = Session.model_validate(raw)
+            except Exception:
+                return None, False
+            self._stamp_owner(session)
+            if session.proc_state in {ProcState.busy, ProcState.spawning, ProcState.ready}:
+                session.proc_state = ProcState.idle_unloaded
+            session.pid = None
+            self.sessions[session.session_id] = session
+            self.save()
+            return session, False
+        return None, False
+
+    async def _outbox_deliver(self, outbox: Path, claimed: Path, name: str) -> float | None:
+        rec = read_json(claimed, {})
+        if not isinstance(rec, dict):
+            rec = {}
+        session_id = str(rec.get("session_id") or "")
+        text = str(rec.get("message") or "").strip()
+        if not session_id or not text:
+            self._outbox_done(outbox, name, {"ok": False, "error": "missing session_id or message"})
+            return None
+        session = self.sessions.get(session_id)
+        foreign = False
+        if session is None:
+            session, foreign = self._adopt_outbox_session(session_id)
+        if session is None:
+            if foreign:
+                return OUTBOX_FOREIGN_RETRY_SEC
+            self._outbox_done(outbox, name, {"ok": False, "error": f"unknown session {session_id}"})
+            return None
+        try:
+            result = await self.dispatch_task(
+                agent=session.agent,
+                message=text,
+                cwd=session.cwd,
+                session_id=session.session_id,
+                user_requested=True,
+            )
+        except RuntimeError as exc:
+            if "is busy with" not in str(exc):
+                self._outbox_done(outbox, name, {"ok": False, "error": str(exc)})
+                return None
+            attempts = int(rec.get("attempts") or 0) + 1
+            if attempts > OUTBOX_MAX_ATTEMPTS:
+                self._outbox_done(
+                    outbox, name, {"ok": False, "error": "session stayed busy; message dropped"}
+                )
+                return None
+            rec["attempts"] = attempts
+            with contextlib.suppress(OSError):
+                atomic_write_json(claimed, rec)
+            return OUTBOX_BUSY_RETRY_SEC
+        except Exception as exc:
+            self._outbox_done(outbox, name, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return None
+        self._outbox_done(
+            outbox,
+            name,
+            {"ok": True, "task_id": result.get("task_id"), "session_id": session.session_id},
+        )
+        log.info(
+            "outbox_dispatch name=%s session_id=%s task_id=%s",
+            name,
+            session.session_id,
+            result.get("task_id"),
+        )
+        return None
+
     async def start(self) -> None:
         self._stopping = False
         install_host_env(self.config.env)
@@ -336,6 +469,8 @@ class Registry:
                 self._idle_exit_watchdog(),
                 name="idle-exit-watchdog",
             )
+        if self.dispatch_enabled:
+            self._outbox_task = asyncio.create_task(self._outbox_loop(), name="outbox")
 
     async def stop(self) -> None:
         self._stopping = True
@@ -344,6 +479,10 @@ class Registry:
         self._watchdog = None
         if watchdog is not None:
             watchdog.cancel()
+        outbox_task = self._outbox_task
+        self._outbox_task = None
+        if outbox_task is not None:
+            outbox_task.cancel()
         for idle in list(self._idle.values()):
             idle.cancel()
         self._idle.clear()

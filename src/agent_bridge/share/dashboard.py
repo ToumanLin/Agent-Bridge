@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -23,6 +24,7 @@ from urllib.parse import urlparse, parse_qs
 BRIDGE_DIR = Path(os.environ.get("BRIDGE_DIR", Path(__file__).resolve().parent))
 STATE_FILE = BRIDGE_DIR / "state.json"
 TRANSCRIPT_DIR = BRIDGE_DIR / "transcripts"
+OUTBOX_DIR = BRIDGE_DIR / "outbox"
 
 # Open-tab presence: browser heartbeats via /api/presence; the bridge checks
 # /api/client_state to decide whether to pop the dashboard up.
@@ -164,7 +166,19 @@ header .spacer{flex:1}
 main{flex:1;display:flex;min-height:0}
 #sidebar{width:340px;min-width:280px;border-right:1px solid var(--border);overflow-y:auto;
   background:var(--panel)}
+#pane{flex:1;display:flex;flex-direction:column;min-width:0}
 #content{flex:1;overflow-y:auto;padding:16px 24px}
+#chatbar{border-top:1px solid var(--border);background:var(--panel);padding:10px 24px;
+  display:flex;gap:10px;align-items:flex-end}
+#chatinput{flex:1;resize:none;background:var(--panel2);border:1px solid var(--border);
+  border-radius:8px;color:var(--text);padding:8px 12px;font:inherit;font-size:13px;
+  min-height:36px;max-height:160px}
+#chatinput:focus{outline:none;border-color:var(--accent)}
+#chatinput:disabled{opacity:.5}
+#chatsend{background:var(--accent);color:#0d1117;border:none;border-radius:8px;
+  padding:8px 18px;font-weight:600;cursor:pointer;font-size:13px}
+#chatsend:disabled{opacity:.4;cursor:default}
+#chatstatus{font-size:11px;color:var(--dim);min-width:90px;padding-bottom:8px}
 .sess{padding:10px 14px;border-bottom:1px solid var(--border);cursor:pointer}
 .sess:hover{background:var(--panel2)}
 .sess.sel{background:var(--panel2);border-left:3px solid var(--accent);padding-left:11px}
@@ -246,7 +260,15 @@ details.tooldetail pre{background:#0a0e14;border-radius:6px;padding:8px;font-siz
 </header>
 <main>
   <div id="sidebar"></div>
-  <div id="content"><div class="empty">Select a session</div></div>
+  <div id="pane">
+    <div id="content"><div class="empty">Select a session</div></div>
+    <div id="chatbar">
+      <textarea id="chatinput" rows="1" disabled
+        placeholder="Message this session… (Enter to send, Shift+Enter for newline)"></textarea>
+      <button id="chatsend" disabled>Send</button>
+      <span id="chatstatus"></span>
+    </div>
+  </div>
 </main>
 <div id="backtop">↓ latest</div>
 <script>
@@ -444,9 +466,46 @@ async function pollOverview(){
   }catch(e){$("#live").textContent="disconnected";$("#live").className=""}
 }
 
+/* ---------- chat bar ---------- */
+function setChatStatus(s){$("#chatstatus").textContent=s||""}
+async function sendChat(){
+  const ta=$("#chatinput"),text=ta.value.trim();
+  if(!text||!selected)return;
+  ta.value="";ta.style.height="";setChatStatus("sending…");
+  try{
+    const r=await fetch("/api/send",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({session:selected,text})});
+    const j=await r.json();
+    if(!j.ok){setChatStatus(j.error||"send failed");return}
+    setChatStatus("queued…");pollSendStatus(j.name);
+  }catch(e){setChatStatus("send failed")}
+}
+async function pollSendStatus(name){
+  for(let i=0;i<300;i++){
+    await new Promise(r=>setTimeout(r,1000));
+    try{
+      const r=await fetch(`/api/send_status?name=${encodeURIComponent(name)}`);
+      if(r.status===404)continue;
+      const j=await r.json();
+      setChatStatus(j.ok?"sent ✓":(j.error||"failed"));
+      return;
+    }catch(e){}
+  }
+  setChatStatus("still queued — is a bridge running?");
+}
+const chatInput=$("#chatinput");
+chatInput.addEventListener("keydown",e=>{
+  if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendChat()}});
+chatInput.addEventListener("input",()=>{
+  chatInput.style.height="auto";
+  chatInput.style.height=Math.min(chatInput.scrollHeight,160)+"px"});
+$("#chatsend").onclick=sendChat;
+
 function select(id){
   if(selected===id)return;
   selected=id;renderSidebar();
+  chatInput.disabled=false;$("#chatsend").disabled=false;setChatStatus("");
   closeBlocks();for(const k in tools)delete tools[k];
   const cached=eventsCache[id];
   if(cached&&cached.length){
@@ -550,11 +609,59 @@ class Handler(BaseHTTPRequestHandler):
             n = presence_count()
             self._json({"clients": n, "open": n > 0})
             return
+        if u.path == "/api/send_status":
+            q = parse_qs(u.query)
+            name = (q.get("name") or [""])[0]
+            if not re.match(r"^msg_\d+_[0-9a-f]{8}\.json$", name):
+                self._json({"error": "bad name"}, 400)
+                return
+            done = OUTBOX_DIR / "done" / name
+            if done.exists():
+                try:
+                    self._json(json.loads(done.read_text(encoding="utf-8", errors="replace")))
+                finally:
+                    done.unlink(missing_ok=True)
+                return
+            self._json({"pending": True}, 404)
+            return
         self._json({"error": "not found"}, 404)
 
     def do_POST(self):
-        # navigator.sendBeacon uses POST
         u = urlparse(self.path)
+        if u.path == "/api/send":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(min(length, 1 << 20)) or b"{}")
+            except Exception:
+                self._json({"ok": False, "error": "bad request"}, 400)
+                return
+            session = str(payload.get("session") or "")
+            text = str(payload.get("text") or "").strip()
+            if not SAFE_ID.match(session):
+                self._json({"ok": False, "error": "bad session"}, 400)
+                return
+            if not text or len(text) > 20000:
+                self._json({"ok": False, "error": "empty or too long"}, 400)
+                return
+            state = load_state()
+            known = {s.get("session_id") for s in state.get("sessions", [])}
+            if session not in known:
+                self._json({"ok": False, "error": "unknown session"}, 404)
+                return
+            OUTBOX_DIR.mkdir(exist_ok=True)
+            name = f"msg_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.json"
+            tmp = OUTBOX_DIR / (name + ".tmp")
+            tmp.write_text(
+                json.dumps(
+                    {"session_id": session, "message": text, "ts": time.time()},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(tmp, OUTBOX_DIR / name)
+            self._json({"ok": True, "name": name})
+            return
+        # navigator.sendBeacon uses POST
         if u.path == "/api/presence":
             q = parse_qs(u.query)
             client_id = (q.get("id") or [""])[0]
@@ -569,11 +676,12 @@ def main():
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--dir", default=None, help="Agent Bridge data directory")
     args = ap.parse_args()
-    global BRIDGE_DIR, STATE_FILE, TRANSCRIPT_DIR
+    global BRIDGE_DIR, STATE_FILE, TRANSCRIPT_DIR, OUTBOX_DIR
     if args.dir:
         BRIDGE_DIR = Path(args.dir).resolve()
         STATE_FILE = BRIDGE_DIR / "state.json"
         TRANSCRIPT_DIR = BRIDGE_DIR / "transcripts"
+        OUTBOX_DIR = BRIDGE_DIR / "outbox"
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"Agent Bridge dashboard → http://127.0.0.1:{args.port}")
     print(f"data dir: {BRIDGE_DIR}")

@@ -1484,3 +1484,59 @@ async def test_stall_cancel_finishes_after_turn_returns(bridge_home, tmp_path, m
         assert cancel_finished.is_set()
     finally:
         await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbox_message_dispatches(bridge_home, tmp_path, monkeypatch):
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "hi", cwd=str(work.resolve()))
+        await registry.wait_task(dispatched["task_id"], timeout_sec=5)
+        outbox = bridge_home / "outbox"
+        outbox.mkdir(exist_ok=True)
+        (outbox / "msg_1_abcdef12.json").write_text(
+            json.dumps({"session_id": dispatched["session_id"], "message": "follow up"}),
+            encoding="utf-8",
+        )
+        done = outbox / "done" / "msg_1_abcdef12.json"
+        for _ in range(100):
+            if done.exists():
+                break
+            await asyncio.sleep(0.05)
+        assert done.exists(), "outbox message was never delivered"
+        result = json.loads(done.read_text(encoding="utf-8"))
+        assert result["ok"], result
+        waited = await registry.wait_task(result["task_id"], timeout_sec=5)
+        assert waited["status"] == "completed"
+        assert "follow up" in waited["result_text"]
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbox_unknown_session_reports_error(bridge_home, tmp_path, monkeypatch):
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        outbox = bridge_home / "outbox"
+        outbox.mkdir(exist_ok=True)
+        (outbox / "msg_2_abcdef12.json").write_text(
+            json.dumps({"session_id": "sess_missing", "message": "hi"}),
+            encoding="utf-8",
+        )
+        done = outbox / "done" / "msg_2_abcdef12.json"
+        for _ in range(100):
+            if done.exists():
+                break
+            await asyncio.sleep(0.05)
+        assert done.exists(), "outbox message was never resolved"
+        result = json.loads(done.read_text(encoding="utf-8"))
+        assert result["ok"] is False
+        assert "unknown session" in result["error"]
+    finally:
+        await registry.stop()
