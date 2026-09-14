@@ -193,7 +193,7 @@ async def test_run_turn_prompt_response_is_conversation_delta(tmp_path):
         assert session.usage_baseline["counters"]["total"] == 3
 
         second = await adapter.run_turn(session, _task(session, "t_pr2", "two"))
-        assert second.run_usage == {"scope": "run", "quality": "exact"}
+        assert second.run_usage == {"scope": "run", "quality": "exact", "v": 1}
     finally:
         await adapter.shutdown(session)
 
@@ -295,7 +295,7 @@ async def test_run_turn_revived_conversation_still_deltas(tmp_path):
     )
     try:
         result = await adapter.run_turn(session, _task(session, "t_rv", "hi"))
-        assert result.run_usage == {"scope": "run", "quality": "exact"}
+        assert result.run_usage == {"scope": "run", "quality": "exact", "v": 1}
     finally:
         await adapter.shutdown(session)
 

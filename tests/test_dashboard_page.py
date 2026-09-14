@@ -178,7 +178,6 @@ def test_page_dom_ids_and_endpoints():
         "chatsend",
         "chatstatus",
         "live",
-        "backtop",
         "langsel",
     ):
         assert f'id="{dom_id}"' in PAGE
@@ -313,7 +312,6 @@ def test_theme_dark_tokens_and_color_scheme():
     assert "color-scheme:light" in PAGE
     # send button contrast rides the token in both themes
     assert re.search(r"#chatsend\{[^}]*color:var\(--on-accent\)", PAGE)
-    assert re.search(r"#backtop\{[^}]*box-shadow:var\(--shadow\)", PAGE)
 
 
 def test_theme_radiogroup_control():
@@ -588,24 +586,28 @@ def test_perf_architecture_hooks():
 
 
 def test_nav_rail():
-    # Codex-style proportional nav rail: a semantic landmark left of the
-    # scroller with one native <button> mark per rendered message card.
+    # Voyager-style timeline ruler: a semantic landmark right of the
+    # scroller with one fixed-length tick per conversation beat.
     rail_nav = re.search(r'<nav id="rail"[^>]*>', PAGE).group(0)
     assert 'aria-label="Message positions"' in rail_nav and "hidden" in rail_nav
     # The landmark label localizes via the i18n hook.
     assert 'data-i18n-aria-label="rail.label"' in rail_nav
     # The landmark label must not redundantly contain the role name.
     assert "Message positions" in PAGE and "navigation" not in rail_nav.lower()
-    # Marks only for Agent cards and non-user Dispatched cards. MARK_SEL is
-    # the single source of truth: layoutRail applies it via querySelectorAll
-    # and the JS behavior tests + benchmark consume the same literal — no
-    # second taxonomy copy exists to drift.
+    # The rail renders to the RIGHT of the scroller inside #conv.
+    conv = re.search(r'<div id="conv">([\s\S]*?)</div>\s*<div id="chatbar">', PAGE)
+    assert conv and conv.group(1).index('id="content"') < conv.group(1).index('id="rail"')
+    # Marks cover agent cards, non-user Dispatched cards and turn ends —
+    # error dividers (.turnend.err) are not turn ends. MARK_SEL is the single
+    # source of truth: layoutRail applies it via querySelectorAll and the JS
+    # behavior tests + benchmark consume the same literal — no second
+    # taxonomy copy exists to drift.
     sel = re.search(r'const MARK_SEL="([^"]+)"', PAGE)
     assert sel, "MARK_SEL selector missing"
-    assert sel.group(1) == ".block.card.msg,.block.card.prompt:not(.user)"
+    assert sel.group(1) == ".block.card.msg,.block.card.prompt:not(.user),.turnend:not(.err)"
     layout = re.search(r"function layoutRail\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
     assert "querySelectorAll(MARK_SEL)" in layout
-    # Layout, clustering and interaction machinery.
+    # Layout, clustering, wave and interaction machinery.
     for needle in (
         "MARK_GAP",
         "clusterYs",
@@ -613,7 +615,10 @@ def test_nav_rail():
         "layoutRail",
         "jumpToMark",
         "updateCurMark",
+        "updateRulerWave",
         "railBtns",
+        "markVars",
+        "setProperty",
         "requestAnimationFrame",
         "MutationObserver",
         "ResizeObserver",
@@ -628,6 +633,7 @@ def test_nav_rail():
         '"ArrowUp"',
         '"Home"',
         '"End"',
+        '"wheel"',
         "scrollTo",
         "scrollTop",
         "prefers-reduced-motion",
@@ -635,29 +641,62 @@ def test_nav_rail():
     ):
         assert needle in PAGE
     # Theme-aware CSS: token colors only, focus ring, current-mark accent,
-    # mobile narrowing inside the existing 900px media block.
+    # mobile narrowing via --railw inside the existing 900px media block.
     rail_css = re.search(r"#rail\{([^}]*)\}", PAGE).group(1)
-    assert "width:18px" in rail_css and "position:relative" in rail_css
+    assert "width:var(--railw)" in rail_css and "position:relative" in rail_css
+    # Every graduation is the same fixed 14px length; only thickness encodes
+    # kind (2/3/4px) — no scaleX or per-tick length variation anywhere.
     mark_css = re.search(r"\.mark\{([^}]*)\}", PAGE).group(1)
+    assert "width:14px" in mark_css and "height:2px" in mark_css
     assert "var(--dimmer)" in mark_css and "cursor:pointer" in mark_css
+    assert "scaleX" not in PAGE
+    assert re.search(r"\.mark\.k-disp\{[^}]*height:3px", PAGE)
+    assert re.search(r"\.mark\.k-turn\{[^}]*height:4px", PAGE)
     assert re.search(r"\.mark\.cur\{[^}]*var\(--accent\)", PAGE)
     assert re.search(r"\.mark:focus-visible\{[^}]*outline:2px", PAGE)
     narrow = re.search(r"@media \(max-width:900px\)\{([\s\S]*?)\n\}", PAGE).group(1)
-    assert "#rail{width:14px}" in narrow and ".mark{left:3px;width:8px}" in narrow
+    assert "#pane{--railw:14px}" in narrow
     # #conv wraps the scroller; #content stays the positioned offset parent so
     # card.offsetTop maps proportionally onto the rail.
     assert re.search(r"#conv\{[^}]*display:flex", PAGE)
     content_css = re.search(r"#content\{([^}]*)\}", PAGE).group(1)
     assert "position:relative" in content_css and "overflow-y:auto" in content_css
-    # Scroll and session-switch hooks keep the current mark live.
+    # Scroll and session-switch hooks keep the current mark and wave live.
     scroll = re.search(r'content\.addEventListener\("scroll",\(\)=>\{([\s\S]*?)\}\)', PAGE)
-    assert "updateCurMark" in scroll.group(1)
+    assert "updateCurMark" in scroll.group(1) and "updateRulerWave" in scroll.group(1)
     sel_body = re.search(r"function select\(id\)\{([\s\S]*?)\n\}", PAGE).group(1)
     assert "scheduleRail()" in sel_body
     # Mark aria-labels/tooltips come from the dictionary, keyed by card kind.
-    assert 't("rail.agent_message")' in PAGE
-    assert 't("rail.dispatched_message")' in PAGE
+    assert '"rail.agent_message"' in PAGE
+    assert '"rail.dispatched_message"' in PAGE
+    assert '"rail.turn_end"' in PAGE
+    assert "MARK_LBL[rank]" in PAGE
     assert 't("rail.messages"' in PAGE
+
+
+def test_centered_content_axis():
+    # Every right-pane inner column centers on one axis compensated for the
+    # right rail's width via --railw; bars keep full-width chrome.
+    block = re.search(r"\.block\{([^}]*)\}", PAGE).group(1)
+    assert "margin:0 auto 14px" in block and "max-width:960px" in block
+    hwrap = re.search(r"#hwrap\{([^}]*)\}", PAGE).group(1)
+    assert "max-width:960px" in hwrap and "margin:0 auto" in hwrap
+    chatinner = re.search(r"\.chatinner\{([^}]*)\}", PAGE).group(1)
+    assert "max-width:960px" in chatinner and "margin:0 auto" in chatinner
+    assert 'class="chatinner"' in PAGE
+    turnend = re.search(r"\.turnend\{([^}]*)\}", PAGE).group(1)
+    assert "margin:20px auto" in turnend and "max-width:960px" in turnend
+    # --railw compensation: header/composer right padding = pad + rail width.
+    pane = re.search(r"#pane\{([^}]*)\}", PAGE).group(1)
+    assert "--railw:18px" in pane
+    head = re.search(r"#sesshead\{([^}]*)\}", PAGE).group(1)
+    assert "calc(26px + var(--railw))" in head
+    assert "border-bottom:1px solid var(--border)" in head  # full-width chrome kept
+    bar = re.search(r"#chatbar\{([^}]*)\}", PAGE).group(1)
+    assert "calc(26px + var(--railw))" in bar
+    assert "border-top:1px solid var(--border)" in bar
+    # The redundant latest button is gone entirely — markup, CSS, JS, i18n.
+    assert "backtop" not in PAGE and "nav.latest" not in PAGE
 
 
 # ---------- i18n: bundled en / zh-CN / zh-TW dictionaries ----------
@@ -703,6 +742,7 @@ def test_i18n_glossary_exactness():
     assert tw["transcript.user_message"] == "使用者訊息"
     assert zh["transcript.thinking"] == "思考中" and tw["transcript.thinking"] == "思考中"
     assert zh["transcript.turn_ended"] == "回合已结束" and tw["transcript.turn_ended"] == "回合已結束"
+    assert zh["rail.turn_end"] == "回合结束" and tw["rail.turn_end"] == "回合結束"
     assert zh["send.waiting_busy"] == "等待 Agent——会话正忙…"
     assert tw["send.waiting_busy"] == "等待 Agent——工作階段忙碌中…"
     assert zh["send.dispatched"] == "已派发" and tw["send.dispatched"] == "已派發"
@@ -730,7 +770,6 @@ def test_i18n_static_hooks_resolve():
     for needle in (
         'data-i18n="nav.subagents"',
         'data-i18n="session.select"',
-        'data-i18n="nav.latest"',
         'data-i18n="theme.label"',
         'data-i18n="language.label"',
         'data-i18n-aria-label="a11y.sessions"',
@@ -1045,6 +1084,9 @@ def test_index_and_overview(dash):
     # task timing fields round-trip so the page can compute working durations
     assert j["tasks"][0]["started_at"] == "2026-09-12T10:00:02Z"
     assert j["tasks"][0]["finished_at"] == "2026-09-12T10:01:42Z"
+    # Batched live-usage map rides the same response; nothing runs in the
+    # fixture so it stays empty.
+    assert j["live"] == {}
 
 
 def test_events_normalized(dash):
@@ -1122,6 +1164,280 @@ def test_send_flow_and_status(dash):
     assert code == 400 and json.loads(body)["error_code"] == "empty_or_too_long"
     code, body = _post(base + "/api/send", {"session": "bad id!", "text": "x"})
     assert code == 400 and json.loads(body)["error_code"] == "bad_session"
+
+
+# ---------- batched live usage map (/api/overview "live") ----------
+
+LIVE_SID = "sess_live"
+
+
+def _usage_rec(ts, total):
+    return {
+        "type": "usage",
+        "ts": ts,
+        "data": {
+            "update_type": "UsageUpdate",
+            "consumed": {"scope": "run", "quality": "exact", "total": total},
+        },
+    }
+
+
+def _chunk_rec(ts, text="x"):
+    return {"type": "message_chunk", "ts": ts, "data": {"text": text}}
+
+
+def _write_transcript(home, sid, records):
+    path = home / "transcripts" / f"{sid}.jsonl"
+    path.write_text(
+        "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8"
+    )
+    return path
+
+
+def _set_state(home, tasks, sessions=None):
+    state = {"sessions": sessions or [SESSION], "tasks": tasks}
+    (home / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+
+def _live_task(sid=LIVE_SID, tid="task_live", started="2026-09-12T10:00:10Z"):
+    return {
+        "task_id": tid,
+        "session_id": sid,
+        "agent": "devin",
+        "status": "running",
+        "created_at": "2026-09-12T10:00:00Z",
+        "started_at": started,
+    }
+
+
+def _overview(base):
+    code, body = _get(base + "/api/overview")
+    assert code == 200
+    return json.loads(body)
+
+
+def test_overview_live_map_last_qualifying_usage(dash):
+    home, base = dash
+    dashboard._LIVE_TAIL.clear()
+    _write_transcript(
+        home,
+        LIVE_SID,
+        [
+            _usage_rec("2026-09-12T10:00:05Z", 99),  # pre-start: prior run
+            _usage_rec("2026-09-12T10:00:20Z", 10),
+            _usage_rec("2026-09-12T10:00:30Z", 25),
+        ],
+    )
+    _set_state(home, [_live_task()])
+    j = _overview(base)
+    entry = j["live"][LIVE_SID]
+    # Pinned to the exact task; only the last post-start snapshot counts.
+    assert entry["task_id"] == "task_live"
+    assert entry["consumed"]["total"] == 25
+
+
+def test_overview_live_covers_sibling_sessions(dash):
+    """Sibling-owned tasks share state.json + transcripts/, so the batch
+    covers them uniformly with no owner check."""
+    home, base = dash
+    dashboard._LIVE_TAIL.clear()
+    _write_transcript(home, "sess_a", [_usage_rec("2026-09-12T10:00:20Z", 5)])
+    _write_transcript(home, "sess_b", [_usage_rec("2026-09-12T10:00:20Z", 7)])
+    _set_state(
+        home,
+        [_live_task("sess_a", "task_a"), _live_task("sess_b", "task_b")],
+    )
+    j = _overview(base)
+    assert j["live"]["sess_a"]["consumed"]["total"] == 5
+    assert j["live"]["sess_b"]["consumed"]["total"] == 7
+    assert j["live"]["sess_b"]["task_id"] == "task_b"
+
+
+def test_live_incremental_reads_appends_only(dash, monkeypatch):
+    """Steady-state polls are one stat + the appended bytes: the transcript
+    is opened on the first sighting and after each append, never reread."""
+    home, base = dash
+    dashboard._LIVE_TAIL.clear()
+    path = _write_transcript(home, LIVE_SID, [_usage_rec("2026-09-12T10:00:20Z", 10)])
+    _set_state(home, [_live_task()])
+    opens = []
+    real_open = open
+
+    def spy(file, *args, **kwargs):
+        if str(file).endswith(".jsonl"):
+            opens.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(dashboard, "open", spy, raising=False)
+    j = _overview(base)
+    assert j["live"][LIVE_SID]["consumed"]["total"] == 10
+    assert len(opens) == 1  # first-touch seed scan
+    _overview(base)
+    _overview(base)
+    assert len(opens) == 1  # stable polls never reopen the transcript
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(_usage_rec("2026-09-12T10:00:40Z", 41)) + "\n")
+    j = _overview(base)
+    assert j["live"][LIVE_SID]["consumed"]["total"] == 41
+    assert len(opens) == 2  # appended bytes only
+    # An incomplete trailing line waits for its newline; the offset stays put.
+    with open(path, "a", encoding="utf-8") as f:
+        f.write('{"type":"usage","ts":"2026-09-12T10:00:50Z","data":{"consumed":{"total":55}}')
+    j = _overview(base)
+    assert j["live"][LIVE_SID]["consumed"]["total"] == 41
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("}\n")
+    j = _overview(base)
+    assert j["live"][LIVE_SID]["consumed"]["total"] == 55
+
+
+def test_live_rotation_resets_reader(dash):
+    home, base = dash
+    dashboard._LIVE_TAIL.clear()
+    _write_transcript(
+        home,
+        LIVE_SID,
+        [_usage_rec("2026-09-12T10:00:20Z", 10), _usage_rec("2026-09-12T10:00:30Z", 25)],
+    )
+    _set_state(home, [_live_task()])
+    assert _overview(base)["live"][LIVE_SID]["consumed"]["total"] == 25
+    # Rotate/truncate: a smaller fresh file must reset the cached offset.
+    _write_transcript(home, LIVE_SID, [_usage_rec("2026-09-12T10:00:35Z", 7)])
+    assert _overview(base)["live"][LIVE_SID]["consumed"]["total"] == 7
+
+
+def test_live_new_started_at_resets(dash):
+    """A new run on the same session must not inherit the prior run's
+    usage events — the entry resets on the started_at change."""
+    home, base = dash
+    dashboard._LIVE_TAIL.clear()
+    _write_transcript(home, LIVE_SID, [_usage_rec("2026-09-12T10:00:20Z", 10)])
+    _set_state(home, [_live_task()])
+    assert _overview(base)["live"][LIVE_SID]["consumed"]["total"] == 10
+    _set_state(home, [_live_task(started="2026-09-12T10:00:50Z")])
+    assert LIVE_SID not in _overview(base)["live"]
+
+
+def test_live_bad_session_id_skipped(dash):
+    home, base = dash
+    dashboard._LIVE_TAIL.clear()
+    _set_state(home, [_live_task("../evil", "task_evil")])
+    j = _overview(base)
+    assert "../evil" not in j["live"]
+    assert "../evil" not in dashboard._LIVE_TAIL
+
+
+def test_live_prunes_finished_sessions(dash):
+    home, base = dash
+    dashboard._LIVE_TAIL.clear()
+    _write_transcript(home, LIVE_SID, [_usage_rec("2026-09-12T10:00:20Z", 10)])
+    _set_state(home, [_live_task()])
+    _overview(base)
+    assert LIVE_SID in dashboard._LIVE_TAIL
+    _set_state(
+        home,
+        [
+            {
+                **_live_task(),
+                "status": "completed",
+                "finished_at": "2026-09-12T10:01:00Z",
+            }
+        ],
+    )
+    j = _overview(base)
+    assert LIVE_SID not in j["live"]
+    assert LIVE_SID not in dashboard._LIVE_TAIL
+
+
+def test_live_seed_fallback_full_scan(dash):
+    """A qualifying usage event older than the seed window is still found —
+    the reader falls back to one bounded full scan on first touch."""
+    home, base = dash
+    dashboard._LIVE_TAIL.clear()
+    _write_transcript(
+        home,
+        LIVE_SID,
+        [
+            _usage_rec("2026-09-12T10:00:20Z", 12),
+            _chunk_rec("2026-09-12T10:00:30Z", "y" * (dashboard.LIVE_SEED_BYTES + 4096)),
+        ],
+    )
+    _set_state(home, [_live_task()])
+    j = _overview(base)
+    assert j["live"][LIVE_SID]["consumed"]["total"] == 12
+    assert dashboard._LIVE_TAIL[LIVE_SID]["offset"] > 0
+
+
+def test_live_no_usage_yet(dash):
+    home, base = dash
+    dashboard._LIVE_TAIL.clear()
+    _write_transcript(home, LIVE_SID, [_chunk_rec("2026-09-12T10:00:20Z", "hi")])
+    _set_state(home, [_live_task()])
+    assert _overview(base)["live"] == {}
+
+
+def test_live_timestamps_compare_as_instants(dash):
+    """Mixed-offset stamps compare by absolute instant, not text: a Z event
+    that sorts textually before a +08:00 started_at can still post-date it.
+    """
+    home, base = dash
+    dashboard._LIVE_TAIL.clear()
+    _write_transcript(
+        home,
+        LIVE_SID,
+        [
+            _usage_rec("2026-09-12T01:59:00Z", 99),  # before the start instant
+            _usage_rec("2026-09-12T03:00:00Z", 42),  # after it, lexically "earlier"
+        ],
+    )
+    # 10:00:05+08:00 == 02:00:05Z — a lexicographic compare would drop 03:00Z.
+    _set_state(home, [_live_task(started="2026-09-12T10:00:05+08:00")])
+    j = _overview(base)
+    assert j["live"][LIVE_SID]["consumed"]["total"] == 42
+    # Cross-day positive offset: 00:30+08:00 == 16:30Z of the previous day;
+    # the 17:00Z event post-dates it though its date string is "earlier".
+    dashboard._LIVE_TAIL.clear()
+    _write_transcript(home, "sess_day", [_usage_rec("2026-09-12T17:00:00Z", 8)])
+    _set_state(
+        home,
+        [
+            _live_task(),
+            _live_task("sess_day", "task_day", started="2026-09-13T00:30:00+08:00"),
+        ],
+    )
+    j = _overview(base)
+    assert j["live"]["sess_day"]["consumed"]["total"] == 8
+
+
+def test_live_timestamps_equivalent_offsets(dash):
+    """The same instant written with Z and an offset qualifies identically —
+    the boundary itself is inclusive."""
+    home, base = dash
+    dashboard._LIVE_TAIL.clear()
+    _write_transcript(
+        home,
+        LIVE_SID,
+        [_usage_rec("2026-09-12T18:00:05+08:00", 7)],  # == started_at instant
+    )
+    _set_state(home, [_live_task(started="2026-09-12T10:00:05Z")])
+    assert _overview(base)["live"][LIVE_SID]["consumed"]["total"] == 7
+
+
+def test_live_timestamps_invalid_fail_closed(dash):
+    """Unparseable event stamps are ignored; an unparseable started_at
+    yields no live entry at all."""
+    home, base = dash
+    dashboard._LIVE_TAIL.clear()
+    _write_transcript(
+        home,
+        LIVE_SID,
+        [_usage_rec("not-a-time", 5), _usage_rec("2026-09-12T10:00:20Z", 10)],
+    )
+    _set_state(home, [_live_task()])
+    j = _overview(base)
+    assert j["live"][LIVE_SID]["consumed"]["total"] == 10
+    _set_state(home, [_live_task(started="garbage")])
+    assert LIVE_SID not in _overview(base)["live"]
 
 
 def test_presence_and_client_state(dash):

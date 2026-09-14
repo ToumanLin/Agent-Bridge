@@ -144,6 +144,15 @@ const overview = {
       created_at: new Date(Date.now() - 70000).toISOString(),
       started_at: new Date(Date.now() - 65000).toISOString() },
   ],
+  // Batched live-usage map, shaped like /api/overview emits it: pinned to
+  // the running task's id so it can only land on that row.
+  live: {
+    [streams[1].id]: {
+      task_id: "task_run",
+      consumed: { scope: "run", quality: "exact", v: 1,
+        input: 10, output: 5, total: 15 },
+    },
+  },
 };
 
 /* ---------- jsdom harness ---------- */
@@ -348,6 +357,20 @@ async function waitStable() {
   await w.pollOverview();
   const sesslistSetsOnStablePolls = stats.sesslistSets;
 
+  // ---- live batch: exactly one repaint for a changed partial, then stable ----
+  overview.live[streams[1].id].consumed =
+    { scope: "run", quality: "exact", v: 1, input: 20, output: 8, total: 28 };
+  await w.pollOverview();
+  const sesslistSetsOnLiveChange = stats.sesslistSets;
+  await w.pollOverview();
+  const sesslistSetsAfterLive = stats.sesslistSets;
+
+  // ---- weekly metric: batched live contributes; the node stays passive ----
+  const weekEl = w.document.querySelector("#weektotal");
+  const weekVal = weekEl && weekEl.querySelector(".wt-val").textContent;
+  const weekTitle = weekEl ? weekEl.title : "";
+  const weekAriaLive = weekEl ? weekEl.getAttribute("aria-live") : "missing";
+
   // ---- task working durations: a completed task freezes at
   // finished_at - started_at ("40s" per the fixture); a running task ticks
   // live via the 1s tickDurations interval — textContent only, so the
@@ -375,6 +398,20 @@ async function waitStable() {
       && statusText(streams[1].id).includes("Running"),
     // task_done usage: (108414-108072)+4763 = 5105 -> " · 5k tok"
     tokensShown: statusText(streams[0].id).includes("5k tok"),
+    // running agent's sidebar counter shows the batched live partial
+    liveTokensShown: statusText(streams[1].id).includes("28 tok"),
+  });
+
+  results.push({
+    liveBatch: { sesslistSetsOnLiveChange, sesslistSetsAfterLive,
+      weekVal, weekTitle, weekAriaLive },
+    liveRepaintOnce: sesslistSetsOnLiveChange === 1,
+    liveStableAfter: sesslistSetsAfterLive === 1,
+    weekValOk: weekVal === "28 tok",
+    weekTitleOk: weekTitle.includes("1 task")
+      && weekTitle.includes("live in-progress")
+      && weekTitle.includes("retained Agent Bridge task history"),
+    weekPassive: weekAriaLive === null,
   });
 
   probing = false;
@@ -400,7 +437,13 @@ async function waitStable() {
     (r.doneFrozen === undefined || r.doneFrozen) &&
     (r.runAdvanced === undefined || r.runAdvanced) &&
     (r.statusLabels === undefined || r.statusLabels) &&
-    (r.tokensShown === undefined || r.tokensShown)) &&
+    (r.tokensShown === undefined || r.tokensShown) &&
+    (r.liveTokensShown === undefined || r.liveTokensShown) &&
+    (r.liveRepaintOnce === undefined || r.liveRepaintOnce) &&
+    (r.liveStableAfter === undefined || r.liveStableAfter) &&
+    (r.weekValOk === undefined || r.weekValOk) &&
+    (r.weekTitleOk === undefined || r.weekTitleOk) &&
+    (r.weekPassive === undefined || r.weekPassive)) &&
     sesslistSetsOnStablePolls === 0 && !jsError;
   process.exit(ok ? 0 : 1);
 })().catch((e) => { console.error(e); probing = false; process.exit(1); });

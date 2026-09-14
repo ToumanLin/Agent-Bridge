@@ -73,8 +73,13 @@ def append_event(session_id: str, event_type: str, data: dict[str, Any] | None =
             and now - buffer.first_pending_at >= BUFFER_MAX_AGE_SEC
         )
         terminal = event_type in {"turn_end", "error"}
+        # "usage" snapshots feed the dashboard's live token counters; flush
+        # each one so polls see them on the next cycle rather than up to
+        # BUFFER_MAX_AGE_SEC late. Upstream emit-key dedup bounds how often
+        # they land, so each flush stays a single small append.
+        immediate = terminal or event_type == "usage"
         _activity[path] = now
-        if buffer.size >= BUFFER_BYTE_LIMIT or aged or terminal:
+        if buffer.size >= BUFFER_BYTE_LIMIT or aged or immediate:
             _flush_locked(path, buffer)
         if terminal and not buffer.lines:
             _buffers.pop(path, None)

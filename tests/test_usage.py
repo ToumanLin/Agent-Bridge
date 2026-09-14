@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from agent_bridge.usage import (
+    RUN_USAGE_VERSION,
     DeltaUsage,
     RunUsage,
     normalize_usage,
@@ -474,4 +475,19 @@ def test_run_usage_from_total_codex_shape():
 
 def test_run_usage_from_total_empty_is_marker_only():
     out = run_usage_from_total({})
-    assert out == {"scope": "run", "quality": "exact"}
+    assert out == {"scope": "run", "quality": "exact", "v": RUN_USAGE_VERSION}
+
+
+def test_run_usage_version_stamped_on_all_producers():
+    """v:1 marks rows written after the double-count fix — pre-version rows
+    are permanently unverifiable for consumers like the weekly total."""
+    assert RUN_USAGE_VERSION == 1
+    run = RunUsage("echo")
+    run.reset()
+    run.update({"inputTokens": 10, "outputTokens": 4})
+    assert run.snapshot()["v"] == 1  # live partial
+    assert run.finish()["v"] == 1  # final snapshot
+    delta = DeltaUsage(count_first=True)
+    delta.update({"input_tokens": 5, "output_tokens": 2})
+    assert delta.run_usage()["v"] == 1
+    assert run_usage_from_total({"input_tokens": 5, "output_tokens": 2})["v"] == 1

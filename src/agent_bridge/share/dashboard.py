@@ -19,6 +19,7 @@ import socket
 import threading
 import time
 import uuid
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -168,6 +169,157 @@ def read_events(session_id, offset):
     return events, new_offset
 
 
+# Incremental per-session transcript tail reader for the batched live-usage
+# map. Each entry caches the byte offset just past the last consumed newline
+# plus the run's started_at, so steady-state polls cost ~one stat() plus the
+# appended bytes — never a full transcript reread. A first sighting seeds
+# near the tail (usage events almost always post-date it) with one bounded
+# full-scan fallback; a file shrink/rotation or a new started_at resets.
+LIVE_SEED_BYTES = 512 * 1024
+_LIVE_TAIL: dict[str, dict] = {}
+_LIVE_LOCK = threading.Lock()
+
+
+def _instant(value) -> float | None:
+    """Epoch seconds for an ISO-8601 timestamp, else None.
+
+    State and transcripts may mix ``Z`` with numeric offsets (``+00:00``,
+    ``+08:00``…), and other bridge writers can use local offsets — only an
+    absolute-instant compare attributes events correctly across those
+    forms. A naive stamp is read as UTC, matching the bridge's own
+    convention; anything unparseable fails closed so the record is ignored
+    rather than mis-attributed.
+    """
+    try:
+        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.timestamp()
+
+
+def _usage_consumed_last(blob: bytes, started_epoch: float) -> dict | None:
+    """Last usage record's consumed snapshot at/after ``started_epoch``.
+
+    Events older than the run start belong to a prior run on the reusable
+    session — the same attribution rule the bridge applies when it recovers
+    a dead run's partial. ``blob`` must contain only complete JSONL lines.
+    """
+    found = None
+    for line in blob.split(b"\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("type") != "usage":
+            continue
+        ts = _instant(rec.get("ts"))
+        if ts is None or ts < started_epoch:
+            continue
+        consumed = (rec.get("data") or {}).get("consumed")
+        if isinstance(consumed, dict) and consumed:
+            found = consumed
+    return found
+
+
+def _live_consumed(session_id: str, started_at: str) -> dict | None:
+    """Latest consumed snapshot for the current run on ``session_id``."""
+    if not SAFE_ID.match(session_id or ""):
+        return None
+    started_epoch = _instant(started_at)
+    if started_epoch is None:
+        return None
+    path = TRANSCRIPT_DIR / f"{session_id}.jsonl"
+    with _LIVE_LOCK:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            _LIVE_TAIL.pop(session_id, None)
+            return None
+        ent = _LIVE_TAIL.get(session_id)
+        if ent is None:
+            offset = max(0, size - LIVE_SEED_BYTES)
+            ent = _LIVE_TAIL[session_id] = {
+                "offset": offset,
+                "mid": offset > 0,       # seed landed inside a record
+                "started": started_at,
+                "consumed": None,
+                "seeded": offset > 0,    # one bounded full-scan fallback left
+            }
+        elif ent["started"] != started_at:
+            # New run on the same session: earlier bytes belong to the prior
+            # run and can never qualify again.
+            ent["started"] = started_at
+            ent["consumed"] = None
+        if size < ent["offset"]:  # truncated/rotated — rescan from scratch
+            ent.update(offset=0, mid=False, consumed=None, seeded=False)
+        if size == ent["offset"]:
+            return ent["consumed"]
+        offset = ent["offset"]
+        try:
+            with open(path, "rb") as f:
+                f.seek(offset)
+                data = f.read()
+        except OSError:
+            return ent["consumed"]
+        cut = data.rfind(b"\n")
+        if cut < 0:
+            return ent["consumed"]
+        blob = data[: cut + 1]
+        ent["offset"] = offset + cut + 1
+        if ent["mid"]:
+            ent["mid"] = False
+            blob = blob[blob.find(b"\n") + 1 :]  # drop the cut-open record
+        found = _usage_consumed_last(blob, started_epoch)
+        if found is not None:
+            ent["consumed"] = found
+            ent["seeded"] = False
+        elif ent["seeded"] and ent["consumed"] is None:
+            # Nothing qualifying in the seed window of a larger file: scan
+            # the whole transcript once, then stay incremental forever.
+            ent["seeded"] = False
+            try:
+                blob = path.read_bytes()
+            except OSError:
+                blob = b""
+            found = _usage_consumed_last(blob, started_epoch)
+            if found is not None:
+                ent["consumed"] = found
+        return ent["consumed"]
+
+
+def live_usage_map(tasks) -> dict:
+    """session_id -> {task_id, consumed} for every task still running.
+
+    Covers sibling/remote-owned tasks uniformly: all bridge instances merge
+    into the same state.json and share this transcript dir, so tailing by
+    session_id needs no owner check. Finished sessions are pruned from the
+    incremental cache on every pass.
+    """
+    running = {}
+    for t in tasks:
+        if not isinstance(t, dict) or t.get("status") != "running":
+            continue
+        sid = str(t.get("session_id") or "")
+        if not t.get("started_at") or not SAFE_ID.match(sid):
+            continue
+        running[sid] = t
+    with _LIVE_LOCK:
+        for sid in list(_LIVE_TAIL):
+            if sid not in running:
+                del _LIVE_TAIL[sid]
+    live = {}
+    for sid, t in running.items():
+        consumed = _live_consumed(sid, str(t.get("started_at")))
+        if consumed:
+            live[sid] = {"task_id": t.get("task_id"), "consumed": consumed}
+    return live
+
+
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -242,6 +394,10 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
 #live.off{color:var(--red)}
 #live.off .ldot{background:var(--red)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.week-total{display:flex;align-items:baseline;justify-content:space-between;
+  gap:8px;padding:0 18px 10px;font-size:12px;color:var(--dim)}
+.week-total .wt-val{font-variant-numeric:tabular-nums;font-weight:600;
+  white-space:nowrap}
 #sesslist{flex:1;overflow-y:auto;padding:4px 10px 14px}
 .side-foot{flex:none;border-top:1px solid var(--border);display:flex;align-items:center;
   gap:8px;padding:4px 12px}
@@ -297,14 +453,19 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
 .sdur,.hdur,.stok,.htok{color:var(--dimmer);font-variant-numeric:tabular-nums;
   white-space:nowrap}
 /* ---------- pane header ---------- */
-#pane{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--panel)}
-#sesshead{display:flex;align-items:center;gap:14px;padding:16px 26px 14px;
+/* --railw reserves the right rail's width in the header/composer padding so
+   every inner column centers on the same axis as the conversation blocks. */
+#pane{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--panel);
+  --railw:18px}
+#sesshead{display:flex;align-items:center;gap:14px;
+  padding:16px calc(26px + var(--railw)) 14px 26px;
   border-bottom:1px solid var(--border);min-height:78px}
 #menubtn{display:none;flex:none;width:34px;height:34px;align-items:center;
   justify-content:center;background:none;border:1px solid var(--border);
   border-radius:8px;color:var(--dim);cursor:pointer}
 #menubtn:hover{background:var(--panel3)}
-#hwrap{flex:1;display:flex;align-items:center;gap:14px;min-width:0}
+#hwrap{flex:1;display:flex;align-items:center;gap:14px;min-width:0;
+  max-width:960px;margin:0 auto}
 .avatar{flex:none;width:46px;height:46px;display:flex;align-items:center;
   justify-content:center}
 .hbody{flex:1;min-width:0}
@@ -323,19 +484,29 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
 /* ---------- conversation cards ---------- */
 #conv{flex:1;min-height:0;display:flex}
 #content{flex:1;position:relative;overflow-y:auto;padding:20px 26px 24px}
-#rail{flex:none;width:18px;position:relative}
-#rail::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:1px;
+#rail{flex:none;width:var(--railw);position:relative}
+#rail::before{content:"";position:absolute;top:0;bottom:0;left:0;width:1px;
   background:var(--border)}
-.mark{position:absolute;top:0;left:4px;width:10px;min-height:3px;padding:0;
-  border:0;border-radius:2px;background:var(--dimmer);opacity:.65;cursor:pointer}
-/* Hit zone: unclustered marks keep >=3px between pill edges (MARK_GAP tops
-   stay >=6 apart), so 1.5px of vertical expansion fills the gap exactly —
+/* Timeline ruler graduations: every tick is the same fixed 14px length,
+   anchored at the rail's content-facing edge and centered on its document
+   fraction via --my + translateY(-50%). Kind shows as thickness only —
+   agent message 2px, dispatched message 3px, turn end 4px. */
+.mark{position:absolute;top:0;left:0;width:14px;height:2px;padding:0;
+  border:0;border-radius:2px;background:var(--dimmer);cursor:pointer;
+  transform:translateY(var(--my,0px)) translateY(-50%);
+  opacity:var(--mo,.5);
+  transition:transform .11s cubic-bezier(.2,.8,.2,1),opacity .11s ease-out,
+    background-color .15s ease}
+.mark.k-disp{height:3px}
+.mark.k-turn{height:4px}
+/* Hit zone: cluster anchors stay >=6px apart (MARK_GAP) and the thickest
+   tick is 4px, so 1px of vertical expansion fills the gap exactly —
    adjacent hit zones can touch but can never overlap. */
-.mark::after{content:"";position:absolute;inset:-1.5px -4px}
+.mark::after{content:"";position:absolute;inset:-1px -4px}
 .mark:hover{opacity:1}
-.mark.cur{background:var(--accent);opacity:1}
+.mark.cur{opacity:1;background:var(--accent)}
 .mark:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.block{margin:0 0 14px;max-width:960px}
+.block{margin:0 auto 14px;max-width:960px}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;
   padding:13px 16px}
 .chead{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;
@@ -400,8 +571,10 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
 .turnend.err{color:var(--red)}
 .empty{color:var(--dimmer);text-align:center;margin-top:80px;font-size:14px}
 /* ---------- composer ---------- */
-#chatbar{border-top:1px solid var(--border);background:var(--panel);padding:14px 26px;
-  display:flex;gap:10px;align-items:flex-end}
+#chatbar{border-top:1px solid var(--border);background:var(--panel);
+  padding:14px calc(26px + var(--railw)) 14px 26px}
+.chatinner{display:flex;gap:10px;align-items:flex-end;width:100%;
+  max-width:960px;margin:0 auto}
 #chatinput{flex:1;resize:none;background:var(--panel);border:1px solid var(--border);
   border-radius:10px;color:var(--text);padding:10px 14px;font:inherit;font-size:13.5px;
   min-height:40px;max-height:160px}
@@ -415,11 +588,6 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
 #chatsend:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 #chatsend:disabled{opacity:.45;cursor:default}
 #chatstatus{font-size:11.5px;color:var(--dim);min-width:96px;align-self:center}
-#backtop{position:fixed;right:26px;bottom:26px;background:var(--panel);
-  border:1px solid var(--border);color:var(--dim);border-radius:999px;padding:7px 14px;
-  cursor:pointer;font-size:12px;display:none;align-items:center;gap:5px;
-  box-shadow:var(--shadow)}
-#backtop:focus-visible{outline:2px solid var(--accent)}
 .clamp{max-height:120px;overflow:hidden;position:relative}
 .clamp::after{content:"";position:absolute;bottom:0;left:0;right:0;height:40px;
   background:linear-gradient(transparent,var(--panel))}
@@ -438,11 +606,10 @@ html[data-i18n-pending] [data-i18n]{visibility:hidden}
   #sidebar.open{transform:none}
   #backdrop.open{display:block;position:fixed;inset:0;z-index:35;
     background:rgba(0,0,0,.35)}
-  #sesshead{padding:12px 16px;min-height:0}
+  #pane{--railw:14px}
+  #sesshead{padding:12px calc(16px + var(--railw)) 12px 16px;min-height:0}
   #content{padding:14px 16px}
-  #chatbar{padding:10px 16px}
-  #rail{width:14px}
-  .mark{left:3px;width:8px}
+  #chatbar{padding:10px calc(16px + var(--railw)) 10px 16px}
 }
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
@@ -457,6 +624,9 @@ html[data-i18n-pending] [data-i18n]{visibility:hidden}
       <h2 data-i18n="nav.subagents">Sub Agents</h2>
       <span id="live" aria-live="polite"><span class="ldot"></span><span class="lt">connecting…</span></span>
     </div>
+    <!-- Passive aggregate: visible semantic text + a shared title/aria-label
+         sentence, deliberately no aria-live — it re-renders every poll. -->
+    <div class="week-total" id="weektotal"><span data-i18n="tokens.week_label">This week</span><span class="wt-val"></span></div>
     <div id="sesslist" role="listbox" aria-label="Sessions"
       data-i18n-aria-label="a11y.sessions"></div>
     <div class="side-foot">
@@ -494,30 +664,29 @@ html[data-i18n-pending] [data-i18n]{visibility:hidden}
         data-i18n="session.select">Select a session</div></div>
     </header>
     <div id="conv">
-      <nav id="rail" aria-label="Message positions"
-        data-i18n-aria-label="rail.label" hidden></nav>
       <div id="content"><div class="empty"
         data-i18n="session.select">Select a session</div></div>
+      <nav id="rail" aria-label="Message positions"
+        data-i18n-aria-label="rail.label" hidden></nav>
     </div>
     <div id="chatbar">
-      <textarea id="chatinput" rows="1" disabled
-        placeholder="Send an instruction… (Enter to send, Shift+Enter for newline)"
-        data-i18n-placeholder="chat.placeholder.default"
-        aria-label="Message the selected session"
-        data-i18n-aria-label="a11y.message_selected_session"></textarea>
-      <button id="chatsend" type="button" disabled aria-label="Send message"
-        data-i18n-aria-label="a11y.send_message" title="Send"
-        data-i18n-title="chat.send"><svg class="ic"
-        width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-        stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
-        focusable="false"><path d="M3 12h18m-9-9l9 9-9 9"/></svg></button>
-      <span id="chatstatus" aria-live="polite"></span>
+      <div class="chatinner">
+        <textarea id="chatinput" rows="1" disabled
+          placeholder="Send an instruction… (Enter to send, Shift+Enter for newline)"
+          data-i18n-placeholder="chat.placeholder.default"
+          aria-label="Message the selected session"
+          data-i18n-aria-label="a11y.message_selected_session"></textarea>
+        <button id="chatsend" type="button" disabled aria-label="Send message"
+          data-i18n-aria-label="a11y.send_message" title="Send"
+          data-i18n-title="chat.send"><svg class="ic"
+          width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
+          focusable="false"><path d="M3 12h18m-9-9l9 9-9 9"/></svg></button>
+        <span id="chatstatus" aria-live="polite"></span>
+      </div>
     </div>
   </div>
 </div>
-<button id="backtop" type="button"><svg class="ic" width="13" height="13" viewBox="0 0 24 24"
-  fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
-  stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="6 9 12 15 18 9"/></svg> <span data-i18n="nav.latest">latest</span></button>
 <script>
 "use strict";
 const $=s=>document.querySelector(s);
@@ -525,6 +694,7 @@ let sessions=[], tasks=[], selected=null;
 let offsets={};            // per-session byte offset for incremental reads
 let eventsCache={};        // per-session array of normalized events (for fast re-render)
 let liveUsage={};          // session_id -> latest consumed snapshot from "usage" events
+let liveAll={};            // session_id -> {task_id, consumed} batched in /api/overview
 let pollTimer=null, ovTimer=null;
 
 /* ---------- presence heartbeat (bridge pops us up only when no tab is open) ---------- */
@@ -558,10 +728,10 @@ const LOCALES=Object.freeze({
 "en":{
 "app.title":"Agent Bridge Dashboard",
 "nav.subagents":"Sub Agents",
-"nav.latest":"latest",
 "rail.label":"Message positions",
 "rail.agent_message":"Agent message",
 "rail.dispatched_message":"Dispatched message",
+"rail.turn_end":"Turn end",
 "rail.messages":"{n} messages",
 "a11y.sessions":"Sessions",
 "a11y.show_session_list":"Show session list",
@@ -655,15 +825,21 @@ const LOCALES=Object.freeze({
 "tokens.conversation":"conversation {n}",
 "tokens.live":"live",
 "tokens.estimate":"estimate",
-"tokens.unit":"tok"
+"tokens.unit":"tok",
+"tokens.week_label":"This week",
+"tokens.week_title":{"one":"Tokens since {date} · {n} task","other":"Tokens since {date} · {n} tasks"},
+"tokens.week_scope":"based on retained Agent Bridge task history",
+"tokens.week_approx":"includes estimated or incomplete history",
+"tokens.week_excluded":{"one":"{n} task excluded — no usable timestamp","other":"{n} tasks excluded — no usable timestamp"},
+"tokens.week_live":"includes live in-progress usage"
 },
 "zh-CN":{
 "app.title":"Agent Bridge 仪表板",
 "nav.subagents":"子 Agent",
-"nav.latest":"最新",
 "rail.label":"消息位置",
 "rail.agent_message":"Agent 消息",
 "rail.dispatched_message":"已派发消息",
+"rail.turn_end":"回合结束",
 "rail.messages":"{n} 条消息",
 "a11y.sessions":"会话",
 "a11y.show_session_list":"显示会话列表",
@@ -757,15 +933,21 @@ const LOCALES=Object.freeze({
 "tokens.conversation":"会话累计 {n}",
 "tokens.live":"实时",
 "tokens.estimate":"估算",
-"tokens.unit":"token"
+"tokens.unit":"token",
+"tokens.week_label":"本周",
+"tokens.week_title":{"other":"自 {date} 以来的 token · {n} 个任务"},
+"tokens.week_scope":"基于已保留的 Agent Bridge 任务历史",
+"tokens.week_approx":"包含估算或不完整历史",
+"tokens.week_excluded":{"other":"{n} 个任务已排除——无可用时间戳"},
+"tokens.week_live":"包含进行中的实时用量"
 },
 "zh-TW":{
 "app.title":"Agent Bridge 儀表板",
 "nav.subagents":"子 Agent",
-"nav.latest":"最新",
 "rail.label":"訊息位置",
 "rail.agent_message":"Agent 訊息",
 "rail.dispatched_message":"已派發訊息",
+"rail.turn_end":"回合結束",
 "rail.messages":"{n} 則訊息",
 "a11y.sessions":"工作階段",
 "a11y.show_session_list":"顯示工作階段清單",
@@ -859,7 +1041,13 @@ const LOCALES=Object.freeze({
 "tokens.conversation":"工作階段累計 {n}",
 "tokens.live":"即時",
 "tokens.estimate":"估算",
-"tokens.unit":"token"
+"tokens.unit":"token",
+"tokens.week_label":"本週",
+"tokens.week_title":{"other":"自 {date} 以來的 token · {n} 個任務"},
+"tokens.week_scope":"基於已保留的 Agent Bridge 任務歷史",
+"tokens.week_approx":"包含估算或不完整歷史",
+"tokens.week_excluded":{"other":"{n} 個任務已排除——無可用時間戳"},
+"tokens.week_live":"包含進行中的即時用量"
 }
 });
 const LOCALE_KEY="ab-locale";
@@ -1211,6 +1399,107 @@ function tickDurations(){
 }
 const baseName=p=>(p||"").split(/[\\/]/).filter(Boolean).pop()||"";
 
+/* ---------- weekly token total + batched live partials ----------
+   The browser-local calendar week runs Monday 00:00 to now; each unique
+   task attributes wholly to the week it started (started_at, falling back
+   to created_at). Local-civil Date construction keeps the boundary DST-
+   safe. Per-task precedence: a non-empty run_usage is authoritative (the
+   live partial is never added on top of it), then the pinned live partial
+   for a still-running task, then the legacy last-snapshot estimate.
+   Quality is independent of source: v===1+exact+non-partial is the only
+   unqualified count, for final rows AND live snapshots alike — an
+   unversioned/partial/estimate live partial from an older bridge still
+   counts and still flags "~"; a live contribution always adds the
+   in-progress note too. */
+function weekStartMs(now){
+  const n=now?new Date(now):new Date();
+  const s=new Date(n.getFullYear(),n.getMonth(),n.getDate());
+  s.setDate(s.getDate()-((n.getDay()+6)%7));
+  return s.getTime();
+}
+/* The overview's live partial is pinned to the task row it belongs to, so
+   stale or cross-run data can never land on a new task. The selected
+   session keeps preferring the fresher event-sourced liveUsage. */
+function livePartial(sid,tk){
+  if(sid===selected&&liveUsage[sid])return liveUsage[sid];
+  const l=liveAll[sid];
+  return tk&&l&&l.task_id===tk.task_id?l.consumed:null;
+}
+/* v===1 && quality==="exact" && !partial — the only snapshot proven to
+   post-date the double-count fix, whether it is a finished run_usage row
+   or a live partial from the batch. */
+const exactUsage=u=>!!u&&u.v===1&&u.quality==="exact"&&!u.partial;
+function weekContrib(tk){
+  const ru=tk.run_usage;
+  if(ru&&typeof ru==="object"&&Object.keys(ru).length){
+    const info=runTok(ru);
+    return{total:info&&Number.isFinite(info.total)?info.total:0,
+      live:false,approx:!exactUsage(ru)};
+  }
+  if(tk.status==="running"||tk.status==="queued"){
+    const l=livePartial(tk.session_id,tk);
+    const info=l&&runTok(l);
+    if(info&&Number.isFinite(info.total))
+      return{total:info.total,live:true,approx:!exactUsage(l)};
+  }
+  if(tk.usage&&typeof tk.usage==="object"){
+    const m=tokCount(tk.usage);
+    if(m!==null&&Number.isFinite(m))return{total:m,live:false,approx:true};
+  }
+  return{total:0,live:false,approx:false};
+}
+function weekStats(){
+  const wk=weekStartMs();
+  const byId=new Map();
+  for(const tk of tasks){
+    if(!tk||typeof tk!=="object")continue;
+    const id=tk.task_id==null?tk:String(tk.task_id);
+    const cur=byId.get(id);
+    const hasRU=o=>o.run_usage&&typeof o.run_usage==="object"&&
+      Object.keys(o.run_usage).length>0;
+    if(!cur||(!hasRU(cur)&&hasRU(tk)))byId.set(id,tk);
+  }
+  const out={total:0,n:0,excluded:0,approx:false,live:false,start:wk};
+  for(const tk of byId.values()){
+    let ts=Date.parse(tk.started_at);
+    if(!Number.isFinite(ts))ts=Date.parse(tk.created_at);
+    if(!Number.isFinite(ts)){out.excluded++;continue}
+    if(ts<wk)continue;
+    out.n++;
+    const c=weekContrib(tk);
+    if(c.total>0){
+      out.total+=c.total;
+      if(c.live)out.live=true;
+      if(c.approx)out.approx=true;
+    }
+  }
+  return out;
+}
+/* Recomputed on overview polls, live usage updates and locale re-renders —
+   pure recompute from tasks/liveUsage/liveAll, so a week rollover or a
+   timezone change self-corrects on the next poll with no extra timer. The
+   DOM writes are gated so stable polls never churn the node. */
+let lastWeekVal="",lastWeekTitle="";
+function renderWeek(){
+  const el=$("#weektotal");if(!el)return;
+  const valEl=el.querySelector(".wt-val");if(!valEl)return;
+  const w=weekStats();
+  const txt=(w.approx?"~":"")+fmtTok(w.total)+" "+t("tokens.unit");
+  if(txt!==lastWeekVal){lastWeekVal=txt;valEl.textContent=txt}
+  let dateStr="";
+  try{dateStr=new Date(w.start).toLocaleDateString(locale,
+    {weekday:"short",month:"short",day:"numeric"})}catch(e){
+    try{dateStr=new Date(w.start).toLocaleDateString()}catch(e2){}}
+  const parts=[t("tokens.week_title",{date:dateStr,n:w.n}),
+    t("tokens.week_scope")];          // retained-history scope is always stated
+  if(w.approx)parts.push(t("tokens.week_approx"));
+  if(w.live)parts.push(t("tokens.week_live"));
+  if(w.excluded)parts.push(t("tokens.week_excluded",{n:w.excluded}));
+  const title=parts.join(" · ");
+  if(title!==lastWeekTitle){lastWeekTitle=title;
+    el.title=title;el.setAttribute("aria-label",title)}
+}
+
 /* ---------- sidebar ---------- */
 let lastSidebarSig="";
 function renderSidebar(){
@@ -1223,7 +1512,8 @@ function renderSidebar(){
     return [s.session_id,s.proc_state,s.last_active_at,s.title,s.agent,s.cwd,
       tk?tk.task_id:"",tk?tk.status:"",tk?tk.message:"",tk?tk.started_at:"",
       tk?tk.finished_at:"",tk?tk.created_at:"",tk?JSON.stringify(tk.run_usage||tk.usage||0):"",
-      JSON.stringify(liveUsage[s.session_id]||0)].join(" ");
+      JSON.stringify(liveUsage[s.session_id]||0),
+      JSON.stringify(liveAll[s.session_id]||0)].join(" ");
   }).join("|");
   if(sig===lastSidebarSig)return;
   lastSidebarSig=sig;
@@ -1239,7 +1529,7 @@ function renderSidebar(){
       <span class="sicon">${agentAvatar(s,18)}</span>
       <span class="smeta">
         <span class="stitle">${esc(s.title||s.session_id)}</span>
-        <span class="sstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone)}</span><span${st.raw?` title="${esc(st.raw)}"`:""}>${esc(t(st.key))}</span>${durSpan(tk,"sdur")}${tokSpan(tk,"stok",liveUsage[s.session_id])}</span>
+        <span class="sstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone)}</span><span${st.raw?` title="${esc(st.raw)}"`:""}>${esc(t(st.key))}</span>${durSpan(tk,"sdur")}${tokSpan(tk,"stok",livePartial(s.session_id,tk))}</span>
         ${sub?`<span class="ssub">${esc(sub)}</span>`:""}
       </span>
     </button>`}).join("")||'<div class="empty" style="margin-top:40px">'+esc(t("empty.no_sessions"))+'</div>';
@@ -1271,7 +1561,7 @@ function renderSessionHeader(){
     <div class="hbody">
       <h2 class="htitle">${esc(s.title||s.session_id)}</h2>
       <div class="hsub">
-        <span class="hstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,13)}</span> <span${st.raw?` title="${esc(st.raw)}"`:""}>${esc(t(st.key))}</span>${durSpan(tk,"hdur")}${tokSpan(tk,"htok",liveUsage[s.session_id])}</span>
+        <span class="hstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,13)}</span> <span${st.raw?` title="${esc(st.raw)}"`:""}>${esc(t(st.key))}</span>${durSpan(tk,"hdur")}${tokSpan(tk,"htok",livePartial(s.session_id,tk))}</span>
         <span class="badge">${esc(s.agent)}</span>
         ${s.model?`<span class="badge">${esc(s.model)}</span>`:""}
         ${repo?`<span class="hsep">|</span><span class="hrepo" title="${esc(s.cwd||"")}">${esc(t("session.working_repo",{repo}))}</span>`:""}
@@ -1442,11 +1732,11 @@ function applyEvents(evs){
   for(const e of evs)(handlers[e.t]||(()=>{}))(e);
   flushBlocks();
   if(nearBottom)content.scrollTop=content.scrollHeight;
-  $("#backtop").style.display=nearBottom?"none":"flex";
 }
 
 /* ---------- conversation nav rail ----------
-   Codex-style proportional marks for rendered message cards. The mark list
+   Voyager-style timeline ruler: proportional graduation ticks on the rail
+   right of the scroller, one per rendered conversation beat. The mark list
    is re-derived from the live DOM on each rAF-coalesced layout pass, so
    incremental appends, chunked replay, transcript resets, pane
    stash/restore, fold toggles, prompt expansion and resizes all self-heal
@@ -1454,13 +1744,32 @@ function applyEvents(evs){
 const rail=$("#rail");
 /* Mark taxonomy — the single source of truth, applied by layoutRail via
    querySelectorAll and consumed verbatim by the tests and benchmark: Agent
-   message cards and MCP-dispatched prompt cards only. Dashboard-authored
-   "User Message" cards (.prompt.user), thinking folds, tool groups, turn and
-   error dividers, empty states and usage events never get a mark. */
-const MARK_SEL=".block.card.msg,.block.card.prompt:not(.user)";
+   message cards, MCP-dispatched prompt cards and successful turn ends.
+   Dashboard-authored "User Message" cards (.prompt.user), thinking folds,
+   tool groups, error dividers (.turnend.err — an error is not a turn end),
+   empty states and usage events never get a mark. */
+const MARK_SEL=".block.card.msg,.block.card.prompt:not(.user),.turnend:not(.err)";
 const MARK_GAP=6;                    // px: nearer marks merge into one cluster
+/* Kind is encoded by thickness only — every tick keeps the same fixed 14px
+   length: agent message 2px, dispatched message 3px, turn end 4px. A mixed
+   cluster wears its thickest member's weight. */
+const MARK_CLS=["k-msg","k-disp","k-turn"],MARK_H=[2,3,4];
+const MARK_LBL=["rail.agent_message","rail.dispatched_message","rail.turn_end"];
 let railQueued=false,railBtns=[],curIdx=-1;
 const rmo=matchMedia("(prefers-reduced-motion: reduce)");
+
+/* Tick position (--my) and wave emphasis (--mo) ride CSS custom properties
+   so hover/current overrides stay declarative. Probe once whether var()
+   resolves inside transform; where it cannot, the write paths below use
+   literal transform/opacity instead and the CSS state overrides degrade to
+   whatever the JS last wrote. */
+let markVars=false;
+try{
+  const p=document.createElement("button");
+  p.className="mark";p.style.setProperty("--my","7px");rail.appendChild(p);
+  const tr=window.getComputedStyle?getComputedStyle(p).transform:"";
+  markVars=!!tr&&tr!=="none";p.remove();
+}catch(e){}
 
 /* Groups sorted mark tops into clusters: each top joins the open cluster
    when it is within `gap` of the cluster's last member. A zero gap never
@@ -1480,6 +1789,13 @@ function scheduleRail(){
   requestAnimationFrame(()=>{railQueued=false;layoutRail()});
 }
 
+/* Mark thickness rank by card kind: agent message 0 (2px), dispatched
+   prompt 1 (3px), turn end 2 (4px). */
+function markRank(el){
+  return el.classList.contains("turnend")?2
+    :el.classList.contains("prompt")?1:0;
+}
+
 function layoutRail(){
   const els=[...content.querySelectorAll(MARK_SEL)];
   if(!selected||!els.length){
@@ -1490,7 +1806,7 @@ function layoutRail(){
   rail.hidden=false;
   const doc=content.scrollHeight,RH=rail.clientHeight;
   // Read phase: batch every offsetTop before the write phase below.
-  const ys=els.map(el=>Math.max(0,Math.min(RH-3,el.offsetTop/doc*RH))||0);
+  const ys=els.map(el=>Math.max(0,Math.min(RH,el.offsetTop/doc*RH))||0);
   const groups=clusterYs(ys,doc&&RH?MARK_GAP:0);
   while(railBtns.length>groups.length)railBtns.pop().remove();
   groups.forEach((g,i)=>{
@@ -1500,21 +1816,26 @@ function layoutRail(){
       b.onclick=e=>jumpToMark(b,e&&e.detail===0);
       rail.appendChild(b);railBtns.push(b)}
     b._els=g.idx.map(j=>els[j]);
-    /* A cluster pill covers its members' pixel span (a lone mark is 3px),
-       capped at 9px; clamping the anchor keeps the whole pill inside the
-       rail no matter how close to the bottom edge the cluster sits. */
-    const h=Math.max(0,Math.min(g.y1-g.y+3,9,RH));
-    const y=Math.max(0,Math.min(g.y,RH-h));
-    b.style.transform=`translateY(${y.toFixed(1)}px)`;
-    b.style.height=h+"px";
+    /* The tick centers on its first member's document fraction; clamping
+       the center keeps the whole tick inside the rail no matter how close
+       to an edge the anchor sits. */
+    let rank=0;g.idx.forEach(j=>{const r=markRank(els[j]);if(r>rank)rank=r});
+    b.className="mark "+MARK_CLS[rank];
+    const th=MARK_H[rank];
+    const c=Math.max(th/2,Math.min(g.y,RH-th/2));
+    b.style.setProperty("--my",c.toFixed(1)+"px");
+    if(!markVars)
+      b.style.transform=`translateY(${c.toFixed(1)}px) translateY(-50%)`;
     const first=b._els[0];
-    const kind=first.classList.contains("msg")?t("rail.agent_message"):t("rail.dispatched_message");
     const cts=(first.querySelector(".ctime")||{}).textContent||"";
-    const lbl=g.idx.length>1?`${t("rail.messages",{n:g.idx.length})} · ${cts}`:`${kind} · ${cts}`;
+    const lbl=g.idx.length>1
+      ?[t("rail.messages",{n:g.idx.length}),cts].filter(Boolean).join(" · ")
+      :[t(MARK_LBL[rank]),cts].filter(Boolean).join(" · ");
     b.setAttribute("aria-label",lbl);b.title=lbl;
   });
   curIdx=-2;                    // force the aria-current/tab-stop sync below
   updateCurMark();
+  updateRulerWave();
 }
 
 function jumpToMark(b,toCard){
@@ -1526,12 +1847,15 @@ function jumpToMark(b,toCard){
 }
 
 function updateCurMark(){
-  const y=content.scrollTop+8;let idx=-1;
+  /* Voyager's 0.45 reference: the current beat is the last mark whose card
+     top sits above 45% of the viewport — the same line the wave crests on,
+     so the accent mark always rides the crest. */
+  const y=content.scrollTop+content.clientHeight*.45;let idx=-1;
   for(let i=0;i<railBtns.length;i++){
     const el=railBtns[i]._els&&railBtns[i]._els[0];
     if(el&&el.isConnected&&el.offsetTop<=y)idx=i;else break;   // tops are monotonic
   }
-  /* Nothing above the fold yet (the first card sits below the +8 probe):
+  /* Nothing above the reference line yet (the first card sits below it):
      the first mark is current — the same rest position the tab stop uses. */
   if(idx<0&&railBtns.length)idx=0;
   if(idx===curIdx)return;
@@ -1544,6 +1868,33 @@ function updateCurMark(){
     b.classList.toggle("cur",i===idx);
     if(i===idx)b.setAttribute("aria-current","true");else b.removeAttribute("aria-current");
     b.tabIndex=i===tab?0:-1;
+  });
+}
+
+/* The Voyager focus wave: a Gaussian crest of brightened ticks tracks the
+   0.45 viewport reference while scrolling. Opacity is the only channel —
+   every tick keeps its fixed length and rail position, so the effect is
+   pure compositor work with zero layout thrash. */
+const WAVE_SIGMA=1.2;
+function updateRulerWave(){
+  const n=railBtns.length;if(!n)return;
+  // Fractional index: interpolate inside the bracketing mark anchors.
+  const tops=[];let last=0;
+  for(const b of railBtns){const el=b._els&&b._els[0];
+    last=el&&el.isConnected?el.offsetTop:last;tops.push(last)}
+  const focus=content.scrollTop+content.clientHeight*.45;
+  let fi=0;
+  if(focus>=tops[n-1])fi=n-1;
+  else if(focus>tops[0]){
+    let lo=0,hi=n-1;
+    while(hi-lo>1){const m=(lo+hi)>>1;if(tops[m]<=focus)lo=m;else hi=m}
+    fi=lo+(focus-tops[lo])/Math.max(1,tops[hi]-tops[lo]);
+  }
+  railBtns.forEach((b,i)=>{
+    const d=i-fi,crest=Math.exp(-d*d/(2*WAVE_SIGMA*WAVE_SIGMA));
+    const mo=(i===curIdx?1:.42+.50*crest).toFixed(3);
+    b.style.setProperty("--mo",mo);
+    if(!markVars)b.style.opacity=mo;
   });
 }
 
@@ -1574,6 +1925,11 @@ rail.addEventListener("click",e=>{
   if(content.scrollTo)content.scrollTo({top,behavior:rmo.matches?"auto":"smooth"});
   else content.scrollTop=top;
 });
+/* Wheeling over the rail scrolls the conversation (Voyager parity). */
+rail.addEventListener("wheel",e=>{
+  if(!e.deltaY)return;
+  content.scrollTop+=e.deltaY;e.preventDefault();
+},{passive:false});
 
 /* Any DOM/geometry change re-derives the marks next frame. Feature-detected:
    without them the rail simply shows the marks computed at select() time. */
@@ -1605,7 +1961,6 @@ async function replay(id,gen,pin){
     rendered[id]=i;
     flushBlocks();
     if(nb)content.scrollTop=content.scrollHeight;
-    $("#backtop").style.display=nb?"none":"flex";
     await new Promise(r=>requestAnimationFrame(r));
   }
 }
@@ -1668,7 +2023,7 @@ async function pollEvents(){
         if(liveUsage[id]){delete liveUsage[id];usageDirty=true}
       }
     }
-    if(usageDirty){renderSidebar();renderSessionHeader()}
+    if(usageDirty){renderSidebar();renderSessionHeader();renderWeek()}
     touchCache(id);
     if(j.reset){                      // transcript rotated: that session's pane/replay
       dropPane(id);                   // are invalid — other sessions' replays are not
@@ -1708,11 +2063,14 @@ async function pollOverview(){
   try{
     const r=await fetch("/api/overview");if(!r.ok)return;
     const j=await r.json();sessions=j.sessions;tasks=j.tasks;
+    // Wholesale replace: the server prunes finished sessions, so stale
+    // partials vanish on the next poll without client-side cleanup.
+    liveAll=j.live||{};
     const known=new Set(sessions.map(s=>s.session_id));
     for(const id of new Set([...Object.keys(eventsCache),...Object.keys(panes),
         ...Object.keys(offsets),...Object.keys(rendered)]))
       if(!known.has(id)&&id!==selected)dropCache(id);
-    renderSidebar();renderSessionHeader();
+    renderSidebar();renderSessionHeader();renderWeek();
     setLive(true);
     if(!selected&&sessions.length)select(sessions.find(s=>s.proc_state==="busy")?.session_id||sessions[0].session_id);
   }catch(e){setLive(false)}
@@ -1892,6 +2250,7 @@ function rerenderLocale(){
   if(refocus)$("#chatinput").focus();
   lastSidebarSig="";                 // labels are baked into the sidebar DOM
   renderSidebar();renderSessionHeader();renderLive();refreshComposer();
+  renderWeek();
   scheduleRail();
 }
 function applyLocale(){
@@ -1936,7 +2295,6 @@ function select(id){
       curMsg=p.curMsg;curThink=p.curThink;curToolGroup=p.curToolGroup;tools=p.tools;
       lastPromptTs=p.lastPromptTs||null;
       content.scrollTop=content.scrollHeight;
-      $("#backtop").style.display="none";
     }else{
       closeBlocks();tools={};lastPromptTs=null;rendered[id]=0;
       if(eventsCache[id]&&eventsCache[id].length){
@@ -1954,12 +2312,7 @@ function select(id){
   scheduleRail();
 }
 
-$("#backtop").onclick=()=>{content.scrollTop=content.scrollHeight};
-content.addEventListener("scroll",()=>{
-  const nb=content.scrollHeight-content.scrollTop-content.clientHeight<120;
-  $("#backtop").style.display=nb?"none":"flex";
-  updateCurMark();
-});
+content.addEventListener("scroll",()=>{updateCurMark();updateRulerWave()});
 
 pollOverview();
 ovTimer=setInterval(pollOverview,3000);
@@ -2035,6 +2388,10 @@ class Handler(BaseHTTPRequestHandler):
                         }
                         for t in state.get("tasks", [])
                     ],
+                    # One batched lookup for every running task's live usage —
+                    # the sidebar reads per-agent counters from here instead
+                    # of issuing per-session transcript requests.
+                    "live": live_usage_map(state.get("tasks", [])),
                 }
             )
             return

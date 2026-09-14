@@ -52,6 +52,46 @@ def test_many_chunks_are_written_in_batches(bridge_home, monkeypatch):
     assert sum(text.count("\n") for text in writes) == 10_001
 
 
+def test_usage_events_flush_immediately(bridge_home):
+    """The dashboard's live token counters read the flushed file — a usage
+    snapshot must hit disk on append, not at the 30s buffer age, while
+    normal events keep batching."""
+    path = transcript_path("sess_usage_flush", bridge_home)
+    append_event("sess_usage_flush", "message_chunk", {"text": "pending"}, bridge_home)
+    assert not path.exists()  # ordinary events stay buffered
+    append_event(
+        "sess_usage_flush",
+        "usage",
+        {"update_type": "UsageUpdate", "consumed": {"total": 12}},
+        bridge_home,
+    )
+    assert path.is_file()
+    lines = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    # The pending chunk rides the same flush; both records are on disk.
+    assert [e["type"] for e in lines] == ["message_chunk", "usage"]
+    append_event(
+        "sess_usage_flush",
+        "usage",
+        {"update_type": "UsageUpdate", "consumed": {"total": 30}},
+        bridge_home,
+    )
+    lines = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert sum(1 for e in lines if e["type"] == "usage") == 2
+    # A later ordinary event buffers again until a terminal/age/byte trigger.
+    append_event("sess_usage_flush", "message_chunk", {"text": "after"}, bridge_home)
+    assert "after" not in path.read_text(encoding="utf-8")
+    append_event("sess_usage_flush", "turn_end", {}, bridge_home)
+    assert "after" in path.read_text(encoding="utf-8")
+
+
 def test_append_and_page(bridge_home):
     for index in range(20):
         append_event("sess_a", "message_chunk", {"text": f"chunk-{index:02d}" * 40}, bridge_home)

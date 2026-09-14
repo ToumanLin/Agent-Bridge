@@ -51,6 +51,12 @@ COUNTER_KEYS = ("input", "cached_read", "cached_write", "output", "total")
 _CONTEXT_KEYS = ("used", "size")
 _COST_KEYS = ("credit_cost", "acu_cost")
 
+# Schema version stamped on every canonical run_usage producer below. Rows
+# written before this marker have no way to prove they post-date the
+# double-counting fix, so consumers (the dashboard's weekly total) must
+# treat unversioned rows as unverifiable estimates.
+RUN_USAGE_VERSION = 1
+
 _PICKS: dict[str, tuple[str, ...]] = {
     "input": ("input", "input_tokens", "inputTokens", "cognition.ai/inputTokens"),
     "cached_read": (
@@ -308,7 +314,11 @@ class RunUsage:
 
     def snapshot(self) -> dict[str, Any]:
         """Live partial: stream counters so far plus context metadata."""
-        out: dict[str, Any] = {"scope": "run", "quality": "exact"}
+        out: dict[str, Any] = {
+            "scope": "run",
+            "quality": "exact",
+            "v": RUN_USAGE_VERSION,
+        }
         for key, value in self._stream_consumed().items():
             if value:
                 out[key] = _intish(value)
@@ -439,6 +449,7 @@ class DeltaUsage:
         out: dict[str, Any] = {
             "scope": "run",
             "quality": "estimate" if self.unbased else "exact",
+            "v": RUN_USAGE_VERSION,
         }
         for key, value in self.consumed.items():
             if value:
@@ -463,7 +474,7 @@ def run_usage_from_total(raw: Any) -> dict[str, Any]:
     """run_usage for providers that emit one authoritative per-run total
     (Codex ``turn.completed.usage``)."""
     norm = normalize_usage(raw)
-    out: dict[str, Any] = {"scope": "run", "quality": "exact"}
+    out: dict[str, Any] = {"scope": "run", "quality": "exact", "v": RUN_USAGE_VERSION}
     for key in (*COUNTER_KEYS, *_CONTEXT_KEYS, *_COST_KEYS):
         if key in norm:
             out[key] = norm[key]

@@ -5,10 +5,11 @@
 // PAGE and runs it inside a vm context with a minimal DOM stub — no jsdom, no
 // npm packages. Covers the centralized proc_state map, latestTask chronology,
 // the taskDur/fmtDur/durText rules end to end, the bundled i18n layer
-// (en / zh-CN / zh-TW), and the nav rail end to end: MARK_SEL taxonomy,
-// layoutRail geometry (cluster spans, rail bounds), updateCurMark, jumpToMark,
-// track-click seeking, roving tabindex, and the MutationObserver/ResizeObserver
-// + rAF-coalesced update loop.
+// (en / zh-CN / zh-TW), and the timeline ruler end to end: MARK_SEL taxonomy,
+// layoutRail geometry (fixed-length ticks, kind thickness, rail bounds),
+// updateCurMark's 0.45 reference, the updateRulerWave focus crest,
+// jumpToMark, track-click seeking, wheel forwarding, roving tabindex, and
+// the MutationObserver/ResizeObserver + rAF-coalesced update loop.
 //
 // Usage: node tests/dashboard_status_behavior.js   (exit 0 = all pass)
 "use strict";
@@ -44,7 +45,17 @@ const el = () => {
   let cn = "", html = "";
   const sync = () => { cn = [...classes].join(" "); };
   const e = {
-    textContent: "", style: {}, title: "", type: "", tagName: "",
+    textContent: "", title: "", type: "", tagName: "",
+    // Inline style + the CSS-custom-property surface the rail writes
+    // (--my/--mo) — recorded verbatim so tests can read either channel.
+    style: {
+      setProperty(k, v) { this[k] = String(v); },
+      getPropertyValue(k) {
+        return Object.prototype.hasOwnProperty.call(this, k)
+          ? String(this[k]) : "";
+      },
+      removeProperty(k) { delete this[k]; },
+    },
     classList: {
       add: (c) => { classes.add(c); sync(); },
       remove: (c) => { classes.delete(c); sync(); },
@@ -57,7 +68,7 @@ const el = () => {
     },
     dataset: {}, disabled: false, value: "", placeholder: "", tabIndex: 0,
     open: false, hidden: false, isConnected: true, offsetTop: 0,
-    children: [], _parent: null,
+    children: [], _parent: null, _htmlSets: 0,
     scrollTop: 0, scrollHeight: 0, clientHeight: 0,
     attrs: {}, _q: {}, _ls: {}, focused: 0, onclick: null,
     appendChild(c) {
@@ -105,6 +116,7 @@ const el = () => {
   Object.defineProperty(e, "innerHTML", {
     get: () => html,
     set: (v) => {
+      e._htmlSets++;
       html = String(v);
       e.children.forEach((c) => { c._parent = null; }); e.children = [];
     },
@@ -184,15 +196,20 @@ vm.runInContext(
     " usageNums, tokCount, runTok, tokTitle, fmtTok, tokSpan, turnDurMs," +
     " addTurn, addPrompt, addTool, addToolStatus, clusterYs, applyEvents," +
     " MARK_SEL, MARK_GAP," +
-    " scheduleRail, layoutRail, jumpToMark, updateCurMark," +
+    " scheduleRail, layoutRail, jumpToMark, updateCurMark, updateRulerWave," +
     " t, LOCALES, LOCALE_PREFS, localePref, resolveSystemLocale," +
     " setLocalePref, applyLocale, rerenderLocale, ago, fmtTs, fmtNum," +
     " sendKey, sendErrState, SEND_ERR, setSendState, renderSendStatus," +
     " refreshComposer, toolKindLabel, stopReasonLabel, renderLive," +
     " thinkLabel," +
+    " weekStartMs, weekContrib, weekStats, renderWeek, livePartial," +
+    " renderSidebar, renderSessionHeader," +
     " select, pollEvents, sendState," +
     " _setTasks: (v) => { tasks = v; }," +
     " _setSessions: (v) => { sessions = v; }," +
+    " _setLiveAll: (v) => { liveAll = v; }," +
+    " _setLiveUsage: (v) => { liveUsage = v; }," +
+    " _liveAll: () => liveAll, _liveUsage: () => liveUsage," +
     " _cache: () => eventsCache, _polled: () => polled," +
     " _panes: () => panes, _rendered: () => rendered," +
     " _railBtns: () => railBtns, _setSelected: (v) => { selected = v; }," +
@@ -503,11 +520,24 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
 
   /* ================= nav rail: marks, geometry, interaction =================
      contentEl/railEl carry real children, offsetTop values and scroll
-     metrics, so layoutRail/updateCurMark/jumpToMark and the rail's own
-     listeners run unmodified inside the vm. */
-  const yOf = (b) =>
-    parseFloat(b.style.transform.match(/translateY\(([-\d.]+)/)[1]);
-  const hOf = (b) => parseFloat(b.style.height);
+     metrics, so layoutRail/updateCurMark/updateRulerWave/jumpToMark and the
+     rail's own listeners run unmodified inside the vm. */
+  // Tick center: the --my custom property is always written; the literal
+  // transform is the no-CSS-var fallback path's channel.
+  const yOf = (b) => {
+    const v = parseFloat(b.style.getPropertyValue("--my"));
+    return Number.isFinite(v) ? v
+      : parseFloat(b.style.transform.match(/translateY\(([-\d.]+)/)[1]);
+  };
+  // Thickness encodes kind only: agent message 2px, dispatched 3px, turn
+  // end 4px — asserted via the k-* classes, never via inline height.
+  const thOf = (b) => b.classList.contains("k-turn") ? 4
+    : b.classList.contains("k-disp") ? 3 : 2;
+  // Wave emphasis: --mo is always written; literal opacity is the fallback.
+  const moOf = (b) => {
+    const v = parseFloat(b.style.getPropertyValue("--mo"));
+    return Number.isFinite(v) ? v : parseFloat(b.style.opacity);
+  };
   const fire = (t, ev, arg) => (t._ls[ev] || []).forEach((f) => f(arg));
   const cardAt = (cls, top) => {
     const c = el(); c.className = cls; c.offsetTop = top; return c;
@@ -521,11 +551,12 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
     return X._railBtns();
   };
 
-  // --- taxonomy: normalized events -> DOM -> marks. Only agent message
-  //     cards and MCP-dispatched prompt cards are marked; dashboard-authored
-  //     "User Message" cards, thinking folds, tool groups, turn/error
-  //     dividers, empty states and usage-only events never get one. ---
-  eq(X.MARK_SEL, ".block.card.msg,.block.card.prompt:not(.user)",
+  // --- taxonomy: normalized events -> DOM -> marks. Agent message cards,
+  //     MCP-dispatched prompt cards and successful turn ends are marked;
+  //     dashboard-authored "User Message" cards, thinking folds, tool
+  //     groups, error dividers, empty states and usage-only events never
+  //     get one. ---
+  eq(X.MARK_SEL, ".block.card.msg,.block.card.prompt:not(.user),.turnend:not(.err)",
     "MARK_SEL is the pinned taxonomy selector");
   eq(X.MARK_GAP, 6, "cluster gap is 6px");
   X._setSelected("rail-sess");
@@ -554,19 +585,30 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   railEl.clientHeight = 100;
   X.layoutRail();
   let bs = X._railBtns();
-  eq(bs.length, 2, "marks = dispatched prompt + agent message only");
+  eq(bs.length, 3, "marks = dispatched prompt + agent message + turn end");
   eq(bs[0]._els[0], contentEl.children[0], "mark 0 -> dispatched prompt card");
   eq(bs[1]._els[0], contentEl.children[2], "mark 1 -> agent message card");
+  eq(bs[2]._els[0], contentEl.children[5], "mark 2 -> turn-end divider");
   eq(railEl.hidden, false, "rail shown when markable cards exist");
   eq(bs[0].attrs["aria-label"].includes("Dispatched message"), true,
     "dispatched prompt mark gets the localized kind label");
   eq(bs[1].attrs["aria-label"].includes("Agent message"), true,
     "agent mark gets the localized kind label");
+  eq(bs[2].attrs["aria-label"].includes("Turn end"), true,
+    "turn-end mark gets the localized kind label");
   eq(bs[0].title, bs[0].attrs["aria-label"], "title mirrors the aria-label");
-  // Document-fraction positions: offsetTop / scrollHeight * railHeight.
+  // Fixed-length ticks; kind shows as thickness only (2/3/4px classes).
+  eq(bs[0].classList.contains("k-disp"), true, "dispatched mark is k-disp");
+  eq(bs[1].classList.contains("k-msg"), true, "agent mark is k-msg");
+  eq(bs[2].classList.contains("k-turn"), true, "turn-end mark is k-turn");
+  eq(thOf(bs[0]), 3, "dispatched tick is 3px thick");
+  eq(thOf(bs[1]), 2, "agent tick is 2px thick");
+  eq(thOf(bs[2]), 4, "turn-end tick is 4px thick");
+  // Document-fraction positions: offsetTop / scrollHeight * railHeight —
+  // --my is the tick CENTER (the tick self-centers via translateY(-50%)).
   eq(yOf(bs[0]), 2.5, "mark y is the card's document fraction (20/800*100)");
   eq(yOf(bs[1]), 32.5, "mark y is the card's document fraction (260/800*100)");
-  eq(hOf(bs[0]), 3, "a lone mark is 3px tall");
+  eq(yOf(bs[2]), 77.5, "turn-end y is its document fraction (620/800*100)");
 
   // --- a sensible current mark exists at scrollTop = 0 ---
   contentEl.scrollTop = 0;
@@ -577,31 +619,59 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   eq(bs[0].tabIndex, 0, "first mark is the rail's tab stop at rest");
   eq(bs[1].tabIndex, -1, "other marks leave the tab order at rest");
 
-  // --- the scroll hook tracks the top-of-viewport card ---
-  contentEl.scrollTop = 300;          // probe y=308: card tops 20,260 pass
+  // --- the scroll hook tracks the 0.45-viewport reference line ---
+  contentEl.scrollTop = 300;          // probe y=480: card tops 20,260 pass
   fire(contentEl, "scroll");
   eq(bs[1].classList.contains("cur"), true, "scrolling moves current to mark 1");
   eq(bs[0].attrs["aria-current"], undefined, "aria-current leaves mark 0");
   eq(bs[1].attrs["aria-current"], "true", "aria-current lands on mark 1");
 
-  // --- cluster pills: height covers the member span, never overflow ---
+  // --- the focus wave: a Gaussian crest of opacity tracks the 0.45 line ---
+  // focus=480 -> fractional index 1.61: mark 1 is current (forced to 1) and
+  // mark 2 sits nearer the crest than mark 0.
+  eq(moOf(bs[1]), 1, "current mark rides the crest at full opacity");
+  eq(moOf(bs[0]) < moOf(bs[2]) && moOf(bs[2]) < moOf(bs[1]), true,
+    "opacity falls off with distance from the focus line");
+  // Scrolling moves the crest: at scrollTop=0 focus=180 brackets anchors
+  // 20/260, so mark 0 is the hot tick (and the current one -> forced to 1).
+  contentEl.scrollTop = 0;
+  fire(contentEl, "scroll");
+  eq(moOf(bs[0]), 1, "crest back on mark 0 at rest (current mark)");
+  eq(moOf(bs[0]) > moOf(bs[1]) && moOf(bs[1]) > moOf(bs[2]), true,
+    "opacity decays with distance from the focus line");
+  // Every tick keeps its fixed length — no inline width, no scale transform.
+  bs.forEach((b, i) => {
+    eq(b.style.width, undefined, `tick ${i} length never set inline`);
+    eq(/scale/.test(b.style.transform || ""), false,
+      `tick ${i} never scaled`);
+  });
+
+  // --- cluster ticks: anchored at the first member, thickest member's
+  //     weight, never painting outside the rail ---
   bs = railScene([["block card msg", 100], ["block card msg", 400],
     ["block card msg", 430]], 1000, 100);
   eq(bs.length, 2, "3px-apart marks cluster, the 30px one stays single");
   eq(yOf(bs[1]), 40, "cluster anchored at its first member");
-  eq(hOf(bs[1]), 6, "cluster pill covers member span + 3");
-  // A cluster that ends exactly at the rail's bottom edge must not paint past
-  // it: anchor clamps to RH - height instead of hanging over the chatbar.
+  eq(thOf(bs[1]), 2, "all-message cluster keeps the 2px tick");
+  // A mixed cluster wears its thickest member's weight.
   bs = railScene([["block card msg", 100], ["block card msg", 980],
     ["block card msg", 985], ["block card prompt", 990],
     ["block card msg", 995]], 1000, 100);
   eq(bs.length, 2, "four close marks merge into one bottom cluster");
+  eq(bs[1].classList.contains("k-disp"), true,
+    "mixed cluster takes the dispatched member's 3px weight");
   bs.forEach((b, i) => eq(
-    yOf(b) >= 0 && yOf(b) + hOf(b) <= railEl.clientHeight, true,
-    `pill ${i} fully inside rail bounds`));
-  eq(yOf(bs[1]) + hOf(bs[1]), 100,
-    "bottom cluster lands exactly on the rail's bottom edge");
+    yOf(b) - thOf(b) / 2 >= 0 &&
+      yOf(b) + thOf(b) / 2 <= railEl.clientHeight, true,
+    `tick ${i} fully inside rail bounds`));
+  // A turn-end cluster flush with the bottom edge lands exactly on it.
+  bs = railScene([["block card msg", 100], ["turnend", 995]], 1000, 100);
+  eq(yOf(bs[1]) + thOf(bs[1]) / 2, 100,
+    "bottom turn-end tick lands exactly on the rail's bottom edge");
   // Cluster label: localized count + the first member's timestamp.
+  bs = railScene([["block card msg", 100], ["block card msg", 980],
+    ["block card msg", 985], ["block card prompt", 990],
+    ["block card msg", 995]], 1000, 100);
   contentEl.children[1].querySelector(".ctime").textContent = "10:00";
   X.layoutRail();
   eq(bs[1].attrs["aria-label"], "4 messages · 10:00",
@@ -669,6 +739,18 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   fire(railEl, "click", { target: bs[0], offsetY: 50 });
   eq(contentEl._scrollToArgs.top, lastTop,
     "mark clicks are not double-handled by the track listener");
+
+  // --- wheel over the rail scrolls the conversation (Voyager parity) ---
+  const st0 = contentEl.scrollTop;
+  let pd2 = 0;
+  fire(railEl, "wheel", { deltaY: 140, preventDefault: () => pd2++ });
+  eq(contentEl.scrollTop, st0 + 140, "wheel delta forwards to #content");
+  eq(pd2, 1, "wheel default is prevented");
+  fire(railEl, "wheel", { deltaY: -60, preventDefault: () => pd2++ });
+  eq(contentEl.scrollTop, st0 + 80, "wheel up scrolls back");
+  fire(railEl, "wheel", { deltaY: 0, preventDefault: () => pd2++ });
+  eq(contentEl.scrollTop, st0 + 80, "zero delta is a no-op");
+  eq(pd2, 2, "zero delta does not preventDefault");
 
   // --- live updates: observers schedule one rAF-coalesced layout pass ---
   eq(moCalls.length, 1, "a single MutationObserver is registered");
@@ -1066,7 +1148,233 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   X._polled().s2 = false;
   eq(true, true, "polled flag is test-controllable");
 
-  /* ================= presence heartbeat lifecycle ================= */
+  /* ================= weekly total + batched live usage ================= */
+
+// --- weekStartMs: browser-local calendar Monday 00:00 boundary ---
+{
+  // Jan 4 2026 is a Sunday — getDay()==0 must map back six days to Mon Dec 29.
+  const sunday = new Date(2026, 0, 4, 15, 0);
+  eq(X.weekStartMs(sunday), new Date(2025, 11, 29).getTime(),
+    "Sunday maps back to the preceding Monday");
+  // A Wednesday afternoon maps to the same week's Monday local midnight.
+  eq(X.weekStartMs(new Date(2026, 0, 7, 15, 30)),
+    new Date(2026, 0, 5).getTime(), "mid-week maps to Monday midnight");
+  // Monday itself is already the boundary.
+  eq(X.weekStartMs(new Date(2026, 0, 5, 9, 15)),
+    new Date(2026, 0, 5).getTime(), "Monday is the boundary");
+  const ws = new Date(X.weekStartMs());
+  eq(ws.getDay(), 1, "week start is always a Monday");
+  eq(ws.getHours() === 0 && ws.getMinutes() === 0 && ws.getSeconds() === 0,
+    true, "week start is local civil midnight");
+  // Mar 9 2026 is the Monday after US DST springs forward — local-civil Date
+  // construction stays on a real local midnight in DST zones, and in zones
+  // without DST the arithmetic is identical anyway.
+  eq(X.weekStartMs(new Date(2026, 2, 11, 12)), new Date(2026, 2, 9).getTime(),
+    "DST-adjacent week start stays local-civil");
+}
+
+// --- livePartial: task_id pin + selected-session precedence ---
+X._setSelected("s1");
+X._setLiveUsage({ s1: { input: 5, output: 5, total: 10 } });
+X._setLiveAll({ s1: { task_id: "t1", consumed: { input: 8, output: 8, total: 16 } } });
+eq(X.livePartial("s1", task({ task_id: "t1", status: "running" })).total, 10,
+  "selected session prefers the event-sourced liveUsage");
+X._setLiveUsage({});
+eq(X.livePartial("s1", task({ task_id: "t1", status: "running" })).total, 16,
+  "liveAll partial fills in when no event-sourced value exists");
+eq(X.livePartial("s1", task({ task_id: "t2", status: "running" })), null,
+  "liveAll is pinned to task_id — a stale partial never attaches to a new task");
+X._setLiveUsage({ s1: { input: 5, output: 5, total: 10 } });
+X._setSelected("s2");
+eq(X.livePartial("s1", task({ task_id: "t1", status: "running" })).total, 16,
+  "a non-selected session uses the pinned batch, not stale liveUsage");
+X._setSelected("s1");
+X._setLiveUsage({});
+
+// --- weekContrib precedence: run_usage > live > legacy ---
+const inWeek = (over) => task(Object.assign({
+  task_id: "w" + Math.random().toString(36).slice(2, 8),
+  session_id: "s1", status: "completed",
+  started_at: new Date(Date.now() - 3600e3).toISOString(),
+  created_at: new Date(Date.now() - 3700e3).toISOString(),
+  finished_at: new Date(Date.now() - 3500e3).toISOString() }, over));
+{
+  let c = X.weekContrib(inWeek({ status: "running", finished_at: null,
+    run_usage: { v: 1, scope: "run", quality: "exact", input: 60, output: 12, total: 72 },
+    usage: { total_tokens: 9999 } }));
+  eq(c.total, 72, "run_usage wins over live partial and legacy snapshot");
+  eq(c.approx, false, "v1 exact run_usage counts without qualification");
+  eq(c.live, false, "a final row is not a live contribution");
+  X._setLiveAll({ s1: { task_id: "t1", consumed: { v: 1, scope: "run",
+    quality: "exact", input: 8, output: 8, total: 16 } } });
+  c = X.weekContrib(inWeek({ task_id: "t1", status: "running", finished_at: null,
+    usage: { total_tokens: 400 } }));
+  eq(c.total, 16, "running task falls back to the pinned live partial");
+  eq(c.live, true, "live contribution flag");
+  eq(c.approx, false, "v1 exact live partial is live+exact — no ~");
+  // Unverified live: an older still-running bridge emits snapshots without
+  // the v:1 stamp — they still count, and they force the estimate mark.
+  X._setLiveAll({ s1: { task_id: "t1", consumed: { scope: "run",
+    quality: "exact", input: 8, output: 8, total: 16 } } });
+  c = X.weekContrib(inWeek({ task_id: "t1", status: "running", finished_at: null }));
+  eq(c.live, true, "unversioned live still counts as live");
+  eq(c.approx, true, "unversioned live partial is live+approx — forces ~");
+  X._setLiveAll({ s1: { task_id: "t1", consumed: { v: 1, scope: "run",
+    quality: "estimate", input: 8, output: 8, total: 16 } } });
+  c = X.weekContrib(inWeek({ task_id: "t1", status: "running", finished_at: null }));
+  eq(c.live === true && c.approx === true, true,
+    "estimate-quality live is live+approx");
+  X._setLiveAll({ s1: { task_id: "t1", consumed: { v: 1, scope: "run",
+    quality: "exact", partial: true, input: 8, output: 8, total: 16 } } });
+  c = X.weekContrib(inWeek({ task_id: "t1", status: "running", finished_at: null }));
+  eq(c.live === true && c.approx === true, true,
+    "partial live snapshot is live+approx");
+  X._setLiveAll({});
+  c = X.weekContrib(inWeek({ usage: { input_tokens: 108414,
+    cached_input_tokens: 108072, output_tokens: 4763 } }));
+  eq(c.total, 5105, "legacy snapshot contributes the derived count");
+  eq(c.approx, true, "legacy rows are estimates");
+  c = X.weekContrib(inWeek({ run_usage: { scope: "run", quality: "exact",
+    input: 30, output: 10, total: 40 } }));
+  eq(c.approx, true, "unversioned run_usage is unverifiable");
+  c = X.weekContrib(inWeek({ run_usage: { v: 1, scope: "run", quality: "estimate",
+    input: 30, output: 10, total: 40 } }));
+  eq(c.approx, true, "v1 estimate quality is an estimate");
+  c = X.weekContrib(inWeek({ run_usage: { v: 1, scope: "run", quality: "exact",
+    partial: true, input: 30, output: 10, total: 40 } }));
+  eq(c.approx, true, "recovered partial rows are estimates");
+}
+
+// --- weekStats: window, dedupe, exclusion, ~ flag ---
+X._setLiveAll({ s1: { task_id: "t1", consumed: { input: 8, output: 8, total: 16 } } });
+X._setTasks([
+  inWeek({ task_id: "old", started_at: new Date(X.weekStartMs() - 86400000).toISOString(),
+    run_usage: { v: 1, scope: "run", quality: "exact", total: 500 } }),
+  inWeek({ task_id: "t1", status: "running", finished_at: null }),
+  inWeek({ task_id: "t2", run_usage: { v: 1, scope: "run", quality: "exact",
+    input: 60, output: 12, total: 72 } }),
+  inWeek({ task_id: "t3", run_usage: { scope: "run", quality: "exact",
+    input: 30, output: 10, total: 40 } }),
+  inWeek({ task_id: "t4", started_at: "garbage", created_at: "also-bad",
+    run_usage: { v: 1, scope: "run", quality: "exact", total: 999 } }),
+  inWeek({ task_id: "t5", run_usage: { v: 1, scope: "run", quality: "exact",
+    total: 10 } }),
+]);
+let w = X.weekStats();
+eq(w.n, 4, "unique in-window tasks counted (resumed tasks stay separate)");
+eq(w.excluded, 1, "both timestamps invalid -> excluded count");
+eq(w.total, 138, "72 + 40 + live 16 + 10 — live counted once");
+eq(w.approx, true, "unversioned run_usage forces the ~ mark");
+eq(w.live, true, "live partial flagged for the tooltip note");
+
+// live -> final swap: the running contribution is replaced, never summed.
+X._setTasks([inWeek({ task_id: "t1", status: "running", finished_at: null })]);
+w = X.weekStats();
+eq(w.total, 16, "live partial contributes while the task runs");
+X._setTasks([inWeek({ task_id: "t1", run_usage: { v: 1, scope: "run",
+  quality: "exact", total: 20 } })]);
+w = X.weekStats();
+eq(w.total, 20, "finished run_usage replaces the partial — never added on top");
+eq(w.approx, false, "exact-only week does not force ~");
+
+// Timestamp fallback: invalid started_at falls back to created_at.
+X._setTasks([inWeek({ task_id: "t6", started_at: "not-a-date",
+  created_at: new Date().toISOString(),
+  run_usage: { v: 1, scope: "run", quality: "exact", total: 3 } })]);
+eq(X.weekStats().total, 3, "created_at fallback attributes the task");
+X._setTasks([inWeek({ task_id: "t7", started_at: "not-a-date",
+  created_at: new Date(X.weekStartMs() - 1000).toISOString(),
+  run_usage: { v: 1, scope: "run", quality: "exact", total: 3 } })]);
+eq(X.weekStats().total, 0, "created_at fallback can place a task last week");
+
+// --- renderWeek DOM: value, shared title/aria-label, i18n ---
+const wt = elCache["#weektotal"];
+const wtv = wt.querySelector(".wt-val");
+X._setTasks([
+  inWeek({ task_id: "t2", run_usage: { v: 1, scope: "run",
+    quality: "exact", input: 60, output: 12, total: 72 } }),
+  inWeek({ task_id: "t1", status: "running", finished_at: null }),
+]);
+X._setLiveAll({ s1: { task_id: "t1", consumed: { v: 1, scope: "run",
+  quality: "exact", input: 8, output: 8, total: 16 } } });
+X.renderWeek();
+eq(wtv.textContent, "88 tok", "weekly value = exact 72 + live 16, no ~");
+eq(wt.title.includes("Tokens since"), true, "title carries the window sentence");
+eq(wt.title.includes("2 tasks"), true, "title counts unique tasks");
+eq(wt.title.includes("based on retained Agent Bridge task history"), true,
+  "retained-history scope is always stated");
+eq(wt.title.includes("includes live in-progress usage"), true,
+  "live note in the shared description");
+eq(wt.attrs["aria-label"], wt.title, "aria-label mirrors the title");
+eq(wt.attrs["aria-live"], undefined, "passive metric — no live region");
+
+// Unverified live: the ~ mark and the approx note join the live note.
+X._setTasks([inWeek({ task_id: "t1", status: "running", finished_at: null })]);
+X._setLiveAll({ s1: { task_id: "t1", consumed: { scope: "run",
+  quality: "exact", input: 8, output: 8, total: 16 } } });
+X.renderWeek();
+eq(wtv.textContent, "~16 tok", "unverified live partial forces the ~ mark");
+eq(wt.title.includes("includes live in-progress usage"), true,
+  "live note kept for unverified live data");
+eq(wt.title.includes("estimated or incomplete"), true,
+  "approx note added for unverified live data");
+// Back to a verified mix for the locale checks.
+X._setTasks([
+  inWeek({ task_id: "t2", run_usage: { v: 1, scope: "run",
+    quality: "exact", input: 60, output: 12, total: 72 } }),
+  inWeek({ task_id: "t1", status: "running", finished_at: null }),
+]);
+X._setLiveAll({ s1: { task_id: "t1", consumed: { v: 1, scope: "run",
+  quality: "exact", input: 8, output: 8, total: 16 } } });
+X.renderWeek();
+
+X.setLocalePref("zh-CN");
+eq(wtv.textContent, "88 token", "zh-CN unit re-renders on locale switch");
+eq(wt.title.includes("2 个任务"), true, "zh-CN task count in title");
+eq(wt.title.includes("已保留"), true, "zh-CN scope note in title");
+X.setLocalePref("zh-TW");
+eq(wt.title.includes("2 個任務"), true, "zh-TW task count in title");
+eq(wt.title.includes("已保留"), true, "zh-TW scope note in title");
+X.setLocalePref("en");
+
+X._setTasks([inWeek({ task_id: "t9", usage: { input_tokens: 108414,
+  cached_input_tokens: 108072, output_tokens: 4763 } })]);
+X._setLiveAll({});
+X.renderWeek();
+eq(wtv.textContent, "~5k tok", "legacy-only week renders the estimate mark");
+eq(wt.title.includes("estimated or incomplete"), true,
+  "approx note appears in the shared description");
+
+// --- sidebar signature: a live batch change repaints once, stable polls never ---
+X._setSessions([sess("busy", "s1")]);
+X._setTasks([inWeek({ task_id: "t1", session_id: "s1", status: "running",
+  finished_at: null })]);
+X._setSelected("s1");
+X._setLiveUsage({});
+X._setLiveAll({ s1: { task_id: "t1", consumed: { input: 8, output: 8, total: 16 } } });
+const listEl = elCache["#sesslist"];
+let sets0 = listEl._htmlSets;
+X.renderSidebar();
+eq(listEl._htmlSets, sets0 + 1, "sidebar renders the first signature");
+eq(listEl.innerHTML.includes("16 tok"), true,
+  "a running agent's sidebar row shows the batched live counter");
+X.renderSidebar(); X.renderSidebar();
+eq(listEl._htmlSets, sets0 + 1, "stable polls never repaint the sidebar");
+X._setLiveAll({ s1: { task_id: "t1", consumed: { input: 20, output: 8, total: 28 } } });
+X.renderSidebar();
+eq(listEl._htmlSets, sets0 + 2, "a changed live batch repaints exactly once");
+eq(listEl.innerHTML.includes("28 tok"), true, "the updated counter renders");
+X.renderSidebar();
+eq(listEl._htmlSets, sets0 + 2, "stable again — no churn");
+// Selected-session event-sourced value overrides the batch everywhere.
+X._setLiveUsage({ s1: { input: 40, output: 2, total: 42 } });
+X.renderSidebar();
+eq(listEl.innerHTML.includes("42 tok"), true,
+  "event-sourced liveUsage takes precedence for the selected session");
+X._setLiveUsage({});
+X._setLiveAll({});
+
+/* ================= presence heartbeat lifecycle ================= */
 
   // The initial ping(0) already ran during script eval; every lifecycle
   // recovery event must re-register the tab immediately.
