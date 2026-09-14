@@ -24,6 +24,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+try:
+    import psutil
+except ImportError:  # a standalone dashboard may run outside the bridge venv
+    psutil = None
+
 BRIDGE_DIR = Path(os.environ.get("BRIDGE_DIR", Path(__file__).resolve().parent))
 STATE_FILE = BRIDGE_DIR / "state.json"
 TRANSCRIPT_DIR = BRIDGE_DIR / "transcripts"
@@ -66,6 +71,153 @@ def presence_count():
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 MAX_INPUT_CHARS = 4000
+
+# Queued dashboard chat records live in outbox/ as msg_*.json until the
+# bridge claims them; task-control requests are req_{pause,cancel,resume}_*.
+# Both name shapes are what /api/send_status may poll and what
+# /api/dequeue may act on.
+MSG_NAME_RE = re.compile(r"^msg_\d+_[0-9a-f]{8}\.json$")
+REQ_NAME_RE = re.compile(r"^req_(?:pause|cancel|resume)_\d+_[0-9a-f]{8}\.json$")
+# Wall-clock bounds mirrored from the bridge (registry.py): a queued message
+# dies after a day; a task-action request no instance serves within this
+# window resolves as expired instead of firing on a stale task state.
+OUTBOX_MSG_MAX_AGE_SEC = 24 * 3600.0
+TASK_ACTION_EXPIRE_SEC = 900.0
+
+_MY_CREATE_TIME: float | None = None
+_MY_CREATE_TIME_SET = False
+
+
+def _my_create_time():
+    """This dashboard process's create time, for outbox claim/request stamps.
+
+    Matches the owner-identity shape the bridge stamps on its own claims so
+    the registry's stranded-claim rescue can restore a dashboard claim left
+    behind by a mid-dequeue crash. Without psutil the stamp degrades to the
+    legacy pid-only shape, which the bridge parses the same way.
+    """
+    global _MY_CREATE_TIME, _MY_CREATE_TIME_SET
+    if not _MY_CREATE_TIME_SET:
+        _MY_CREATE_TIME_SET = True
+        if psutil is not None:
+            with contextlib.suppress(Exception):
+                _MY_CREATE_TIME = psutil.Process().create_time()
+    return _MY_CREATE_TIME
+
+
+def _owner_alive(pid, create_time):
+    """Read-only liveness of a recorded bridge owner — the same identity rule
+    the registry applies (pid + process create time, so a recycled pid never
+    passes). Used for button enablement and dead-owner reporting; the bridge
+    re-checks ownership authoritatively when it serves the outbox request, so
+    a wrong answer here only affects which controls look usable.
+
+    Without psutil the check fails closed on Windows and falls back to a
+    pid-exists signal on POSIX."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if psutil is None:
+        if os.name != "posix":
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+    try:
+        proc = psutil.Process(pid)
+        if not proc.is_running():
+            return False
+        if create_time is not None and abs(proc.create_time() - float(create_time)) >= 1.0:
+            return False
+    except (psutil.Error, TypeError, ValueError, OSError):
+        return False
+    return True
+
+
+def _dash_claim_name(name):
+    """``name.<pid>[.<create_time>].claim`` — the same atomic-rename claim the
+    bridge uses, stamped with the dashboard's own owner identity."""
+    create_time = _my_create_time()
+    if create_time is None:
+        return f"{name}.{os.getpid()}.claim"
+    return f"{name}.{os.getpid()}.{create_time}.claim"
+
+
+def _task_action_fields(task, dead_sessions):
+    """(resumable, remote, owner_lost) for one persisted task row — the
+    registry's control gates computed read-only against the recorded owner
+    identity so the session header offers pause/cancel/resume only when the
+    outbox route can serve them.
+
+    Mirrors ``Registry._resume_fields``: an in-flight row with a live owner
+    must be paused/cancelled before it can resume; a dead owner's in-flight
+    row resumes through dead-owner adoption; completed rows and dead sessions
+    are not resumable. The dashboard owns no rows — every live owner is a
+    sibling from its point of view, so ``remote`` simply means "a live bridge
+    owns this row".
+    """
+    status = task.get("status")
+    active = status in ("queued", "running")
+    alive = _owner_alive(task.get("owner_pid"), task.get("owner_create_time"))
+    if active:
+        resumable = not alive
+    else:
+        resumable = (
+            status in ("cancelled", "failed")
+            and str(task.get("session_id") or "") not in dead_sessions
+        )
+    return resumable, bool(alive), bool(active and not alive)
+
+
+def outbox_queue():
+    """Queued dashboard chat records, grouped by session.
+
+    A ``msg_*.json`` still sitting in outbox/ is the queue the bridge has not
+    claimed yet — it survives page refresh because it lives on disk. Claimed
+    (*.claim) records are mid-delivery and deliberately absent: they can no
+    longer be recalled, so the UI must never resurrect or delete them. A
+    requeued record keeps its bridge-annotated state (waiting_busy /
+    waiting_owner) so the card can say *why* it is still waiting.
+    """
+    queue: dict[str, list[dict]] = {}
+    try:
+        entries = sorted(OUTBOX_DIR.iterdir())
+    except OSError:
+        return queue
+    for path in entries:
+        if not path.is_file() or not MSG_NAME_RE.match(path.name):
+            continue
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        session_id = str(rec.get("session_id") or "")
+        if not SAFE_ID.match(session_id):
+            continue
+        queue.setdefault(session_id, []).append(
+            {
+                "name": path.name,
+                "message": str(rec.get("message") or ""),
+                "ts": rec.get("ts"),
+                "state": rec.get("state") or "queued",
+                "attempts": rec.get("attempts") or 0,
+            }
+        )
+    for items in queue.values():
+        items.sort(
+            key=lambda item: (
+                item["ts"] if isinstance(item["ts"], (int, float)) else 0,
+                item["name"],
+            )
+        )
+    return queue
 
 
 def load_state():
@@ -602,7 +754,20 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
 .hsep{color:var(--dimmer)}
 .hrepo{display:inline-flex;align-items:center;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;min-width:0;max-width:34ch}
-.hmeta{flex:none;margin-left:auto;font-size:11.5px;color:var(--dimmer);white-space:nowrap}
+/* Session-task controls sit on a right-side column above the meta line so
+   the actions never squeeze the title/id row. */
+.hside{flex:none;margin-left:auto;display:flex;flex-direction:column;
+  align-items:flex-end;gap:6px;justify-content:center}
+.hactions{display:flex;gap:6px}
+.hact{display:inline-flex;align-items:center;gap:5px;font:inherit;
+  font-size:11.5px;font-weight:600;color:var(--dim);background:var(--panel);
+  border:1px solid var(--border);border-radius:7px;padding:3px 9px;
+  cursor:pointer;line-height:1.4}
+.hact:hover:not(:disabled){background:var(--panel3);color:var(--text)}
+.hact:disabled{opacity:.45;cursor:default}
+.hact:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.hact .ic{display:block}
+.hmeta{flex:none;font-size:11.5px;color:var(--dimmer);white-space:nowrap}
 .hplaceholder{color:var(--dimmer);font-size:14px}
 /* ---------- conversation cards ---------- */
 #conv{flex:1;min-height:0;position:relative;display:flex}
@@ -719,6 +884,27 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
 #chatstatus{display:block;width:100%;max-width:960px;margin:8px auto 0;
   font-size:11.5px;color:var(--dim);text-align:right}
 #chatstatus:empty{display:none}
+/* Queued outbox records ride directly above the composer — one card per
+   pending message, on the same 960px axis as the input row. */
+#queue{display:flex;flex-direction:column;gap:6px;width:100%;
+  max-width:960px;margin:0 auto 10px}
+#queue[hidden]{display:none}
+.qcard{display:flex;align-items:center;gap:8px;background:var(--panel2);
+  border:1px solid var(--border);border-radius:10px;padding:5px 8px 5px 12px;
+  font-size:12.5px;color:var(--text)}
+.qicon{flex:none;color:var(--dimmer);display:inline-flex}
+.qtext{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qmeta{flex:none;font-size:11px;color:var(--dimmer);white-space:nowrap;
+  font-variant-numeric:tabular-nums}
+.qact{flex:none;height:26px;min-width:26px;display:inline-flex;align-items:center;
+  justify-content:center;gap:5px;background:none;border:1px solid var(--border);
+  border-radius:7px;color:var(--dim);cursor:pointer;font:inherit;font-size:11px;
+  font-weight:600;padding:0}
+.qact.qsteer{width:auto;padding:0 9px}
+.qact:hover{background:var(--panel3);color:var(--text)}
+.qact.qdel:hover{color:var(--red);border-color:var(--red)}
+.qact:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.qact .ic{display:block}
 .clamp{max-height:120px;overflow:hidden;position:relative}
 .clamp::after{content:"";position:absolute;bottom:0;left:0;right:0;height:40px;
   background:linear-gradient(transparent,var(--panel))}
@@ -801,6 +987,8 @@ html[data-i18n-pending] [data-i18n]{visibility:hidden}
         data-i18n-aria-label="rail.label" hidden></nav>
     </div>
     <div id="chatbar">
+      <div id="queue" role="list" hidden
+        aria-label="Queued messages" data-i18n-aria-label="queue.label"></div>
       <div class="chatinner">
         <textarea id="chatinput" rows="1" disabled
           placeholder="Send an instruction… (Enter to send, Shift+Enter for newline)"
@@ -913,6 +1101,30 @@ const LOCALES=Object.freeze({
 "send.err_invalid_record":"invalid queued message",
 "send.err_dispatch_failed":"dispatch failed",
 "send.err_dispatch_error":"dispatch error",
+"a11y.task_actions":"Task actions",
+"queue.label":"Queued messages",
+"queue.steer":"Steer",
+"queue.steer_hint":"Return to composer for editing",
+"queue.delete":"Remove from queue",
+"queue.recalled":"moved back to composer",
+"queue.deleted":"removed from queue",
+"queue.err_delivering":"already being delivered",
+"queue.err_dispatched":"already dispatched",
+"queue.err_failed":"queue operation failed",
+"act.pause":"Pause",
+"act.cancel":"Cancel",
+"act.resume":"Resume",
+"act.requesting":"requesting…",
+"act.pending":"request in flight…",
+"act.paused":"task paused",
+"act.cancelled":"task cancelled",
+"act.resumed":"resumed · {task}",
+"act.failed":"action failed",
+"act.err_expired":"request expired in queue",
+"act.err_unknown_task":"unknown task",
+"act.err_wrong_session":"task belongs to another session",
+"act.no_active":"no active task",
+"act.no_resumable":"nothing to resume",
 "transcript.user_message":"User Message",
 "transcript.dispatched_message":"Dispatched Message",
 "transcript.agent":"Agent",
@@ -1024,6 +1236,30 @@ const LOCALES=Object.freeze({
 "send.err_invalid_record":"无效的队列消息",
 "send.err_dispatch_failed":"派发失败",
 "send.err_dispatch_error":"派发错误",
+"a11y.task_actions":"任务操作",
+"queue.label":"排队消息",
+"queue.steer":"移回",
+"queue.steer_hint":"移回输入框编辑",
+"queue.delete":"从队列移除",
+"queue.recalled":"已放回输入框",
+"queue.deleted":"已从队列移除",
+"queue.err_delivering":"正在投递中",
+"queue.err_dispatched":"已派发",
+"queue.err_failed":"队列操作失败",
+"act.pause":"暂停",
+"act.cancel":"取消",
+"act.resume":"恢复",
+"act.requesting":"请求中…",
+"act.pending":"请求进行中…",
+"act.paused":"任务已暂停",
+"act.cancelled":"任务已取消",
+"act.resumed":"已恢复 · {task}",
+"act.failed":"操作失败",
+"act.err_expired":"请求已在队列中过期",
+"act.err_unknown_task":"未知任务",
+"act.err_wrong_session":"任务属于其他会话",
+"act.no_active":"没有运行中的任务",
+"act.no_resumable":"没有可恢复的任务",
 "transcript.user_message":"用户消息",
 "transcript.dispatched_message":"已派发消息",
 "transcript.agent":"Agent 消息",
@@ -1135,6 +1371,30 @@ const LOCALES=Object.freeze({
 "send.err_invalid_record":"無效的佇列訊息",
 "send.err_dispatch_failed":"派發失敗",
 "send.err_dispatch_error":"派發錯誤",
+"a11y.task_actions":"任務操作",
+"queue.label":"佇列訊息",
+"queue.steer":"移回",
+"queue.steer_hint":"移回輸入框編輯",
+"queue.delete":"從佇列移除",
+"queue.recalled":"已放回輸入框",
+"queue.deleted":"已從佇列移除",
+"queue.err_delivering":"正在傳遞中",
+"queue.err_dispatched":"已派發",
+"queue.err_failed":"佇列操作失敗",
+"act.pause":"暫停",
+"act.cancel":"取消",
+"act.resume":"恢復",
+"act.requesting":"請求中…",
+"act.pending":"請求進行中…",
+"act.paused":"任務已暫停",
+"act.cancelled":"任務已取消",
+"act.resumed":"已恢復 · {task}",
+"act.failed":"操作失敗",
+"act.err_expired":"請求已在佇列中過期",
+"act.err_unknown_task":"未知任務",
+"act.err_wrong_session":"任務屬於其他工作階段",
+"act.no_active":"沒有執行中的任務",
+"act.no_resumable":"沒有可恢復的任務",
 "transcript.user_message":"使用者訊息",
 "transcript.dispatched_message":"已派發訊息",
 "transcript.agent":"Agent 訊息",
@@ -1277,6 +1537,11 @@ const ICONS={
   sparkle:['<path d="M12 2C13 7 17 11 22 12C17 13 13 17 12 22C11 17 7 13 2 12C7 11 11 7 12 2Z"/>','fill'],
   arc:['<path opacity=".3" d="M18 12C18 8.68629 15.3137 6 12 6C8.68629 6 6 8.68629 6 12C6 15.3137 8.68629 18 12 18C15.3137 18 18 15.3137 18 12ZM20 12C20 16.4183 16.4183 20 12 20C7.58172 20 4 16.4183 4 12C4 7.58172 7.58172 4 12 4C16.4183 4 20 7.58172 20 12Z"/>','<path d="M12 4C16.4183 4 20 7.58172 20 12C20 16.4183 16.4183 20 12 20C7.58172 20 4 16.4183 4 12H6C6 15.3137 8.68629 18 12 18C15.3137 18 18 15.3137 18 12C18 8.68629 15.3137 6 12 6V4Z"/>','fill'],
   dot:['<circle cx="12" cy="12" r="6"/>','fill'],
+  pause:['<rect x="6" y="4" width="4" height="16" rx="1"/>','<rect x="14" y="4" width="4" height="16" rx="1"/>'],
+  play:['<polygon points="6 3 20 12 6 21 6 3"/>'],
+  trash:['<path d="M3 6h18"/>','<path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>','<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>','<line x1="10" y1="11" x2="10" y2="17"/>','<line x1="14" y1="11" x2="14" y2="17"/>'],
+  steer:['<polyline points="9 10 4 15 9 20"/>','<path d="M20 4v7a4 4 0 0 1-4 4H4"/>'],
+  queueMsg:['<polyline points="15 10 20 15 15 20"/>','<path d="M4 4v7a4 4 0 0 0 4 4h12"/>'],
 };
 const BRANDS={
   devin:{vb:"0 0 500 500",html:'<path fill="#2A6DCE" d="M59.29,209.39l48.87,28.21c1.75,1.01,3.71,1.51,5.67,1.51c1.95,0,3.92-0.52,5.67-1.51l48.87-28.21 c0,0,0.14-0.11,0.2-0.16c0.74-0.45,1.44-0.99,2.07-1.6c0.09-0.09,0.18-0.2,0.27-0.29c0.54-0.58,1.03-1.21,1.44-1.89 c0.06-0.11,0.16-0.2,0.2-0.32c0.43-0.74,0.74-1.53,0.99-2.37c0.05-0.18,0.09-0.36,0.14-0.54c0.2-0.86,0.36-1.74,0.36-2.66v-28.21 c0-10.89,5.87-21.03,15.3-26.48c9.42-5.45,21.15-5.44,30.59,0l24.43,14.11c0.79,0.45,1.62,0.77,2.47,1.01 c0.18,0.05,0.37,0.11,0.54,0.16c0.83,0.2,1.69,0.32,2.54,0.34c0.05,0,0.09,0,0.11,0c0.09,0,0.18-0.05,0.26-0.05 c0.79,0,1.58-0.11,2.34-0.32c0.14-0.03,0.27-0.05,0.4-0.09c0.83-0.23,1.64-0.57,2.41-0.99c0.06-0.05,0.16-0.05,0.23-0.09 l48.87-28.21c3.51-2.03,5.67-5.76,5.67-9.81V64.52c0-4.05-2.16-7.78-5.67-9.81l-48.91-28.19c-3.51-2.03-7.81-2.03-11.32,0 l-48.87,28.21c0,0-0.14,0.11-0.2,0.16c-0.74,0.45-1.44,0.99-2.07,1.6c0.09-0.09,0.18-0.2,0.27-0.29 c-0.54,0.58-1.03,1.21-1.44,1.89c-0.06,0.11-0.16,0.2-0.2,0.31c-0.43,0.74-0.74,1.53-0.99,2.37c-0.05,0.18-0.09,0.36-0.14,0.54 c-0.2,0.86-0.36,1.74-0.36,2.66v28.21c0,10.89-5.87,21.03-15.3,26.5c-9.42,5.44-21.15,5.44-30.59,0l-24.42-14.1 c-0.79-0.45-1.63-0.77-2.47-1.01c-0.18-0.05-0.36-0.11-0.54-0.16c-0.84-0.2-1.69-0.31-2.55-0.34c-0.14,0-0.25,0-0.38,0 c-0.81,0-1.6,0.11-2.37,0.31c-0.14,0.02-0.25,0.05-0.38,0.09c-0.82,0.23-1.63,0.57-2.4,1c-0.06,0.05-0.16,0.05-0.23,0.09 l-48.84,28.24c-3.51,2.03-5.67,5.76-5.67,9.81v56.42c0,4.05,2.16,7.78,5.67,9.81C59.29,209.41,59.29,209.39,59.29,209.39z"/><path fill="#1DC19C" d="M325.46,223.49c9.42-5.44,21.15-5.44,30.59,0l24.43,14.11c0.79,0.45,1.62,0.77,2.47,1.01 c0.18,0.05,0.36,0.11,0.54,0.16c0.83,0.2,1.69,0.31,2.54,0.34c0.05,0,0.09,0,0.11,0c0.09,0,0.18-0.03,0.26-0.05 c0.79,0,1.58-0.11,2.34-0.31c0.14-0.03,0.27-0.05,0.4-0.09c0.83-0.23,1.62-0.57,2.41-0.99c0.06-0.05,0.16-0.05,0.25-0.09 l48.87-28.21c3.51-2.03,5.67-5.76,5.67-9.81v-56.43c0-4.05-2.16-7.78-5.67-9.81l-48.84-28.22c-3.51-2.03-7.81-2.03-11.32,0 l-48.87,28.21c0,0-0.14,0.11-0.2,0.16c-0.74,0.45-1.44,0.99-2.07,1.6c0.09-0.09,0.18-0.2,0.26-0.29 c-0.54,0.58-1.03,1.21-1.44,1.89c-0.06,0.11-0.16,0.2-0.2,0.32c-0.43-0.74-0.74,1.53-0.99,2.37c-0.05,0.18-0.09,0.36-0.14,0.54 c-0.2,0.86-0.36,1.74-0.36,2.66v28.21c0,10.89-5.87,21.03-15.3,26.5c-9.42,5.44-21.15,5.44-30.59,0l-24.43-14.11 c-0.79-0.45-1.62-0.77-2.47-1.01c-0.18-0.05-0.36-0.11-0.54-0.16c-0.83-0.2-1.69-0.32-2.54-0.34c-0.14,0-0.25,0-0.38,0 c-0.81,0-1.6,0.11-2.37,0.32c-0.14,0.03-0.25,0.05-0.38,0.09c-0.83,0.23-1.64,0.57-2.41,0.99c-0.06,0.05-0.16,0.05-0.23,0.09 l-48.87,28.21c-3.51,2.03-5.67,5.76-5.67,9.81v56.43c0,4.05,2.16,7.78,5.67,9.81l48.87,28.21c0,0,0.16,0.05,0.23,0.09 c0.77,0.43,1.58,0.77,2.41,0.99c0.14,0.05,0.27,0.05,0.4,0.09c0.77,0.18,1.55,0.29,2.34,0.32c0.09,0,0.18,0.05,0.27,0.05 c0.05,0,0.09,0,0.11,0c0.86,0,1.69-0.14,2.54-0.34c0.18-0.05,0.36-0.09,0.54-0.16c0.86-0.25,1.69-0.57,2.47-1.01l24.43-14.11 c9.42-5.44,21.15-5.44,30.59,0c9.42,5.44,15.3,15.59,15.3,26.48v28.21c0,0.92,0.14,1.8,0.36,2.66c0.05,0.18,0.09,0.36,0.14,0.54 c0.25,0.83,0.56,1.62,0.99,2.37c0.06,0.11,0.14,0.2,0.2,0.31c0.4,0.68,0.9,1.31,1.44,1.89c0.09,0.09,0.18,0.2,0.26,0.29 c0.61,0.6,1.31,1.12,2.07,1.6c0.06,0.05,0.11,0.11,0.2,0.16l48.87,28.21c1.75,1.01,3.72,1.51,5.67,1.51s3.92-0.52,5.67-1.51 l48.87-28.21c3.51-2.03,5.67-5.76,5.67-9.81v-56.43c0-4.05-2.16-7.78-5.67-9.81l-48.87-28.21c0,0-0.16-0.05-0.23-0.09 c-0.77-0.43-1.58-0.77-2.41-0.99c-0.14-0.05-0.25-0.05-0.38-0.09c-0.79-0.18-1.57-0.29-2.38-0.32c-0.11,0-0.25,0-0.36,0 c-0.86,0-1.71,0.14-2.54,0.34c-0.18,0.05-0.34,0.09-0.52,0.16c-0.86,0.25-1.69,0.57-2.47,1.01l-24.43,14.11 c-9.42,5.44-21.15,5.44-30.58,0c-9.42-5.44-15.3-15.59-15.3-26.5c0-10.91,5.87-21.03,15.3-26.48 C325.55,223.49,325.46,223.49,325.46,223.49z"/><path fill="#1796E2" d="M304.5,369.22l-48.87-28.21c0,0-0.16-0.05-0.23-0.09c-0.77-0.43-1.57-0.77-2.41-0.99 c-0.14-0.05-0.27-0.05-0.4-0.09c-0.79-0.18-1.57-0.29-2.37-0.32c-0.14,0-0.25,0-0.38,0c-0.86,0-1.71,0.14-2.54,0.34 c-0.18,0.05-0.34,0.09-0.52,0.16c-0.86,0.25-1.69,0.57-2.47,1.01l-24.43,14.11c-9.42,5.44-21.15,5.44-30.58,0 c-9.42-5.44-15.3-15.59-15.3-26.5v-28.22c0-0.92-0.14-1.8-0.36-2.66c-0.05-0.18-0.09-0.36-0.14-0.54 c-0.25-0.83-0.57-1.62-0.99-2.37c-0.06-0.11-0.14-0.2-0.2-0.32c-0.4-0.68-0.9-1.31-1.44-1.89c-0.09-0.09-0.18-0.2-0.27-0.29 c-0.6-0.6-1.31-1.12-2.07-1.6c-0.06-0.05-0.11-0.11-0.2-0.16l-48.87-28.21c-3.51-2.03-7.81-2.03-11.32,0L59.28,290.6 c-3.51,2.03-5.67,5.76-5.67,9.81v56.43c0,4.05,2.16,7.78,5.67,9.81l48.87,28.21c0,0,0.16,0.06,0.23,0.09 c0.77,0.43,1.55,0.77,2.38,0.99c0.14,0.05,0.27,0.06,0.4,0.09c0.77,0.18,1.55,0.29,2.34,0.32c0.09,0,0.18,0.05,0.29,0.05 c0.05,0,0.09,0,0.14,0c0.86,0,1.69-0.14,2.52-0.34c0.18-0.05,0.36-0.09,0.54-0.16c0.86-0.25,1.69-0.57,2.47-1.01l24.43-14.11 c9.42-5.44,21.15-5.44,30.59,0c9.42,5.44,15.3,15.59,15.3,26.48v28.21c0,0.92,0.14,1.8,0.36,2.66c0.05,0.18,0.09,0.36,0.14,0.54 c0.25,0.83,0.57,1.62,0.99,2.37c0.06,0.11,0.14,0.2,0.2,0.32c0.4,0.68,0.9,1.31,1.44,1.89c0.09,0.09,0.18,0.2,0.27,0.29 c0.61,0.61,1.31,1.12,2.07,1.6c0.06,0.05,0.11,0.11,0.2,0.16l48.87,28.21c1.75,1.01,3.71,1.51,5.67,1.51 c1.96,0,3.92-0.52,5.67-1.51l48.87-28.21c3.51-2.03,5.67-5.76,5.67-9.81v-56.43c0-4.05-2.16-7.78-5.67-9.81L304.5,369.22z"/>'},
@@ -1745,6 +2010,17 @@ function renderSessionHeader(){
   const ids=[taskId?t("session.task_id",{id:taskId}):"",
     s.session_id?t("session.session_id",{id:s.session_id}):""]
     .filter(Boolean).join(" · ");
+  /* Task controls gate on the latest applicable task: pause/cancel for an
+     in-flight turn (a remote-owned row routes the request to its bridge),
+     resume when the server's resumable gate says a continuation can land.
+     While one req_* is in flight all three park — the pending reason lives
+     on the disabled title. */
+  const can=taskActions(tk,s),busy=actPending(s.session_id);
+  const hbtns=["pause","cancel","resume"].map(a=>{
+    const on=!busy&&can[a];
+    return actBtn(a,on,on?t("act."+a)
+      :busy?t("act.pending"):a==="resume"?t("act.no_resumable"):t("act.no_active"));
+  }).join("");
   el.innerHTML=`<div class="avatar">${agentAvatar(s,26)}</div>
     <div class="hbody">
       <h2 class="htitle"><span class="htext">${esc(s.title||s.session_id)}</span>${ids?`<span class="hids" title="${esc(ids)}">${esc(ids)}</span>`:""}</h2>
@@ -1755,7 +2031,11 @@ function renderSessionHeader(){
         ${repo?`<span class="hsep">|</span><span class="hrepo" title="${esc(s.cwd||"")}">${esc(t("session.working_repo",{repo}))}</span>`:""}
       </div>
     </div>
-    <div class="hmeta">${esc(t("session.turns",{n:s.turns??0}))}${agoStr?" · "+esc(agoStr):""}</div>`;
+    <div class="hside">
+      <div class="hactions" role="group" aria-label="${esc(t("a11y.task_actions"))}">${hbtns}</div>
+      <div class="hmeta">${esc(t("session.turns",{n:s.turns??0}))}${agoStr?" · "+esc(agoStr):""}</div>
+    </div>`;
+  el.querySelectorAll(".hact").forEach(b=>b.onclick=()=>taskAction(b.dataset.act));
 }
 
 /* ---------- conversation rendering ---------- */
@@ -2247,11 +2527,12 @@ async function pollOverview(){
     // Wholesale replace: the server prunes finished sessions, so stale
     // partials vanish on the next poll without client-side cleanup.
     liveAll=j.live||{};
+    outboxQ=j.outbox||{};
     const known=new Set(sessions.map(s=>s.session_id));
     for(const id of new Set([...Object.keys(eventsCache),...Object.keys(panes),
         ...Object.keys(offsets),...Object.keys(rendered)]))
       if(!known.has(id)&&id!==selected)dropCache(id);
-    renderSidebar();renderSessionHeader();renderWeek();
+    renderSidebar();renderSessionHeader();renderWeek();renderQueue();
     setLive(true);
     if(!selected&&sessions.length)select(sessions.find(s=>s.proc_state==="busy")?.session_id||sessions[0].session_id);
   }catch(e){setLive(false)}
@@ -2300,11 +2581,27 @@ const SEND_ERR={expired:"send.err_expired",
   bad_session:"send.err_bad_session",
   bad_request:"send.err_bad_request",
   bad_name:"send.err_bad_request",
+  bad_action:"send.err_bad_request",
+  bad_task:"send.err_bad_request",
   invalid_record:"send.err_invalid_record",
   dispatch_failed:"send.err_dispatch_failed",
-  dispatch_error:"send.err_dispatch_error"};
-function sendErrState(j){
-  const k=j&&SEND_ERR[j.error_code];
+  dispatch_error:"send.err_dispatch_error",
+  delivering:"queue.err_delivering",
+  dispatched:"queue.err_dispatched",
+  dequeue_failed:"queue.err_failed",
+  unknown_task:"act.err_unknown_task",
+  wrong_session:"act.err_wrong_session",
+  pause_failed:"act.failed",
+  cancel_failed:"act.failed",
+  resume_failed:"act.failed"};
+function sendErrState(j,req){
+  /* req: a req_* task-action done record — its failures carry "code"
+     (resume) or "error_code" (pause/cancel), and its wording is action-
+     oriented, so the generic fallback is act.failed and an expired request
+     never reads like an expired message. */
+  const code=j&&(j.error_code||j.code);
+  let k=code&&SEND_ERR[code];
+  if(req)k=code==="expired"?"act.err_expired":k||"act.failed";
   return{key:k||"send.failed",detail:j&&j.error||"",final:true};
 }
 function setSendState(sid,st){
@@ -2343,6 +2640,17 @@ async function pollSendStatus(name,sid){
       if(!mine())return;              // a newer send to this session owns the status line
       if(j&&j.pending){setSendState(sid,{key:sendKey(j)});continue}
       const done=j||{};
+      if(/^req_/.test(name)){
+        /* Task-control request: the done record's state names the outcome —
+           paused/cancelled/resumed, or the task status the action landed on. */
+        setSendState(sid,done.ok
+          ?{key:ACT_DONE[done.state]||"status.proc.done",
+            params:done.task_id?{task:done.task_id}:null,final:true}
+          :sendErrState(done,true));
+        renderSessionHeader();   // controls re-enable with the real outcome
+        pollOverview();          // pull the new task state in promptly
+        return;
+      }
       setSendState(sid,done.ok
         ?{key:done.task_id?"send.dispatched_task":"send.dispatched",
           params:done.task_id?{task:done.task_id}:null,final:true}
@@ -2350,6 +2658,119 @@ async function pollSendStatus(name,sid){
       return;
     }
   }finally{delete sendPolls[name]}
+}
+
+/* ---------- outbox queue + session task controls ----------
+   Queued chat records live in outbox/ as msg_*.json until the bridge claims
+   them, so the list above the composer is re-read from /api/overview each
+   poll and survives reloads. Steer pulls a record back into the composer
+   for editing; delete drops it — both are one atomic dequeue server-side,
+   and a record the bridge claimed in between reports back as delivering.
+   Session task controls drop req_{pause,cancel,resume}_*.json requests into
+   the same outbox; whichever bridge owns the task row runs the normal
+   pause/cancel/resume path and reports through the done/ channel this page
+   already polls — the dashboard never mutates task state itself. */
+let outboxQ={};          // session_id -> [{name,message,ts,state,attempts}]
+let lastQueueSig="";
+const ACT_ICON={pause:"pause",cancel:"xCircle",resume:"play"};
+const ACT_DONE={paused:"act.paused",cancelled:"act.cancelled",
+  resumed:"act.resumed",completed:"status.proc.done",
+  failed:"status.proc.failed",running:"status.proc.running",
+  queued:"send.queued"};
+const actBusy={};        // session_id -> /api/task_action POST in flight
+function taskActions(tk,s){
+  const off={pause:false,cancel:false,resume:false};
+  if(!tk||!s||s.proc_state==="dead")return off;
+  /* Pause/cancel only on in-flight tasks (remote-owned ones included — the
+     request routes to the owning bridge). Resume follows the server's
+     resumable gate, minus rows a continuation already replaced. */
+  const active=tk.status==="queued"||tk.status==="running";
+  return{pause:active,cancel:active,
+    resume:!!tk.resumable&&!tk.resumed_by};
+}
+function actPending(sid){
+  const cur=sid&&sendState[sid];
+  return!!(actBusy[sid]||cur&&cur.name&&/^req_/.test(cur.name)&&!cur.final);
+}
+function actBtn(act,on,why){
+  const label=t("act."+act);
+  return `<button type="button" class="hact" data-act="${act}"${on?"":" disabled"} title="${esc(why)}" aria-label="${esc(label)}">${icon(ACT_ICON[act],13)}<span>${esc(label)}</span></button>`;
+}
+async function taskAction(act){
+  const sid=selected;if(!sid)return;
+  const s=sessions.find(x=>x.session_id===sid);if(!s)return;
+  const tk=latestTask(sid);if(!tk||tk.task_id==null)return;
+  if(!taskActions(tk,s)[act]||actPending(sid))return;   // stale state guard
+  actBusy[sid]=true;                 // parks all three controls from click 1
+  setSendState(sid,{key:"act.requesting"});
+  try{
+    const r=await fetch("/api/task_action",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({task_id:tk.task_id,session_id:sid,action:act})});
+    const j=await r.json();
+    if(!j.ok){setSendState(sid,sendErrState(j,true));return}
+    setSendState(sid,{key:"send.queued"});
+    sendState[sid].name=j.name;
+    renderSessionHeader();          // controls park while the request rides
+    pollSendStatus(j.name,sid);
+  }catch(e){setSendState(sid,{key:"act.failed",final:true})}
+  finally{delete actBusy[sid];renderSessionHeader()}
+}
+function renderQueue(){
+  const el=$("#queue");if(!el)return;
+  const items=selected?(outboxQ[selected]||[]):[];
+  const sig=(selected||"")+"|"+items.map(m=>
+    [m.name,m.message,m.state,m.attempts,m.ts].join(" ")).join("|");
+  if(sig===lastQueueSig)return;
+  lastQueueSig=sig;
+  el.innerHTML=items.map(m=>{
+    const age=Number.isFinite(m.ts)?ago(new Date(m.ts*1000).toISOString()):"";
+    const meta=[t(sendKey(m)),age].filter(Boolean).join(" · ");
+    return `<div class="qcard" role="listitem" data-name="${esc(m.name)}">
+      <span class="qicon">${icon("queueMsg",13)}</span>
+      <span class="qtext" title="${esc(m.message)}">${esc(m.message)}</span>
+      <span class="qmeta">${esc(meta)}</span>
+      <button type="button" class="qact qsteer" data-act="steer" data-name="${esc(m.name)}" title="${esc(t("queue.steer_hint"))}" aria-label="${esc(t("queue.steer_hint"))}">${icon("steer",13)}<span>${esc(t("queue.steer"))}</span></button>
+      <button type="button" class="qact qdel" data-act="delete" data-name="${esc(m.name)}" title="${esc(t("queue.delete"))}" aria-label="${esc(t("queue.delete"))}">${icon("trash",13)}</button>
+    </div>`;
+  }).join("");
+  el.hidden=!items.length;
+  el.querySelectorAll(".qact").forEach(b=>b.onclick=()=>
+    b.dataset.act==="steer"?steerMsg(b.dataset.name):delMsg(b.dataset.name));
+}
+function dropQueueEntry(sid,name){
+  const items=outboxQ[sid];
+  if(items)outboxQ[sid]=items.filter(m=>m.name!==name);
+  lastQueueSig="";
+  renderQueue();
+}
+async function dequeueMsg(name){
+  try{
+    const r=await fetch("/api/dequeue",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({name})});
+    return await r.json();
+  }catch(e){return{ok:false,error:String(e),error_code:"dequeue_failed"}}
+}
+async function steerMsg(name){
+  const j=await dequeueMsg(name);
+  const sid=(j&&j.session_id)||selected;
+  if(!j||!j.ok){setSendState(sid||"",sendErrState(j));return}
+  if(sid===selected){
+    chatInput.value=String(j.message||"");
+    chatInput.style.height="auto";
+    chatInput.style.height=Math.min(chatInput.scrollHeight,160)+"px";
+    chatInput.focus();
+  }
+  setSendState(sid,{key:"queue.recalled",final:true});
+  dropQueueEntry(sid,name);
+}
+async function delMsg(name){
+  const j=await dequeueMsg(name);
+  const sid=(j&&j.session_id)||selected;
+  if(!j||!j.ok){setSendState(sid||"",sendErrState(j));return}
+  setSendState(sid,{key:"queue.deleted",final:true});
+  dropQueueEntry(sid,name);
 }
 const chatInput=$("#chatinput");
 chatInput.addEventListener("keydown",e=>{
@@ -2430,8 +2851,9 @@ function rerenderLocale(){
   }
   if(refocus)$("#chatinput").focus();
   lastSidebarSig="";                 // labels are baked into the sidebar DOM
+  lastQueueSig="";                   // so are the queue cards' state labels
   renderSidebar();renderSessionHeader();renderLive();refreshComposer();
-  renderWeek();
+  renderWeek();renderQueue();
   scheduleRail();
 }
 function applyLocale(){
@@ -2489,7 +2911,7 @@ function select(id){
     touchCache(id);
     pollEvents();
   }
-  renderSidebar();renderSessionHeader();closeSidebar();
+  renderSidebar();renderSessionHeader();closeSidebar();renderQueue();
   scheduleRail();
 }
 
@@ -2542,33 +2964,52 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/overview":
             state = load_state()
+            dead_sessions = {
+                str(s.get("session_id") or "")
+                for s in state.get("sessions", [])
+                if isinstance(s, dict) and s.get("proc_state") == "dead"
+            }
+            tasks = []
+            for t in state.get("tasks", []):
+                if not isinstance(t, dict):
+                    continue
+                row = {
+                    k: t.get(k)
+                    for k in (
+                        "task_id",
+                        "session_id",
+                        "agent",
+                        "status",
+                        "stop_reason",
+                        "paused",
+                        "message",
+                        "result_chars",
+                        "files_changed",
+                        "error",
+                        "source",
+                        "usage",
+                        "run_usage",
+                        "created_at",
+                        "started_at",
+                        "finished_at",
+                        "resumed_by",
+                        "resume_of",
+                    )
+                }
+                (
+                    row["resumable"],
+                    row["remote"],
+                    row["owner_lost"],
+                ) = _task_action_fields(t, dead_sessions)
+                tasks.append(row)
             self._json(
                 {
                     "sessions": state.get("sessions", []),
-                    "tasks": [
-                        {
-                            k: t.get(k)
-                            for k in (
-                                "task_id",
-                                "session_id",
-                                "agent",
-                                "status",
-                                "stop_reason",
-                                "paused",
-                                "message",
-                                "result_chars",
-                                "files_changed",
-                                "error",
-                                "source",
-                                "usage",
-                                "run_usage",
-                                "created_at",
-                                "started_at",
-                                "finished_at",
-                            )
-                        }
-                        for t in state.get("tasks", [])
-                    ],
+                    "tasks": tasks,
+                    # Queued chat records still sitting in outbox/, grouped by
+                    # session — the queue cards above the composer render
+                    # straight from this, so they survive refresh naturally.
+                    "outbox": outbox_queue(),
                     # One batched lookup for every running task's live usage —
                     # the sidebar reads per-agent counters from here instead
                     # of issuing per-session transcript requests.
@@ -2606,7 +3047,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/send_status":
             q = parse_qs(u.query)
             name = (q.get("name") or [""])[0]
-            if not re.match(r"^msg_\d+_[0-9a-f]{8}\.json$", name):
+            if not (MSG_NAME_RE.match(name) or REQ_NAME_RE.match(name)):
                 self._json({"error": "bad name", "error_code": "bad_name"}, 400)
                 return
             done = OUTBOX_DIR / "done" / name
@@ -2628,6 +3069,28 @@ class Handler(BaseHTTPRequestHandler):
                     rec = json.loads(queued.read_text(encoding="utf-8", errors="replace"))
                 if not isinstance(rec, dict):
                     rec = {}
+                # Same expiry rule the bridge applies: expire_ts when the
+                # requester set one, else the 24h queued-message bound — a
+                # record past it resolves as expired instead of polling
+                # forever while the bridge sweeps it.
+                queued_ts = rec.get("ts")
+                expire_ts = rec.get("expire_ts")
+                if not isinstance(expire_ts, (int, float)) and isinstance(
+                    queued_ts, (int, float)
+                ):
+                    expire_ts = queued_ts + OUTBOX_MSG_MAX_AGE_SEC
+                if isinstance(expire_ts, (int, float)) and time.time() > expire_ts:
+                    self._json(
+                        {
+                            "pending": False,
+                            "ok": False,
+                            "state": "expired",
+                            "error": "request expired in queue; no bridge instance served it",
+                            "error_code": "expired",
+                        },
+                        404,
+                    )
+                    return
                 self._json(
                     {
                         "pending": True,
@@ -2688,6 +3151,176 @@ class Handler(BaseHTTPRequestHandler):
             )
             os.replace(tmp, OUTBOX_DIR / name)
             self._json({"ok": True, "name": name})
+            return
+        if u.path == "/api/dequeue":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(min(length, 1 << 20)) or b"{}")
+            except Exception:
+                self._json({"ok": False, "error": "bad request", "error_code": "bad_request"}, 400)
+                return
+            name = str(payload.get("name") or "")
+            # Strict name whitelist — the record can only ever resolve inside
+            # outbox/, so a crafted name can never unlink an arbitrary path.
+            if not MSG_NAME_RE.match(name):
+                self._json({"ok": False, "error": "bad name", "error_code": "bad_name"}, 400)
+                return
+            src = OUTBOX_DIR / name
+            done_path = OUTBOX_DIR / "done" / name
+            # Claim through the same atomic rename the bridge uses — whoever
+            # wins the rename owns the record. A dashboard crash between claim
+            # and delete leaves a *.claim the bridge rescues back into the
+            # queue, so a dequeue is never half-applied.
+            claim = OUTBOX_DIR / _dash_claim_name(name)
+            try:
+                os.replace(src, claim)
+            except OSError:
+                # Lost the rename race — the bridge claimed it, it already
+                # delivered, or it never existed. Report the live truth.
+                if done_path.exists():
+                    self._json(
+                        {
+                            "ok": False,
+                            "error": "message already dispatched",
+                            "error_code": "dispatched",
+                        },
+                        409,
+                    )
+                elif any(OUTBOX_DIR.glob(name + ".*.claim")):
+                    self._json(
+                        {
+                            "ok": False,
+                            "error": "message is mid-delivery and cannot be recalled",
+                            "error_code": "delivering",
+                        },
+                        409,
+                    )
+                elif src.is_file():
+                    self._json(
+                        {
+                            "ok": False,
+                            "error": "queued message could not be removed",
+                            "error_code": "dequeue_failed",
+                        },
+                        500,
+                    )
+                else:
+                    self._json(
+                        {
+                            "ok": False,
+                            "error": "message is no longer queued",
+                            "error_code": "missing",
+                        },
+                        404,
+                    )
+                return
+            try:
+                rec = json.loads(claim.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, ValueError):
+                rec = None
+            if not isinstance(rec, dict):
+                # Unreadable payload: hand the record back to the queue
+                # untouched rather than destroying data the user may want.
+                with contextlib.suppress(OSError):
+                    os.replace(claim, src)
+                if claim.exists():
+                    claim.unlink(missing_ok=True)
+                self._json(
+                    {
+                        "ok": False,
+                        "error": "invalid queued message record",
+                        "error_code": "invalid_record",
+                    },
+                    409,
+                )
+                return
+            claim.unlink(missing_ok=True)
+            self._json(
+                {
+                    "ok": True,
+                    "name": name,
+                    "session_id": rec.get("session_id"),
+                    "message": rec.get("message"),
+                }
+            )
+            return
+        if u.path == "/api/task_action":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(min(length, 1 << 20)) or b"{}")
+            except Exception:
+                self._json({"ok": False, "error": "bad request", "error_code": "bad_request"}, 400)
+                return
+            action = str(payload.get("action") or "")
+            task_id = str(payload.get("task_id") or "")
+            session_id = str(payload.get("session_id") or "")
+            if action not in ("pause", "cancel", "resume"):
+                self._json(
+                    {
+                        "ok": False,
+                        "error": "action must be pause, cancel, or resume",
+                        "error_code": "bad_action",
+                    },
+                    400,
+                )
+                return
+            if not SAFE_ID.match(task_id):
+                self._json({"ok": False, "error": "bad task_id", "error_code": "bad_task"}, 400)
+                return
+            if session_id and not SAFE_ID.match(session_id):
+                self._json({"ok": False, "error": "bad session", "error_code": "bad_session"}, 400)
+                return
+            state = load_state()
+            row = next(
+                (
+                    t
+                    for t in state.get("tasks", [])
+                    if isinstance(t, dict) and t.get("task_id") == task_id
+                ),
+                None,
+            )
+            if row is None:
+                self._json(
+                    {"ok": False, "error": f"unknown task {task_id}", "error_code": "unknown_task"},
+                    404,
+                )
+                return
+            if session_id and row.get("session_id") != session_id:
+                # The page resolves the action against the session's latest
+                # task — a mismatch means the row moved on (resumed or
+                # superseded) between the overview read and the click, and
+                # refusing is safer than acting on a task the user did not
+                # intend.
+                self._json(
+                    {
+                        "ok": False,
+                        "error": "task belongs to another session",
+                        "error_code": "wrong_session",
+                    },
+                    409,
+                )
+                return
+            OUTBOX_DIR.mkdir(exist_ok=True)
+            name = f"req_{action}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.json"
+            record = {
+                "kind": action,
+                "task_id": task_id,
+                "session_id": row.get("session_id"),
+                "ts": time.time(),
+                # Bounded queue age: a request no bridge instance can serve
+                # inside the window resolves as expired rather than firing a
+                # stale pause/cancel on a task that has long since moved on.
+                "expire_ts": time.time() + TASK_ACTION_EXPIRE_SEC,
+                "requester_pid": os.getpid(),
+                "requester_create_time": _my_create_time(),
+            }
+            if action == "resume":
+                record["request_id"] = str(uuid.uuid4())
+                record["message"] = None
+            tmp = OUTBOX_DIR / (name + ".tmp")
+            tmp.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, OUTBOX_DIR / name)
+            self._json({"ok": True, "name": name, "task_id": task_id, "action": action})
             return
         # navigator.sendBeacon uses POST
         if u.path == "/api/presence":

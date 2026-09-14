@@ -208,6 +208,8 @@ vm.runInContext(
     " weekStartMs, weekContrib, weekStats, renderWeek, livePartial," +
     " renderSidebar, renderSessionHeader," +
     " select, pollEvents, sendState," +
+    " taskActions, actPending, taskAction, renderQueue, dropQueueEntry," +
+    " steerMsg, delMsg, ACT_DONE," +
     " _setTasks: (v) => { tasks = v; }," +
     " _setSessions: (v) => { sessions = v; }," +
     " _setLiveAll: (v) => { liveAll = v; }," +
@@ -216,6 +218,7 @@ vm.runInContext(
     " _cache: () => eventsCache, _polled: () => polled," +
     " _panes: () => panes, _rendered: () => rendered," +
     " _railBtns: () => railBtns, _setSelected: (v) => { selected = v; }," +
+    " _setOutbox: (v) => { outboxQ = v; }, _outbox: () => outboxQ," +
     " _getLocale: () => locale, _getLangPref: () => langPref };",
   sandbox);
 const X = sandbox.__x;
@@ -1598,6 +1601,259 @@ X._setLiveAll({});
   eq(beacons.length, 1, "pagehide sends exactly one beacon");
   eq(beacons[0].includes("/api/presence") && beacons[0].includes("bye=1"),
     true, "pagehide beacon carries bye=1");
+
+  /* ================= outbox queue + session task controls =================
+     Queue cards render straight from /api/overview's outbox map; task
+     buttons gate on the latest applicable task via taskActions(). */
+
+  // --- taskActions: enablement matrix on the applicable task ---
+  X._setSessions([sess("busy", "s1")]);
+  const actTk = (over) => Object.assign(
+    { task_id: "t1", session_id: "s1", status: "running",
+      created_at: "2026-01-01T00:00:00Z", resumable: false }, over);
+  const sLive = sess("busy", "s1");
+  let can = X.taskActions(actTk({}), sLive);
+  eq(can.pause && can.cancel && !can.resume, true,
+    "running task: pause+cancel on, resume off");
+  can = X.taskActions(actTk({ status: "queued" }), sLive);
+  eq(can.pause && can.cancel, true, "queued task: pause+cancel on");
+  can = X.taskActions(actTk({ status: "running" }), sLive);
+  eq(can.resume, false, "in-flight task is not resumable");
+  can = X.taskActions(actTk({ status: "cancelled", paused: true,
+    resumable: true }), sess("ready", "s1"));
+  eq(!can.pause && !can.cancel && can.resume, true,
+    "paused task: resume only");
+  can = X.taskActions(actTk({ status: "failed", resumable: true }),
+    sess("ready", "s1"));
+  eq(can.resume, true, "failed task with a live session is resumable");
+  can = X.taskActions(actTk({ status: "cancelled", resumable: true,
+    resumed_by: "t9" }), sess("ready", "s1"));
+  eq(can.resume, false, "superseded row (resumed_by) never offers resume");
+  can = X.taskActions(actTk({ status: "completed" }), sess("ready", "s1"));
+  eq(!can.pause && !can.cancel && !can.resume, true,
+    "completed task: nothing enabled");
+  can = X.taskActions(actTk({ status: "running", resumable: true }),
+    sess("ready", "s1"));
+  eq(can.resume, true,
+    "dead-owner in-flight row is resumable (server-side gate)");
+  can = X.taskActions(actTk({ status: "running" }), sess("dead", "s1"));
+  eq(!can.pause && !can.cancel && !can.resume, true,
+    "dead session: all controls off");
+  eq(JSON.stringify(X.taskActions(null, sLive)),
+    JSON.stringify({ pause: false, cancel: false, resume: false }),
+    "no task -> all off");
+  eq(JSON.stringify(X.taskActions(actTk({}), null)),
+    JSON.stringify({ pause: false, cancel: false, resume: false }),
+    "no session -> all off");
+  // Remote-owned active rows stay enabled — the req routes to the owner.
+  can = X.taskActions(actTk({ remote: true }), sLive);
+  eq(can.pause && can.cancel, true, "remote live-owned task stays actionable");
+
+  // --- header: three labelled controls in a group, gated by the task ---
+  X._setSessions([sess("busy", "s1")]);
+  X._setTasks([actTk({})]);
+  X._setSelected("s1");
+  X.renderSessionHeader();
+  let h = elCache["#hwrap"].innerHTML;
+  eq(h.includes('class="hactions"'), true, "header renders the actions group");
+  eq(h.includes('role="group"'), true, "actions group is a role=group");
+  eq(h.includes('aria-label="Task actions"'), true,
+    "actions group carries the localized label");
+  for (const a of ["pause", "cancel", "resume"])
+    eq(h.includes(`data-act="${a}"`), true, `header has a ${a} control`);
+  eq(/data-act="pause" title/.test(h) && !/data-act="pause" disabled/.test(h),
+    true, "pause enabled for a running task");
+  eq(/data-act="resume" disabled/.test(h), true,
+    "resume disabled for a running task");
+  eq(h.includes('title="nothing to resume"'), true,
+    "disabled resume explains why in the tooltip");
+  X._setTasks([actTk({ status: "cancelled", paused: true, resumable: true })]);
+  X._setSessions([sess("ready", "s1")]);
+  X.renderSessionHeader();
+  h = elCache["#hwrap"].innerHTML;
+  eq(/data-act="resume" title/.test(h) && !/data-act="resume" disabled/.test(h),
+    true, "resume enabled for a paused task");
+  eq(/data-act="pause" disabled/.test(h), true,
+    "pause disabled for a terminal task");
+  eq(h.includes('title="no active task"'), true,
+    "disabled pause explains why");
+  // An in-flight req_* parks all three controls.
+  X._setTasks([actTk({})]);
+  X._setSessions([sess("busy", "s1")]);
+  X.setSendState("s1", { key: "send.queued" });
+  X.sendState.s1.name = "req_pause_1_abcd1234.json";
+  X.renderSessionHeader();
+  h = elCache["#hwrap"].innerHTML;
+  eq(/data-act="pause" disabled/.test(h) && /data-act="resume" disabled/.test(h),
+    true, "pending req parks every control");
+  eq(h.includes('title="request in flight…"'), true,
+    "parked controls name the pending request");
+  X.sendState.s1.final = true;
+  X.renderSessionHeader();
+  h = elCache["#hwrap"].innerHTML;
+  eq(!/data-act="pause" disabled/.test(h), true,
+    "controls re-enable once the request resolves");
+
+  // --- taskAction: writes a req record + polls it; stale state never fires ---
+  X._setSessions([sess("ready", "s1")]);
+  X._setTasks([actTk({ status: "completed" })]);
+  X._setSelected("s1");
+  let actCalls0 = apiCalls("/api/task_action");
+  await X.taskAction("resume");      // not resumable -> early return
+  eq(apiCalls("/api/task_action"), actCalls0,
+    "a disabled action never hits the network");
+  X._setSessions([sess("busy", "s1")]);
+  X._setTasks([actTk({})]);
+  delete X.sendState.s1;
+  const realFetch = sandbox.fetch;
+  sandbox.fetch = (u, o) => {
+    fetchCalls.push(String(u));
+    const body = o && o.body ? JSON.parse(o.body) : {};
+    return Promise.resolve({ json: () => Promise.resolve(
+      { ok: true, name: "req_pause_1_abcd1234.json",
+        task_id: body.task_id, action: body.action }) });
+  };
+  await X.taskAction("pause");
+  sandbox.fetch = realFetch;
+  eq(apiCalls("/api/task_action"), actCalls0 + 1, "enabled pause POSTs once");
+  eq(X.sendState.s1.name, "req_pause_1_abcd1234.json",
+    "the req name is tracked for the status poll");
+  eq(X.sendState.s1.key, "send.queued", "request shows as queued");
+  // A second click while the req is pending never doubles the request.
+  await X.taskAction("cancel");
+  eq(apiCalls("/api/task_action"), actCalls0 + 1,
+    "in-flight request blocks a second action");
+  // A rejected action surfaces the localized error, not a spinner.
+  sandbox.fetch = (u) => {
+    fetchCalls.push(String(u));
+    return Promise.resolve({ json: () => Promise.resolve(
+      { ok: false, error_code: "unknown_task", error: "unknown task t1" }) });
+  };
+  delete X.sendState.s1;
+  await X.taskAction("cancel");
+  sandbox.fetch = realFetch;
+  eq(X.sendState.s1.key, "act.err_unknown_task",
+    "rejected action surfaces the error code");
+  eq(X.sendState.s1.final, true, "rejected action is final");
+
+  // --- renderQueue: cards for the selected session only, escaped, gated ---
+  X._setSelected("s1");
+  X._setOutbox({
+    s1: [{ name: "msg_1_abcdef12.json", message: "hello <b>world</b>",
+      ts: 1700000000, state: "queued" }],
+    s2: [{ name: "msg_2_abcdef12.json", message: "other session" }],
+  });
+  X.renderQueue();
+  const qEl = elCache["#queue"];
+  let q = qEl.innerHTML;
+  eq(qEl.hidden, false, "queue shown for the selected session");
+  eq(q.includes('class="qcard"'), true, "queue card renders");
+  eq(q.includes("hello &lt;b&gt;world&lt;/b&gt;"), true,
+    "queued message text is escaped");
+  eq(q.includes('data-act="steer"') && q.includes('data-act="delete"'), true,
+    "queue card carries steer + delete actions");
+  eq(q.includes('data-name="msg_1_abcdef12.json"'), true,
+    "card pins the outbox record name");
+  eq(q.includes("msg_2_"), false, "another session's queue never renders");
+  eq(q.includes("queued"), true, "card meta shows the queued state");
+  const qSets = qEl._htmlSets;
+  X.renderQueue();
+  eq(qEl._htmlSets, qSets, "a stable queue never repaints");
+  // Bridge-annotated requeue states surface their real reason.
+  X._setOutbox({ s1: [{ name: "msg_1_abcdef12.json", message: "hi",
+    ts: 1700000000, state: "waiting_busy" }] });
+  X.renderQueue();
+  eq(qEl.innerHTML.includes("waiting for agent"), true,
+    "waiting_busy state label renders");
+  // Session switch re-renders that session's queue (and clears for none).
+  X._setOutbox({ s2: [{ name: "msg_2_abcdef12.json",
+    message: "other session", ts: 1700000001 }] });
+  X._setSelected("s2");
+  X.renderQueue();
+  eq(qEl.innerHTML.includes("other session"), true,
+    "selecting s2 renders s2's queue");
+  X._setOutbox({});
+  X.renderQueue();
+  eq(qEl.hidden, true, "empty queue hides the strip");
+  // dropQueueEntry removes just the acted-on record.
+  X._setSelected("s1");
+  X._setOutbox({ s1: [
+    { name: "msg_1_abcdef12.json", message: "one", ts: 1700000000 },
+    { name: "msg_2_abcdef12.json", message: "two", ts: 1700000001 }] });
+  X.renderQueue();
+  X.dropQueueEntry("s1", "msg_1_abcdef12.json");
+  q = qEl.innerHTML;
+  eq(q.includes("msg_1_"), false, "dropped record leaves the queue");
+  eq(q.includes("msg_2_"), true, "the other queued record stays");
+  // Locale switch re-bakes the queue labels.
+  X.setLocalePref("zh-CN");
+  eq(qEl.innerHTML.includes("移回"), true, "queue card labels zh-CN");
+  eq(qEl.innerHTML.includes("已排队"), true, "queue state label zh-CN");
+  X.setLocalePref("en");
+
+  // --- steer/del: one dequeue call, message back to composer or gone ---
+  sandbox.fetch = (u, o) => {
+    fetchCalls.push(String(u));
+    const body = o && o.body ? JSON.parse(o.body) : {};
+    return Promise.resolve({ json: () => Promise.resolve(
+      { ok: true, name: body.name, session_id: "s1",
+        message: "edit me again" }) });
+  };
+  elCache["#chatinput"].value = "";
+  await X.steerMsg("msg_2_abcdef12.json");
+  eq(elCache["#chatinput"].value, "edit me again",
+    "steer returns the message to the composer");
+  eq(X.sendState.s1.key, "queue.recalled", "steer reports the recall");
+  eq(qEl.innerHTML.includes("msg_2_"), false,
+    "steered record leaves the queue");
+  await X.delMsg("msg_2_abcdef12.json");
+  eq(X.sendState.s1.key, "queue.deleted", "delete reports the removal");
+  // Claimed mid-flight -> localized error, card stays for the next poll.
+  X._setOutbox({ s1: [{ name: "msg_3_abcdef12.json", message: "busy",
+    ts: 1700000000 }] });
+  X.renderQueue();
+  sandbox.fetch = (u) => {
+    fetchCalls.push(String(u));
+    return Promise.resolve({ json: () => Promise.resolve(
+      { ok: false, error_code: "delivering",
+        error: "message is mid-delivery and cannot be recalled" }) });
+  };
+  await X.delMsg("msg_3_abcdef12.json");
+  sandbox.fetch = realFetch;
+  eq(X.sendState.s1.key, "queue.err_delivering",
+    "claimed record reports the mid-delivery error");
+  eq(elCache["#chatstatus"].textContent, "already being delivered",
+    "queue error renders localized on the status line");
+
+  // --- sendErrState: req records read "code" too; action-worded fallback ---
+  eq(X.sendErrState({ code: "resume_failed", error: "x" }, true).key,
+    "act.failed", "req done failure maps via the code field");
+  eq(X.sendErrState({ error_code: "expired" }, true).key, "act.err_expired",
+    "req expiry never reads like an expired message");
+  eq(X.sendErrState({ error_code: "weird_code" }, true).key, "act.failed",
+    "unknown req error -> action failed, not send failed");
+  eq(X.sendErrState({ error_code: "delivering" }).key,
+    "queue.err_delivering", "dequeue race maps to its label");
+  eq(X.sendErrState({ error_code: "dispatched" }).key,
+    "queue.err_dispatched", "already-dispatched maps to its label");
+  eq(X.sendErrState({ error_code: "wrong_session" }, true).key,
+    "act.err_wrong_session", "stale session selection maps to its label");
+  // ACT_DONE keys exist in every locale.
+  for (const loc of ["en", "zh-CN", "zh-TW"]) {
+    X.setLocalePref(loc);
+    for (const key of Object.values(X.ACT_DONE))
+      eq(X.t(key) !== key, true, `${loc} has ${key}`);
+    for (const key of ["queue.label", "queue.steer", "queue.delete",
+        "queue.recalled", "queue.deleted", "queue.err_delivering",
+        "queue.err_dispatched", "queue.err_failed", "act.pause",
+        "act.cancel", "act.resume", "act.requesting", "act.pending",
+        "act.paused", "act.cancelled", "act.resumed", "act.failed",
+        "act.err_expired", "act.err_unknown_task", "act.err_wrong_session",
+        "act.no_active", "act.no_resumable", "a11y.task_actions",
+        "queue.steer_hint"])
+      eq(X.t(key) !== key, true, `${loc} has ${key}`);
+  }
+  X.setLocalePref("en");
 
   console.log(failed ? `\n${failed} FAILED` : "\nall assertions passed");
   process.exit(failed ? 1 : 0);

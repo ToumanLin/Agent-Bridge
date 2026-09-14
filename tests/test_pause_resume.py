@@ -1025,3 +1025,240 @@ async def test_resume_on_ended_session_rejected(bridge_home, tmp_path, monkeypat
         assert "ended" in checked["resume_hint"]
     finally:
         await registry.stop()
+
+
+# ---------- dashboard task-action requests (req_pause_/req_cancel_) ----------
+#
+# The dashboard never mutates task state directly: it drops a req_* record in
+# the shared outbox and the instance owning the task row runs the normal
+# pause/cancel path, reporting through outbox/done/ for the dashboard's poll.
+
+
+def _drop_req(home: Path, kind: str, task_id: str, **extra) -> str:
+    """Write a req_<kind>_<ms>_<8hex>.json request the way the dashboard does."""
+    import uuid
+
+    name = f"req_{kind}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.json"
+    rec = {
+        "kind": kind,
+        "task_id": task_id,
+        "ts": time.time(),
+        "expire_ts": time.time() + 900.0,
+    }
+    rec.update(extra)
+    outbox = home / "outbox"
+    outbox.mkdir(exist_ok=True)
+    atomic_write_json(outbox / name, rec)
+    return name
+
+
+def _done_record(home: Path, name: str) -> dict | None:
+    path = home / "outbox" / "done" / name
+    if not path.is_file():
+        return None
+    return read_json(path, {})
+
+
+async def _wait_done(home: Path, name: str, timeout: float = 15.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rec = _done_record(home, name)
+        if rec is not None:
+            return rec
+        await asyncio.sleep(0.05)
+    pytest.fail(f"no done record for {name} within {timeout}s")
+
+
+@pytest.mark.asyncio
+async def test_outbox_pause_request_runs_owner_pause_path(bridge_home, tmp_path, monkeypatch):
+    """A req_pause_* record is claimed by the owning instance and executed
+    through the normal pause_task path — graceful cancel, paused terminal row,
+    and a done record carrying the fields the dashboard reports on."""
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "30")
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_PARTIAL", "1")
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    work = tmp_path / "work"
+    work.mkdir()
+    cwd = str(work.resolve())
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "long running", cwd=cwd)
+        task_id = dispatched["task_id"]
+        await asyncio.sleep(0.2)
+        assert registry.tasks[task_id].status == TaskStatus.running
+
+        name = _drop_req(bridge_home, "pause", task_id)
+        done = await _wait_done(bridge_home, name)
+        assert done["ok"] is True
+        assert done["state"] == "paused"
+        assert done["task_id"] == task_id
+        assert done["status"] == "cancelled"
+        assert done["stop_reason"] == "paused"
+        assert done["paused"] is True
+        # The normal pause path ran: partial result, resumable flag, flush
+        # ordering — state.json already shows the row the done record means.
+        task = registry.tasks[task_id]
+        assert task.status == TaskStatus.cancelled and task.paused is True
+        assert "partial progress" in (task.result_text or "")
+        disk = read_json(state_path(bridge_home), {})
+        row = next(r for r in disk["tasks"] if r["task_id"] == task_id)
+        assert row["status"] == "cancelled" and row["paused"] is True
+        # The request record itself is consumed (claimed file is gone).
+        assert not (bridge_home / "outbox" / name).exists()
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbox_cancel_request_runs_owner_cancel_path(bridge_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "30")
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    work = tmp_path / "work"
+    work.mkdir()
+    cwd = str(work.resolve())
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "long running", cwd=cwd)
+        task_id = dispatched["task_id"]
+        await asyncio.sleep(0.2)
+
+        name = _drop_req(bridge_home, "cancel", task_id)
+        done = await _wait_done(bridge_home, name)
+        assert done["ok"] is True
+        assert done["state"] == "cancelled"
+        assert done["status"] == "cancelled"
+        assert done["stop_reason"] == "cancelled"
+        task = registry.tasks[task_id]
+        assert task.status == TaskStatus.cancelled
+        assert task.paused is not True  # plain cancel is not a pause
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbox_task_action_unknown_and_expired(bridge_home, tmp_path, monkeypatch):
+    """Request-level guards: an unknown task id and a request past its
+    expire_ts both resolve through done/ without touching any task."""
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        name = _drop_req(bridge_home, "pause", "task_nope")
+        done = await _wait_done(bridge_home, name)
+        assert done["ok"] is False
+        assert done["error_code"] == "unknown_task"
+
+        name = _drop_req(bridge_home, "cancel", "task_nope", expire_ts=time.time() - 1)
+        done = await _wait_done(bridge_home, name)
+        assert done["ok"] is False
+        assert done["error_code"] == "expired"
+
+        # An invalid task id shape never leaves validation.
+        name = _drop_req(bridge_home, "pause", "../bad")
+        done = await _wait_done(bridge_home, name)
+        assert done["ok"] is False
+        assert done["error_code"] == "invalid_record"
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbox_task_action_requeues_for_live_owner_then_serves(
+    bridge_home, tmp_path, monkeypatch
+):
+    """Single-owner safety over the outbox: when the sibling that does not
+    own the task claims the request first it requeues it (waiting_owner, no
+    done record); once the recorded owner dies the claimer adopts the row
+    and runs the cancel itself."""
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "30")
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_FOREIGN_RETRY_SEC", 0.1)
+    alive = {4242: True}
+    monkeypatch.setattr(
+        "agent_bridge.registry.owner_alive",
+        lambda pid, create_time=None: pid == os.getpid() or alive.get(pid, False),
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    cwd = str(work.resolve())
+    a = Registry.create(bridge_home, owner_pid=4242, owner_create_time=7.0)
+    await a.start()
+    dispatched = await a.dispatch_task("fake", "sibling work", cwd=cwd)
+    task_id = dispatched["task_id"]
+    session_id = dispatched["session_id"]
+    await asyncio.sleep(0.2)
+    await a.flush_state()
+    # Simulate the orphaned-bridge shape: A's pid still passes liveness but
+    # its outbox loop is gone, so only B can observe the request — first as a
+    # live-owner requeue, then as a dead-owner adoption.
+    monkeypatch.setattr(a, "save", lambda: None)
+    for bg in (a._watchdog, a._outbox_task):
+        if bg is not None:
+            bg.cancel()
+
+    b = Registry.create(bridge_home, owner_pid=2002, owner_create_time=22.0)
+    await b.start()
+    try:
+        name = _drop_req(bridge_home, "cancel", task_id)
+        # B claims and requeues: the record returns to the outbox annotated
+        # waiting_owner and no done answer exists while the owner is alive.
+        req_path = bridge_home / "outbox" / name
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if req_path.is_file():
+                rec = read_json(req_path, {})
+                if rec.get("state") == "waiting_owner":
+                    break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("request never requeued for the live owner")
+        await asyncio.sleep(0.3)
+        assert _done_record(bridge_home, name) is None
+        assert task_id not in b.tasks  # never adopted while the owner is live
+
+        # Owner dies -> B's next claim adopts the row and runs cancel_task.
+        alive[4242] = False
+        done = await _wait_done(bridge_home, name)
+        assert done["ok"] is True
+        assert done["task_id"] == task_id
+        assert done["session_id"] == session_id
+        # The adopted in-flight row was finalized by adoption (failed/
+        # bridge_restarted), and cancel_task reports that terminal row.
+        assert done["status"] == "failed"
+        assert b.tasks[task_id].owner_pid == 2002
+        assert b.tasks[task_id].error == "bridge_restarted"
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbox_pause_on_terminal_task_reports_current_state(
+    bridge_home, tmp_path, monkeypatch
+):
+    """Pausing an already-finished task through the outbox surfaces the
+    truthful terminal snapshot (ok + the real status), never an invented
+    'paused'."""
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "0.01")
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    work = tmp_path / "work"
+    work.mkdir()
+    cwd = str(work.resolve())
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "quick", cwd=cwd)
+        task_id = dispatched["task_id"]
+        waited = await registry.wait_task(task_id, timeout_sec=5)
+        assert waited["status"] == "completed"
+
+        name = _drop_req(bridge_home, "pause", task_id)
+        done = await _wait_done(bridge_home, name)
+        # pause_task raises for a completed non-paused row; the dashboard sees
+        # a failed action with the specific code, not a stuck request.
+        assert done["ok"] is False
+        assert done["error_code"] == "pause_failed"
+        assert task_id in done["error"]
+    finally:
+        await registry.stop()

@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -174,6 +175,7 @@ def test_page_dom_ids_and_endpoints():
         "conv",
         "rail",
         "content",
+        "queue",
         "chatinput",
         "chatsend",
         "chatstatus",
@@ -181,7 +183,15 @@ def test_page_dom_ids_and_endpoints():
         "langsel",
     ):
         assert f'id="{dom_id}"' in PAGE
-    for ep in ("/api/overview", "/api/events", "/api/send", "/api/send_status", "/api/presence"):
+    for ep in (
+        "/api/overview",
+        "/api/events",
+        "/api/send",
+        "/api/send_status",
+        "/api/dequeue",
+        "/api/task_action",
+        "/api/presence",
+    ):
         assert ep in PAGE
     assert "sendBeacon" in PAGE  # presence heartbeat on pagehide
 
@@ -533,6 +543,100 @@ def test_user_message_card_and_send_status():
     assert '"delivered' not in PAGE and "`delivered" not in PAGE
     assert "still queued" not in PAGE
     assert "sendState" in PAGE and "pollSendStatus" in PAGE
+
+
+def test_queue_cards_and_task_controls_contract():
+    """Queued-message cards sit directly above the composer; pause/cancel/
+    resume live in the session header and gate on the latest applicable task.
+
+    Executable coverage of the enablement matrix, steer/delete flows and
+    per-locale labels lives in tests/dashboard_status_behavior.js — here we
+    pin the structural contract.
+    """
+    # Queue strip: semantic list, labelled, inside #chatbar, strictly above
+    # the composer input row and the status line.
+    chatbar = re.search(
+        r'<div id="chatbar">([\s\S]*?)</div>\s*</div>\s*</div>', PAGE).group(1)
+    queue_idx = chatbar.index('id="queue"')
+    assert queue_idx < chatbar.index('class="chatinner"') < chatbar.index('id="chatstatus"')
+    queue_el = re.search(r'<div id="queue"[^>]*>', PAGE).group(0)
+    assert 'role="list"' in queue_el and "hidden" in queue_el
+    assert 'data-i18n-aria-label="queue.label"' in queue_el
+    # Rendering + recall/delete machinery.
+    for needle in (
+        "function renderQueue(",
+        "function steerMsg(",
+        "function delMsg(",
+        "function dropQueueEntry(",
+        '"/api/dequeue"',
+        "data-act=\"steer\"",
+        "data-act=\"delete\"",
+        "lastQueueSig",
+        "outboxQ",
+        "j.outbox",
+        "qcard",
+        "qsteer",
+        "qdel",
+        '"queue.recalled"',
+        '"queue.deleted"',
+    ):
+        assert needle in PAGE
+    # Task controls: one gate function, labelled buttons in a header group,
+    # the shared send-status surface polls the req_* record back.
+    for needle in (
+        "function taskActions(",
+        "function actPending(",
+        "function taskAction(",
+        "function actBtn(",
+        "ACT_DONE",
+        "ACT_ICON",
+        'class="hactions"',
+        'role="group"',
+        'data-act="',
+        '"/api/task_action"',
+        '"act.err_unknown_task"',
+        "sendErrState(j,true)",
+        '/^req_/.test(',
+    ):
+        assert needle in PAGE
+    # Gate rules: pause/cancel only for queued|running; resume only for a
+    # resumable row nothing superseded; dead sessions and in-flight
+    # requests disable everything.
+    gate = re.search(r"function taskActions\(tk,s\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert 'proc_state==="dead"' in gate
+    assert 'tk.status==="queued"||tk.status==="running"' in gate
+    assert "tk.resumable" in gate and "tk.resumed_by" in gate
+    head = re.search(r"function renderSessionHeader\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert "actPending(s.session_id)" in head and "taskAction(b.dataset.act)" in head
+    # Every localized key the new UI resolves exists in all dictionaries.
+    locales = _locales()
+    for loc, d in locales.items():
+        for key in (
+            "queue.label",
+            "queue.steer",
+            "queue.delete",
+            "queue.recalled",
+            "queue.deleted",
+            "queue.err_delivering",
+            "queue.err_dispatched",
+            "queue.err_failed",
+            "act.pause",
+            "act.cancel",
+            "act.resume",
+            "act.requesting",
+            "act.pending",
+            "act.paused",
+            "act.cancelled",
+            "act.resumed",
+            "act.failed",
+            "act.err_expired",
+            "act.err_unknown_task",
+            "act.err_wrong_session",
+            "act.no_active",
+            "act.no_resumable",
+            "a11y.task_actions",
+        ):
+            assert key in d, f"{key} missing in {loc}"
 
 
 def test_turn_end_shows_duration():
@@ -892,6 +996,13 @@ def test_i18n_glossary_exactness():
     assert zh["status.live"] == "实时" and tw["status.live"] == "即時"
     assert zh["status.disconnected"] == "已断开" and tw["status.disconnected"] == "已中斷"
     assert zh["empty.loading"] == "加载中…" and tw["empty.loading"] == "載入中…"
+    # Queue + task controls: deliberate product wording, not MT output.
+    assert zh["queue.steer"] == "移回" and tw["queue.steer"] == "移回"
+    assert zh["queue.delete"] == "从队列移除" and tw["queue.delete"] == "從佇列移除"
+    assert zh["act.pause"] == "暂停" and tw["act.pause"] == "暫停"
+    assert zh["act.cancel"] == "取消" and tw["act.cancel"] == "取消"
+    assert zh["act.resume"] == "恢复" and tw["act.resume"] == "恢復"
+    assert zh["act.pending"] == "请求进行中…" and tw["act.pending"] == "請求進行中…"
     # "token" stays a technical term in every locale — never 令牌.
     for d in (en, zh, tw):
         assert "token" in d["tokens.run"].lower()
@@ -1018,7 +1129,7 @@ def test_i18n_send_err_covers_emitted_codes():
     the tooltip, never as the status line."""
     send_err = dict(
         re.findall(
-            r'(\w+):"(send\.[\w.]+)"',
+            r'(\w+):"((?:send|queue|act)\.[\w.]+)"',
             re.search(r"const SEND_ERR=\{([\s\S]*?)\};", PAGE).group(1),
         )
     )
@@ -1222,10 +1333,22 @@ def test_index_and_overview(dash):
         "created_at",
         "started_at",
         "finished_at",
+        "resumed_by",
+        "resume_of",
+        "resumable",
+        "remote",
+        "owner_lost",
     }
     # task timing fields round-trip so the page can compute working durations
     assert j["tasks"][0]["started_at"] == "2026-09-12T10:00:02Z"
     assert j["tasks"][0]["finished_at"] == "2026-09-12T10:01:42Z"
+    # The failed task on the dead fixture session reports its control gates:
+    # not resumable (dead session), no live owner, no orphaned in-flight row.
+    assert j["tasks"][0]["resumable"] is False
+    assert j["tasks"][0]["remote"] is False
+    assert j["tasks"][0]["owner_lost"] is False
+    # The outbox queue map rides the same response — empty in the fixture.
+    assert j["outbox"] == {}
     # Batched live-usage map rides the same response; nothing runs in the
     # fixture so it stays empty.
     assert j["live"] == {}
@@ -1306,6 +1429,197 @@ def test_send_flow_and_status(dash):
     assert code == 400 and json.loads(body)["error_code"] == "empty_or_too_long"
     code, body = _post(base + "/api/send", {"session": "bad id!", "text": "x"})
     assert code == 400 and json.loads(body)["error_code"] == "bad_session"
+
+
+# ---------- queue management + session task controls ----------
+
+
+def _queue_msg(home, name, session_id="sess_1", message="queued hello", **extra):
+    rec = {"session_id": session_id, "message": message, "ts": 1700000000.0}
+    rec.update(extra)
+    (home / "outbox" / name).write_text(json.dumps(rec), encoding="utf-8")
+    return rec
+
+
+def test_overview_reports_queued_outbox_messages(dash):
+    """Filesystem-backed queued messages reach the page grouped by session.
+
+    Claimed records are mid-delivery and excluded; the req_* task-action
+    records never masquerade as queued chat messages.
+    """
+    home, base = dash
+    _queue_msg(home, "msg_1700000000000_abcd1234.json")
+    _queue_msg(home, "msg_1700000000001_abcd1235.json", session_id="sess_2",
+               message="other session", attempts=2, state="waiting_busy")
+    # In-flight claim files and task-action requests are not queue entries.
+    (home / "outbox" / "msg_1700000000002_abcd1236.json.42.claim").write_text("{}", encoding="utf-8")
+    _queue_msg(home, "req_pause_1700000000003_abcd1237.json", kind="pause", task_id="t1")
+    _queue_msg(home, "msg_badname.json")  # fails the strict name regex
+    j = _overview(base)
+    assert set(j["outbox"]) == {"sess_1", "sess_2"}
+    s1 = j["outbox"]["sess_1"]
+    assert len(s1) == 1
+    assert s1[0]["name"] == "msg_1700000000000_abcd1234.json"
+    assert s1[0]["message"] == "queued hello"
+    # session_id is the group key; the item carries name/message/ts/state.
+    assert s1[0]["ts"] == 1700000000.0
+    assert s1[0]["state"] == "queued"  # synthesized default
+    s2 = j["outbox"]["sess_2"]
+    assert s2[0]["attempts"] == 2 and s2[0]["state"] == "waiting_busy"
+    # FIFO order is filename order (timestamp-prefixed names).
+    _queue_msg(home, "msg_1600000000000_aaaa0000.json", message="older")
+    j = _overview(base)
+    assert [m["name"] for m in j["outbox"]["sess_1"]] == [
+        "msg_1600000000000_aaaa0000.json",
+        "msg_1700000000000_abcd1234.json",
+    ]
+
+
+def test_dequeue_atomic_recall_and_delete(dash):
+    """/api/dequeue wins its record by atomic rename, then unlinks it — the
+    response carries the stored message so the composer can repopulate."""
+    home, base = dash
+    _queue_msg(home, "msg_1700000000000_abcd1234.json")
+    code, body = _post(base + "/api/dequeue", {"name": "msg_1700000000000_abcd1234.json"})
+    assert code == 200
+    j = json.loads(body)
+    assert j["ok"] is True and j["message"] == "queued hello"
+    assert j["session_id"] == "sess_1" and j["name"] == "msg_1700000000000_abcd1234.json"
+    assert not (home / "outbox" / "msg_1700000000000_abcd1234.json").exists()
+    assert not list((home / "outbox").glob("*.claim"))
+
+
+def test_dequeue_race_states(dash):
+    """Every losing race reports a specific code — claimed mid-delivery,
+    already-dispatched done records, vanished records."""
+    home, base = dash
+    name = "msg_1700000000000_abcd1234.json"
+    # Mid-delivery claim beats the recall.
+    _queue_msg(home, name)
+    (home / "outbox" / name).rename(home / "outbox" / f"{name}.42.claim")
+    code, body = _post(base + "/api/dequeue", {"name": name})
+    assert code == 409
+    assert json.loads(body)["error_code"] == "delivering"
+    # A done record means it already dispatched — recall is too late.
+    (home / "outbox" / f"{name}.42.claim").unlink()
+    (home / "outbox" / "done").mkdir(exist_ok=True)
+    (home / "outbox" / "done" / name).write_text(
+        json.dumps({"ok": True, "state": "dispatched"}), encoding="utf-8")
+    code, body = _post(base + "/api/dequeue", {"name": name})
+    assert code == 409
+    assert json.loads(body)["error_code"] == "dispatched"
+    # Gone entirely.
+    (home / "outbox" / "done" / name).unlink()
+    code, body = _post(base + "/api/dequeue", {"name": name})
+    assert code == 404
+    assert json.loads(body)["error_code"] == "missing"
+
+
+def test_dequeue_rejects_bad_and_traversal_names(dash):
+    """Only msg_<digits>_<8hex>.json reaches the outbox — req records, claim
+    files and path traversal are refused before any filesystem touch."""
+    home, base = dash
+    for bad in (
+        "../state.json",
+        "..\\state.json",
+        "req_pause_1_abcd1234.json",
+        "msg_1_abcd1234.json.42.claim",
+        "msg_x_abcd1234.json",
+        "msg_1_ABCD1234.json",  # hex must be lowercase
+        "msg_1_abcd12345.json",  # wrong hex width
+        "",
+        42,
+    ):
+        code, body = _post(base + "/api/dequeue", {"name": bad})
+        assert code == 400, bad
+        assert json.loads(body)["error_code"] == "bad_name"
+    assert not list((home / "outbox").glob("*.claim"))
+
+
+def test_task_action_writes_request_record(dash):
+    """The dashboard never mutates tasks — /api/task_action drops a signed
+    req_* record in the shared outbox for the owning bridge to claim."""
+    home, base = dash
+    code, body = _post(
+        base + "/api/task_action",
+        {"action": "cancel", "task_id": "t1", "session_id": "sess_2"},
+    )
+    assert code == 200
+    j = json.loads(body)
+    name = j["name"]
+    assert re.fullmatch(r"req_cancel_\d+_[0-9a-f]{8}\.json", name)
+    assert j["task_id"] == "t1" and j["action"] == "cancel"
+    rec = json.loads((home / "outbox" / name).read_text(encoding="utf-8"))
+    assert rec["kind"] == "cancel"
+    assert rec["task_id"] == "t1" and rec["session_id"] == "sess_2"
+    # The request is self-identifying for the owning Registry's liveness check.
+    assert rec["requester_pid"] > 0
+    assert "requester_create_time" in rec
+    assert rec["expire_ts"] > rec["ts"]  # bounded lifetime
+    # session_id is optional — task_id alone identifies the task, and the
+    # request records the row's own session so it stays self-identifying.
+    code, body = _post(base + "/api/task_action", {"action": "pause", "task_id": "t1"})
+    assert code == 200
+    name = json.loads(body)["name"]
+    rec = json.loads((home / "outbox" / name).read_text(encoding="utf-8"))
+    assert rec["kind"] == "pause" and rec["session_id"] == "sess_2"
+    # Resume rides the same contract with a request id for done matching.
+    code, body = _post(
+        base + "/api/task_action", {"action": "resume", "task_id": "t1"})
+    assert code == 200
+    name = json.loads(body)["name"]
+    rec = json.loads((home / "outbox" / name).read_text(encoding="utf-8"))
+    assert rec["kind"] == "resume" and rec["request_id"]
+
+
+def test_task_action_validation(dash):
+    home, base = dash
+    for payload, code, err in (
+        ({"action": "explode", "task_id": "t1"}, 400, "bad_action"),
+        ({"action": "pause"}, 400, "bad_task"),
+        ({"action": "pause", "task_id": "bad id!"}, 400, "bad_task"),
+        ({"action": "pause", "task_id": "t1", "session_id": "bad id!"}, 400, "bad_session"),
+        ({"action": "pause", "task_id": "nope"}, 404, "unknown_task"),
+        ({"action": "pause", "task_id": "t1", "session_id": "sess_1"}, 409, "wrong_session"),
+    ):
+        c, body = _post(base + "/api/task_action", payload)
+        assert c == code, payload
+        assert json.loads(body)["error_code"] == err, payload
+
+
+def test_send_status_req_names_and_expiry(dash):
+    """Task-action polls reuse the send_status surface: req names pass the
+    regex, stale msg_/req_ files report expired instead of pending forever."""
+    home, base = dash
+    # Malformed names never reach the filesystem.
+    for bad in ("../evil", "msg_x.json", "req_boom_1_abcd1234.json"):
+        code, body = _get(base + f"/api/send_status?name={bad}")
+        assert code == 400
+        assert json.loads(body)["error_code"] == "bad_name"
+    # A pending req reads as queued while it waits for the owner bridge —
+    # its own expire_ts keeps it inside the service window.
+    req_name = "req_pause_1700000000000_abcd1234.json"
+    _queue_msg(
+        home, req_name, kind="pause", task_id="t1",
+        expire_ts=time.time() + dashboard.TASK_ACTION_EXPIRE_SEC,
+    )
+    code, body = _get(base + f"/api/send_status?name={req_name}")
+    assert code == 404
+    j = json.loads(body)
+    assert j["pending"] is True and j["state"] == "queued"
+    # An ancient msg_*/req_* file is expired, not pending.
+    old_name = "req_cancel_1_abcd1234.json"
+    _queue_msg(home, old_name, kind="cancel", task_id="t1", ts=1.0)
+    code, body = _get(base + f"/api/send_status?name={old_name}")
+    assert code == 404
+    j = json.loads(body)
+    assert j["pending"] is False and j["state"] == "expired"
+    assert j["error_code"] == "expired"
+    old_msg = "msg_1_abcd1235.json"
+    _queue_msg(home, old_msg, ts=1.0)
+    code, body = _get(base + f"/api/send_status?name={old_msg}")
+    j = json.loads(body)
+    assert j["state"] == "expired" and j["error_code"] == "expired"
 
 
 # ---------- batched live usage map (/api/overview "live") ----------

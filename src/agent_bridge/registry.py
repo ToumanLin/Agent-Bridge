@@ -722,6 +722,8 @@ class Registry:
             rec = {}
         if rec.get("kind") == "resume":
             return await self._outbox_resume(outbox, claimed, name, rec)
+        if rec.get("kind") in ("pause", "cancel"):
+            return await self._outbox_task_action(outbox, claimed, name, rec)
         session_id = str(rec.get("session_id") or "")
         text = str(rec.get("message") or "").strip()
         if not session_id or not text:
@@ -898,6 +900,138 @@ class Registry:
             name,
             task_id,
             result.get("task_id"),
+        )
+        return None
+
+    async def _outbox_task_action(
+        self, outbox: Path, claimed: Path, name: str, rec: dict
+    ) -> float | None:
+        """Execute a dashboard ``pause_task``/``cancel_task`` request.
+
+        The dashboard drops ``req_pause_*``/``req_cancel_*`` records into the
+        shared outbox; whichever instance owns the task row runs the normal
+        pause/cancel path and reports through ``done/``. A row owned by a
+        live sibling is requeued for that sibling — single-owner safety, the
+        claimer never drives it — and a dead owner's row is adopted first so
+        its orphaned worker is reaped rather than left running. Records past
+        ``expire_ts`` resolve as expired so a request the user has long moved
+        on from cannot fire a stale action much later.
+        """
+        action = str(rec.get("kind") or "")
+        task_id = str(rec.get("task_id") or "")
+        if not is_safe_id(task_id):
+            self._outbox_done(
+                outbox,
+                name,
+                {
+                    "ok": False,
+                    "state": "error",
+                    "error": "missing or invalid task_id",
+                    "error_code": "invalid_record",
+                },
+            )
+            return None
+        queued_ts = rec.get("ts")
+        if not isinstance(queued_ts, (int, float)):
+            queued_ts = time.time()
+            rec["ts"] = queued_ts
+        expire_ts = rec.get("expire_ts")
+        if not isinstance(expire_ts, (int, float)):
+            expire_ts = queued_ts + OUTBOX_MAX_AGE_SEC
+        if time.time() > expire_ts or time.time() - queued_ts > OUTBOX_MAX_AGE_SEC:
+            self._outbox_done(
+                outbox,
+                name,
+                {
+                    "ok": False,
+                    "state": "error",
+                    "error": f"task {action} request expired in queue; nothing was executed",
+                    "error_code": "expired",
+                },
+            )
+            return None
+        task = self.tasks.get(task_id)
+        if task is None:
+            row = self._disk_task_row(task_id)
+            if row is not None and not self._is_mine(
+                row.get("owner_pid"), row.get("owner_create_time")
+            ):
+                if owner_alive(row.get("owner_pid"), row.get("owner_create_time")) or (
+                    not self.config.server.remote_tasks
+                ):
+                    # A live sibling owns the row (or this instance never
+                    # touches remote rows): leave the request queued for an
+                    # instance allowed to serve it.
+                    rec["state"] = "waiting_owner"
+                    with contextlib.suppress(OSError):
+                        atomic_write_json(claimed, rec)
+                    return OUTBOX_FOREIGN_RETRY_SEC
+                task, _foreign = self._adopt_dead_task(task_id)
+            if task is None:
+                self._outbox_done(
+                    outbox,
+                    name,
+                    {
+                        "ok": False,
+                        "state": "error",
+                        "error": f"unknown task {task_id}",
+                        "error_code": "unknown_task",
+                    },
+                )
+                return None
+        try:
+            if action == "pause":
+                result = await self.pause_task(task_id)
+            else:
+                result = await self.cancel_task(task_id)
+        except KeyError:
+            self._outbox_done(
+                outbox,
+                name,
+                {
+                    "ok": False,
+                    "state": "error",
+                    "error": f"unknown task {task_id}",
+                    "error_code": "unknown_task",
+                },
+            )
+            return None
+        except Exception as exc:
+            self._outbox_done(
+                outbox,
+                name,
+                {
+                    "ok": False,
+                    "state": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "error_code": f"{action}_failed",
+                },
+            )
+            return None
+        # save() only schedules the async flusher; the done record must not
+        # outrun the state rows it points at — the dashboard reads the new
+        # task status off disk the moment it sees this answer.
+        await self.flush_state()
+        paused_row = bool(result.get("paused")) or result.get("stop_reason") == "paused"
+        self._outbox_done(
+            outbox,
+            name,
+            {
+                "ok": True,
+                "state": "paused" if paused_row else str(result.get("status") or "done"),
+                "task_id": task_id,
+                "session_id": result.get("session_id"),
+                "status": result.get("status"),
+                "stop_reason": result.get("stop_reason"),
+                "paused": result.get("paused"),
+            },
+        )
+        log.info(
+            "outbox_task_action name=%s action=%s task_id=%s status=%s",
+            name,
+            action,
+            task_id,
+            result.get("status"),
         )
         return None
 
