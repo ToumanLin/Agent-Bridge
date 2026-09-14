@@ -13,10 +13,21 @@ from agent_bridge.usage import (
 )
 
 
-def devin_update(input_toks=None, output=None, *, run_id=None, parent=None, used=None, size=None):
+def devin_update(
+    input_toks=None,
+    output=None,
+    *,
+    cached_read=None,
+    run_id=None,
+    parent=None,
+    used=None,
+    size=None,
+):
     meta = {}
     if input_toks is not None:
         meta["cognition.ai/inputTokens"] = input_toks
+    if cached_read is not None:
+        meta["cognition.ai/cachedReadTokens"] = cached_read
     if output is not None:
         meta["cognition.ai/outputTokens"] = output
     if run_id or parent:
@@ -128,11 +139,98 @@ def test_subagent_streams_sum_and_do_not_leak_ids():
     assert out["streams"] == 2
 
 
-def test_parent_agent_id_groups_stream_when_no_run_id():
+def test_parent_agent_id_is_a_parent_pointer_not_a_stream():
+    """runId is the only stream identity. Live devin annotates the root
+    agent's own re-emitted updates with {"parentAgentId": "root"} — a
+    parent pointer, so ctx-without-runId is the root stream, and a literal
+    runId="root" normalizes to it too."""
     assert usage_stream_key(devin_update(run_id="r1", parent="p1")) == "r1"
-    assert usage_stream_key(devin_update(parent="p1")) == "p1"
+    assert usage_stream_key(devin_update(parent="p1")) == ""
+    assert usage_stream_key(devin_update(run_id="root")) == ""
+    assert usage_stream_key(devin_update(run_id="root", parent="p1")) == ""
     assert usage_stream_key(devin_update()) == ""
     assert usage_stream_key({"_meta": {"cognition.ai/subagent_context": {}}}) == ""
+    # Snake_case keys follow the same rule.
+    snake_parent = {"_meta": {"cognition.ai/subagent_context": {"parent_agent_id": "p1"}}}
+    assert usage_stream_key(snake_parent) == ""
+    snake_run = {"_meta": {"cognition.ai/subagent_context": {"run_id": "r2", "parent_agent_id": "p"}}}
+    assert usage_stream_key(snake_run) == "r2"
+
+
+def test_devin_paired_root_updates_dedup_to_one_stream():
+    """The exact sequence live `devin acp` emitted on sess_fafc98c2f9:
+    every root UsageUpdate twice — bare plus a {"parentAgentId": "root"}
+    copy carrying identical counters. Both are the root stream, so the
+    second member of each pair is an exact re-emission and dedups."""
+    run = RunUsage("devin")
+    run.reset()
+    run.update(devin_update(12072, 55, used=12127, size=262000))
+    run.update(devin_update(12072, 55, parent="root", used=12127, size=262000))
+    run.update(devin_update(12219, 56, cached_read=12071, used=12275, size=262000))
+    run.update(devin_update(12219, 56, cached_read=12071, parent="root", used=12275, size=262000))
+    out = run.finish()
+    assert out["input"] == 12219
+    assert out["cached_read"] == 12071
+    assert out["output"] == 111  # per-step 55 + 56, each counted once
+    assert out["total"] == 12330
+    assert out["streams"] == 1
+    assert out["used"] == 12275 and out["size"] == 262000
+    assert out["quality"] == "exact"
+    # No phantom "root" stream survives into the persisted baseline.
+    assert set(run.stream_baselines) == {""}
+
+
+def test_paired_root_dupes_do_not_hide_genuine_subagent_streams():
+    """Mixed root pair + a real runId subagent: the annotated root copy
+    folds into "" while the subagent keeps its own stream."""
+    run = RunUsage("devin")
+    run.reset()
+    run.update(devin_update(10, 4, used=5, size=100))
+    run.update(devin_update(10, 4, parent="root", used=5, size=100))  # paired root copy
+    run.update(devin_update(20, 1, run_id="sub-1", parent="root"))
+    run.update(devin_update(25, 9, used=8, size=100))
+    run.update(devin_update(25, 9, parent="root", used=8, size=100))
+    run.update(devin_update(35, 3, run_id="sub-1", parent="root"))
+    out = run.finish()
+    assert out["input"] == 60  # root 10->25, sub-1 20->35
+    assert out["output"] == 17  # root 4+9, sub-1 1+3
+    assert out["total"] == 77
+    assert out["streams"] == 2
+
+
+def test_root_reemission_after_a_subagent_update_still_dedups():
+    """The per-stream fingerprint survives interleaving: a root counter
+    copy arriving after a subagent update is still an exact re-emission."""
+    run = RunUsage("devin")
+    run.reset()
+    run.update(devin_update(10, 4))
+    run.update(devin_update(20, 1, run_id="sub-1", parent="root"))
+    run.update(devin_update(10, 4, parent="root"))  # non-adjacent root copy
+    out = run.finish()
+    assert out["input"] == 30
+    assert out["output"] == 5
+    assert out["streams"] == 2
+
+
+def test_stale_root_stream_baseline_folds_into_root_stream():
+    """Pre-fix sessions persisted a phantom "root" stream baseline. Seeding
+    folds it into "" fill-gaps-only — and a real "" baseline wins when both
+    carry the same counter."""
+    run = RunUsage("devin")
+    run.reset(stream_baselines={"root": {"input": 100}, "": {"input": 50}})
+    assert set(run.stream_baselines) == {""}
+    run.update(devin_update(60, 1))
+    out = run.finish()
+    # Delta against the truthful "" baseline (50), never the phantom's 100.
+    assert out["input"] == 10
+
+    only = RunUsage("devin")
+    only.reset(stream_baselines={"root": {"input": 100}})
+    only.update(devin_update(130, 2))
+    out = only.finish()
+    # With no "" baseline the folded one still bounds the resumed delta.
+    assert out["input"] == 30
+    assert set(only.stream_baselines) == {""}
 
 
 def test_context_window_used_size_never_counted():

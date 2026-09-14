@@ -535,6 +535,7 @@ def test_token_counter_helpers():
         '"input_tokens"',
         '"inputTokens"',
         '"tokens.unit"',
+        '"tokens.last_snapshot"',
     ):
         assert needle in PAGE
     # The sidebar signature fingerprints run_usage (preferred), legacy usage,
@@ -546,6 +547,9 @@ def test_token_counter_helpers():
     body = re.search(r"function tokSpan\(tk,cls,live\)\{([\s\S]*?)\n\}", PAGE).group(1)
     assert "tk.run_usage" in body and "runTok" in body
     assert 'quality:"estimate"' in body
+    # The legacy fallback is labeled a last-snapshot estimate, not a run total.
+    title = re.search(r"function tokTitle\(o\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert 't("tokens.last_snapshot"' in title and "o.legacy" in title
     # The compact-count unit comes from the dictionary, not a hardcoded suffix.
     assert 't("tokens.unit")' in body
     # Usage text stays static between overview polls — not joined to the tick.

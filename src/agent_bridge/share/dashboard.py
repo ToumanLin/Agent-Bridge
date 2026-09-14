@@ -646,6 +646,7 @@ const LOCALES=Object.freeze({
 "time.ago_hour":"{n}h ago",
 "time.ago_day":"{n}d ago",
 "tokens.run":"Run tokens {n}",
+"tokens.last_snapshot":"Last snapshot estimate ~{n} — not a whole-run total",
 "tokens.ctx_only":"Context in use ~{n} — last snapshot only, not a run total",
 "tokens.in":"in {n}",
 "tokens.cached":"cached {n}",
@@ -747,6 +748,7 @@ const LOCALES=Object.freeze({
 "time.ago_hour":"{n} 小时前",
 "time.ago_day":"{n} 天前",
 "tokens.run":"运行 token {n}",
+"tokens.last_snapshot":"最近快照估算 ~{n}——不是单次运行总量",
 "tokens.ctx_only":"上下文占用 ~{n}——仅为最近快照，不是单次运行总量",
 "tokens.in":"输入 {n}",
 "tokens.cached":"已缓存 {n}",
@@ -848,6 +850,7 @@ const LOCALES=Object.freeze({
 "time.ago_hour":"{n} 小時前",
 "time.ago_day":"{n} 天前",
 "tokens.run":"執行 token {n}",
+"tokens.last_snapshot":"最近快照估算 ~{n}——不是單次執行總量",
 "tokens.ctx_only":"上下文佔用 ~{n}——僅為最近快照，不是單次執行總量",
 "tokens.in":"輸入 {n}",
 "tokens.cached":"已快取 {n}",
@@ -1101,8 +1104,8 @@ function durSpan(tk,cls){
    window occupancy snapshots — metadata only, never the consumed total.
    `quality:"estimate"` marks degraded derivations (resumed conversation
    counters without a baseline). Legacy `usage` rows are last-snapshot data:
-   usable only as a marked estimate, and a `used`-only snapshot is context
-   occupancy, never a run total. */
+   usable only labeled as a last-snapshot estimate, and a `used`-only
+   snapshot is context occupancy, never a run total. */
 function usageNums(u){
   if(!u||typeof u!=="object")u={};
   const m=typeof u._meta==="object"&&u._meta?u._meta:{};
@@ -1157,20 +1160,25 @@ function tokTitle(o){
   if(o.input!=null)seg.push(t("tokens.in",{n:fmtNum(o.input)}));
   if(o.cached)seg.push(t("tokens.cached",{n:fmtNum(o.cached)}));
   if(o.output!=null)seg.push(t("tokens.out",{n:fmtNum(o.output)}));
-  const parts=[t("tokens.run",{n:fmtNum(o.total)})+
+  // A legacy raw-usage fallback is a last-snapshot estimate, never a run
+  // total — the lead says so instead of "Run tokens", and already carries
+  // the estimate mark.
+  const parts=[(o.legacy?t("tokens.last_snapshot",{n:fmtNum(o.total)})
+    :t("tokens.run",{n:fmtNum(o.total)}))+
     (seg.length?" ("+seg.join(", ")+")":"")];
   if(o.used!=null)parts.push(t("tokens.context",
     {n:fmtNum(o.used)+(o.size?"/"+fmtNum(o.size):"")}));
   if(o.conv!=null)parts.push(t("tokens.conversation",{n:fmtNum(o.conv)}));
   if(o.live)parts.push(t("tokens.live"));
-  if(o.estimate)parts.push(t("tokens.estimate"));
+  if(o.estimate&&!o.legacy)parts.push(t("tokens.estimate"));
   return parts.join(" · ");
 }
 /* Token span for the latest/current task. Priority while running: live
    `usage` event snapshot, then the persisted run_usage. A present run_usage
    is authoritative — when it has no computable run total (estimate without
    counters) nothing renders rather than showing the conversation total.
-   Old state falls back to raw `usage`, always marked as an estimate. */
+   Old state falls back to raw `usage`, labeled a last-snapshot estimate
+   rather than a run total. */
 function tokSpan(tk,cls,live){
   let info=null,isLive=false,ctxOnly=false;
   if(tk&&(tk.status==="running"||tk.status==="queued")&&live){
@@ -1186,7 +1194,7 @@ function tokSpan(tk,cls,live){
         tk.usage.total_tokens===undefined&&tk.usage.totalTokens===undefined&&
         !(tk.usage._meta&&tk.usage._meta["cognition.ai/totalTokens"]!==undefined);
       info={total:m,input:n.input,cached:n.cached,output:n.output,
-        used:n.used,size:n.size,quality:"estimate"};
+        used:n.used,size:n.size,quality:"estimate",legacy:true};
     }
   }
   if(!info||!Number.isFinite(info.total))return"";

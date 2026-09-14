@@ -10,8 +10,13 @@ Provider semantics differ:
   cumulative snapshots (they reset on context compaction — a decrease starts
   a new epoch), while ``outputTokens`` is a per-step count that must be
   summed. Subagent usage arrives as separate streams identified by
-  ``cognition.ai/subagent_context`` (``runId`` when present, else
-  ``parentAgentId``; absent means the root stream).
+  ``cognition.ai/subagent_context`` ``runId`` — the only stream identity.
+  ``parentAgentId`` is a parent pointer, not an identity: live Devin
+  re-emits every root update annotated with ``{"parentAgentId": "root"}``,
+  so a context without a ``runId`` (and a literal ``runId="root"``) is the
+  root stream; the per-stream fingerprint dedups those paired copies. A
+  hypothetical subagent reporting usage with a parent but no runId folds
+  into the root stream — bounded mis-attribution, not silent loss.
 - Other ACP workers: counters in ``UsageUpdate`` fields/``_meta`` are treated
   as cumulative snapshots — the provider-neutral safe choice.
   ``PromptResponse.usage`` semantics are ambiguous in the ACP spec itself:
@@ -84,7 +89,14 @@ def _num(value: Any) -> int | float | None:
 
 
 def usage_stream_key(raw: Any) -> str:
-    """Identify the subagent usage stream; ``""`` is the root agent."""
+    """Identify the subagent usage stream; ``""`` is the root agent.
+
+    ``runId``/``run_id`` is the only non-root identity. ``parentAgentId``
+    names the owning parent — live Devin stamps ``{"parentAgentId": "root"}``
+    on the root agent's own re-emitted updates — so it never routes; a
+    context without a runId, and a literal ``runId="root"``, are the root
+    stream.
+    """
     if not isinstance(raw, dict):
         return ""
     meta = raw.get("_meta")
@@ -93,10 +105,10 @@ def usage_stream_key(raw: Any) -> str:
     ctx = meta.get("cognition.ai/subagent_context")
     if not isinstance(ctx, dict):
         return ""
-    for key in ("runId", "run_id", "parentAgentId", "parent_agent_id"):
+    for key in ("runId", "run_id"):
         value = ctx.get(key)
         if isinstance(value, str) and value:
-            return value
+            return "" if value == "root" else value
         if _num(value) is not None:
             return str(value)
     return ""
@@ -195,10 +207,17 @@ class RunUsage:
             self._conv_prev = {
                 k: v for k, v in conv_baseline.items() if _num(v) is not None
             }
-        for stream_key, counters in (stream_baselines or {}).items():
+        # Baselines persisted before the stream-key fix can carry a phantom
+        # "root" stream (a parentAgentId mistaken for an identity). Fold it
+        # into the "" stream — after every real stream so a stale "root"
+        # value can never displace a truthful baseline for the same counter.
+        for stream_key, counters in sorted(
+            (stream_baselines or {}).items(), key=lambda item: str(item[0]) == "root"
+        ):
             if not isinstance(counters, dict):
                 continue
-            st = self._streams.setdefault(str(stream_key), self._new_stream())
+            stream = str(stream_key)
+            st = self._streams.setdefault("" if stream == "root" else stream, self._new_stream())
             for key, value in counters.items():
                 # Only fill gaps: for a still-live worker the in-memory prev
                 # is at least as fresh as anything persisted last turn.

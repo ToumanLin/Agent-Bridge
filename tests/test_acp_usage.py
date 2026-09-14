@@ -20,9 +20,9 @@ ECHO = Path(__file__).resolve().parent / "echo_agent.py"
 _COG = "cognition.ai/"
 
 
-def _upd(used: int, meta: dict) -> UsageUpdate:
+def _upd(used: int, meta: dict, size: int = 100) -> UsageUpdate:
     return UsageUpdate(
-        used=used, size=100, sessionUpdate="usage_update", field_meta=meta
+        used=used, size=size, sessionUpdate="usage_update", field_meta=meta
     )
 
 
@@ -46,11 +46,11 @@ def _adapter(
     )
 
 
-def _task(session: Session, task_id: str, message: str) -> Task:
+def _task(session: Session, task_id: str, message: str, agent: str = "echo") -> Task:
     return Task(
         task_id=task_id,
         session_id=session.session_id,
-        agent="echo",
+        agent=agent,
         message=message,
         cwd=session.cwd,
     )
@@ -91,6 +91,77 @@ async def test_client_usage_updates_aggregate_streams(tmp_path):
     # no stream routing key / subagent id anywhere in the emitted events
     assert "sub-1" not in json.dumps(events)
     assert '"stream":' not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+async def test_client_paired_root_updates_dedup_to_one_stream(tmp_path):
+    """Live `devin acp` emits every root UsageUpdate twice: bare plus a
+    {"parentAgentId": "root"} annotated copy of the same counters
+    (sess_fafc98c2f9). parentAgentId is a parent pointer — both copies are
+    the root stream, the second member of each pair dedups, and the
+    transcript gets two usage events rather than four."""
+    client = _BridgeClient("sess_dup", tmp_path, "devin")
+    client.reset_turn()
+    root_ctx = {_COG + "subagent_context": {"parentAgentId": "root"}}
+    first = {_COG + "inputTokens": 12072, _COG + "outputTokens": 55}
+    second = {
+        _COG + "inputTokens": 12219,
+        _COG + "cachedReadTokens": 12071,
+        _COG + "outputTokens": 56,
+    }
+    for update in (
+        _upd(12127, first, size=262000),
+        _upd(12127, {**first, **root_ctx}, size=262000),
+        _upd(12275, second, size=262000),
+        _upd(12275, {**second, **root_ctx}, size=262000),
+    ):
+        await client.session_update("sess_dup", update)
+
+    final = client.run.finish()
+    assert final["input"] == 12219
+    assert final["cached_read"] == 12071
+    assert final["output"] == 111
+    assert final["total"] == 12330
+    assert final["streams"] == 1
+    assert final["used"] == 12275 and final["size"] == 262000
+    # The persisted per-stream baseline holds only the real stream.
+    assert set(client.run.stream_baselines) == {""}
+
+    events = [e for e in read_events("sess_dup", tmp_path) if e["type"] == "usage"]
+    assert len(events) == 2  # the annotated re-emissions are suppressed
+    assert events[-1]["data"]["consumed"]["total"] == 12330
+    assert "root" not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_paired_root_updates_aggregate_once(tmp_path):
+    """End to end over the real ACP wire: ECHO_USAGE_PAIRED_ROOT replays the
+    live devin paired emission; the run aggregates one stream and persists
+    only real stream baselines."""
+    adapter = AcpAdapter(
+        AgentConfig(
+            name="devin",
+            protocol="acp",
+            command=[sys.executable, str(ECHO)],
+            env={"ECHO_USAGE_PAIRED_ROOT": "1"},
+        ),
+        tmp_path,
+    )
+    session = Session(session_id="sess_pair", agent="devin", cwd=str(tmp_path))
+    try:
+        result = await adapter.run_turn(session, _task(session, "t_pair", "hi", agent="devin"))
+        assert result.run_usage["input"] == 12219
+        assert result.run_usage["cached_read"] == 12071
+        assert result.run_usage["output"] == 111
+        assert result.run_usage["total"] == 12330
+        assert result.run_usage["streams"] == 1
+        assert result.run_usage["used"] == 12275 and result.run_usage["size"] == 262000
+        assert set(session.usage_baseline["streams"]) == {""}
+
+        events = [e for e in read_events("sess_pair", tmp_path) if e["type"] == "usage"]
+        assert len(events) == 2
+    finally:
+        await adapter.shutdown(session)
 
 
 @pytest.mark.asyncio

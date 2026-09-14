@@ -30,14 +30,35 @@ def _usage_updates(turn: int) -> list[UsageUpdate]:
     Root stream cumulative input + per-step output, a subagent stream keyed by
     subagent_context.runId, and one exact paired re-emission. Counters are
     conversation-cumulative: later turns continue from where the last ended.
+
+    ECHO_USAGE_PAIRED_ROOT replays the observed live devin emission instead:
+    every root update twice — bare, then annotated with
+    {"parentAgentId": "root"} — with identical counters.
     """
-    if not os.environ.get("ECHO_USAGE"):
+    if not os.environ.get("ECHO_USAGE") and not os.environ.get("ECHO_USAGE_PAIRED_ROOT"):
         return []
 
-    def upd(used: int, meta: dict[str, Any]) -> UsageUpdate:
+    def upd(used: int, meta: dict[str, Any], size: int = 100) -> UsageUpdate:
         return UsageUpdate(
-            used=used, size=100, sessionUpdate="usage_update", field_meta=meta
+            used=used, size=size, sessionUpdate="usage_update", field_meta=meta
         )
+
+    if os.environ.get("ECHO_USAGE_PAIRED_ROOT"):
+        root_ctx = {_COG + "subagent_context": {"parentAgentId": "root"}}
+        if turn == 0:
+            first = {_COG + "inputTokens": 12072, _COG + "outputTokens": 55}
+            second = {
+                _COG + "inputTokens": 12219,
+                _COG + "cachedReadTokens": 12071,
+                _COG + "outputTokens": 56,
+            }
+            return [
+                upd(12127, first, size=262000),
+                upd(12127, {**first, **root_ctx}, size=262000),
+                upd(12275, second, size=262000),
+                upd(12275, {**second, **root_ctx}, size=262000),
+            ]
+        return []
 
     sub = {_COG + "subagent_context": {"runId": "sub-1", "parentAgentId": "root"}}
     if turn == 0:

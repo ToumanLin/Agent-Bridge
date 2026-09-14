@@ -436,12 +436,36 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   eq(legacyHtml.includes("estimate"), true, "legacy tooltip marks estimate");
   eq(legacyHtml.includes("in 108,414"), true,
     "legacy tooltip keeps the breakdown");
+  // The label must be truthful: a last-snapshot estimate, never a whole-run
+  // total — in the tooltip AND the aria-label, which share one string.
+  eq(legacyHtml.includes("Last snapshot estimate ~5,105"), true,
+    "legacy tooltip calls itself a last-snapshot estimate");
+  eq(legacyHtml.includes("not a whole-run total"), true,
+    "legacy tooltip disclaims the whole-run total");
+  eq(legacyHtml.includes('aria-label="Last snapshot estimate'), true,
+    "legacy aria-label carries the same disclaimer");
+  // run_usage = {} is the same legacy path — devin-shaped snapshots included.
+  const devinSnap = X.tokSpan(task({ run_usage: {},
+    usage: { used: 12275, size: 262000,
+      _meta: { "cognition.ai/inputTokens": 12219,
+        "cognition.ai/cachedReadTokens": 12071,
+        "cognition.ai/outputTokens": 56,
+        "cognition.ai/subagent_context": { parentAgentId: "root" } } } }),
+    "stok");
+  eq(devinSnap.includes("~204 tok"), true,
+    "empty run_usage + devin snapshot renders as an estimate");
+  eq(devinSnap.includes("Last snapshot estimate"), true,
+    "empty run_usage tooltip stays a snapshot estimate");
+  eq(devinSnap.includes("not a whole-run total"), true,
+    "empty run_usage tooltip disclaims the run total");
   const ctxHtml = X.tokSpan(task({ usage: { used: 113177, size: 262000 } }),
     "stok");
   eq(ctxHtml.includes("~113k tok"), true,
     "context-only snapshot renders as estimate");
   eq(ctxHtml.includes("Context in use"), true,
     "context-only title never claims a run total");
+  eq(ctxHtml.includes("last snapshot"), true,
+    "context-only title admits it is only a snapshot");
   eq(X.tokSpan(task({}), "stok"), "", "no usage -> empty span");
   eq(X.tokSpan(task({ usage: { junk: 1 } }), "stok"), "",
     "unusable usage -> empty span");
