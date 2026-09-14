@@ -587,7 +587,13 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
   justify-content:center}
 .hbody{flex:1;min-width:0}
 .htitle{font-size:17px;font-weight:700;margin:0;line-height:1.3;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  display:flex;align-items:baseline;gap:10px;min-width:0}
+.htext{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* The identifier pair is secondary chrome inside the title — dimmed mono
+   that never ellipsizes first: a long session title yields to it instead. */
+.hids{flex:none;max-width:55%;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;font-family:var(--font-mono);font-size:11px;
+  font-weight:500;color:var(--dimmer)}
 .hsub{display:flex;align-items:center;gap:9px;margin-top:4px;flex-wrap:wrap;
   font-size:12px;color:var(--dim)}
 .hstatus{display:inline-flex;align-items:center;gap:6px;font-weight:600;color:var(--text)}
@@ -870,6 +876,8 @@ const LOCALES=Object.freeze({
 "language.system":"Follow system",
 "session.select":"Select a session",
 "session.working_repo":"Working repo · {repo}",
+"session.task_id":"task {id}",
+"session.session_id":"session {id}",
 "session.turns":{"one":"{n} turn","other":"{n} turns"},
 "empty.no_sessions":"No sessions",
 "empty.no_events":"No events",
@@ -977,6 +985,8 @@ const LOCALES=Object.freeze({
 "language.system":"跟随系统",
 "session.select":"选择一个会话",
 "session.working_repo":"工作仓库 · {repo}",
+"session.task_id":"任务 {id}",
+"session.session_id":"会话 {id}",
 "session.turns":{"other":"{n} 回合"},
 "empty.no_sessions":"暂无会话",
 "empty.no_events":"暂无事件",
@@ -1084,6 +1094,8 @@ const LOCALES=Object.freeze({
 "language.system":"跟隨系統",
 "session.select":"選擇一個工作階段",
 "session.working_repo":"工作儲存庫 · {repo}",
+"session.task_id":"任務 {id}",
+"session.session_id":"工作階段 {id}",
 "session.turns":{"other":"{n} 回合"},
 "empty.no_sessions":"暫無工作階段",
 "empty.no_events":"暫無事件",
@@ -1679,9 +1691,16 @@ function renderSessionHeader(){
   const tk=latestTask(s.session_id);
   const repo=baseName(s.cwd);
   const agoStr=s.last_active_at?ago(s.last_active_at):"";
+  /* The title pair always names the displayed sub-agent: both ids resolve
+     fresh from this session's own rows on every render, and a missing value
+     drops out instead of leaving stale text behind. */
+  const taskId=tk&&tk.task_id!=null?String(tk.task_id):"";
+  const ids=[taskId?t("session.task_id",{id:taskId}):"",
+    s.session_id?t("session.session_id",{id:s.session_id}):""]
+    .filter(Boolean).join(" · ");
   el.innerHTML=`<div class="avatar">${agentAvatar(s,26)}</div>
     <div class="hbody">
-      <h2 class="htitle">${esc(s.title||s.session_id)}</h2>
+      <h2 class="htitle"><span class="htext">${esc(s.title||s.session_id)}</span>${ids?`<span class="hids" title="${esc(ids)}">${esc(ids)}</span>`:""}</h2>
       <div class="hsub">
         <span class="hstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,13)}</span> <span${st.raw?` title="${esc(st.raw)}"`:""}>${esc(t(st.key))}</span>${durSpan(tk,"hdur")}${tokSpan(tk,"htok",livePartial(s.session_id,tk))}</span>
         <span class="badge">${esc(s.agent)}</span>

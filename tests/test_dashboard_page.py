@@ -454,6 +454,47 @@ def test_header_icon_has_no_tint_block():
     assert "align-items:center" in rule and "justify-content:center" in rule
 
 
+def test_session_header_identifiers():
+    """The right-pane title names the displayed sub-agent's identifiers.
+
+    The Agent Bridge task_id (the session's latest task row) and the
+    session_id render inside the h2 title — resolved per selection, escaped
+    as data, labeled via the bundled dictionaries, and dropped rather than
+    stale when absent. Executable end-to-end coverage lives in
+    tests/dashboard_status_behavior.js.
+    """
+    body = re.search(r"function renderSessionHeader\(\)\{([\s\S]*?)\n\}", PAGE)
+    assert body, "renderSessionHeader missing"
+    body = body.group(1)
+    # task_id comes from the selected session's own latest task — never a
+    # global or foreign row.
+    assert "latestTask(s.session_id)" in body
+    for needle in ('"session.task_id"', '"session.session_id"', "esc(ids)"):
+        assert needle in body
+    # Each id renders only when present: the join drops the missing part
+    # instead of printing "undefined"/"null" or a stale value.
+    assert "filter(Boolean)" in body
+    # The pair lives inside the h2 after the still-primary title text.
+    h2 = re.search(r'<h2 class="htitle">([\s\S]*?)</h2>', body)
+    assert h2, "htitle markup missing"
+    frag = h2.group(1)
+    assert 'class="htext"' in frag and 'class="hids"' in frag
+    assert frag.index('class="htext"') < frag.index('class="hids"')
+    assert "esc(s.title||s.session_id)" in frag
+    # The full untruncated pair stays reachable via tooltip.
+    assert 'title="${esc(ids)}"' in frag
+    # The labels resolve in every bundled dictionary (id text stays data).
+    for loc in _locales().values():
+        assert "session.task_id" in loc and "session.session_id" in loc
+    # Layout: the title text ellipsizes first; the ids span stays put.
+    htitle = re.search(r"\.htitle\{([^}]*)\}", PAGE).group(1)
+    assert "display:flex" in htitle
+    htext = re.search(r"\.htext\{([^}]*)\}", PAGE).group(1)
+    assert "min-width:0" in htext and "text-overflow:ellipsis" in htext
+    hids = re.search(r"\.hids\{([^}]*)\}", PAGE).group(1)
+    assert "flex:none" in hids and "var(--font-mono)" in hids
+
+
 def test_dark_theme_is_neutral_gray_black():
     dark = re.search(r'\[data-theme="dark"\]\{([^}]*)\}', PAGE).group(1)
     # The old GitHub-blue dark palette is gone.

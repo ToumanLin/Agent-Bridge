@@ -1172,6 +1172,94 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   X._polled().s2 = false;
   eq(true, true, "polled flag is test-controllable");
 
+  /* ================= session header identifiers ================= */
+
+  // --- the right-pane title carries the displayed sub-agent's ids ---
+  X._setSessions([
+    { session_id: "s1", proc_state: "busy", title: "Researcher",
+      agent: "devin", cwd: "/r" },
+    { session_id: "s2", proc_state: "ready", title: "Writer",
+      agent: "kimi", cwd: "/r" },
+  ]);
+  X._setTasks([
+    task({ task_id: "task_1", session_id: "s1" }),
+    task({ task_id: "task_2", session_id: "s2" }),
+  ]);
+  X._setSelected("s1");
+  X.renderSessionHeader();
+  let hdr = elCache["#hwrap"].innerHTML;
+  eq(hdr.includes("task task_1"), true,
+    "header title shows the selected agent's task_id");
+  eq(hdr.includes("session s1"), true,
+    "header title shows the selected session_id");
+  eq(hdr.includes("task_2"), false,
+    "another agent's task_id stays out of the title");
+  eq(hdr.includes('class="hids"'), true,
+    "ids render inside the title's .hids span");
+  eq(hdr.indexOf('class="htext"') < hdr.indexOf('class="hids"'), true,
+    "the session title stays the leading title text");
+  eq(hdr.includes('title="task task_1 · session s1"'), true,
+    "the ids span tooltip carries the full untruncated pair");
+
+  // Selection changes re-render the pair for the newly displayed sub-agent.
+  X.select("s2");
+  hdr = elCache["#hwrap"].innerHTML;
+  eq(hdr.includes("task task_2") && hdr.includes("session s2"), true,
+    "select() swaps the title ids to the new sub-agent");
+  eq(hdr.includes("task_1"), false,
+    "the previous agent's task_id is gone");
+
+  // A session with no task still shows its session_id — no stale task id.
+  X._setTasks([]);
+  X.renderSessionHeader();
+  hdr = elCache["#hwrap"].innerHTML;
+  eq(hdr.includes("session s2"), true,
+    "session_id still renders without any task row");
+  eq(hdr.includes("task_2"), false, "no stale task_id once tasks are gone");
+  eq(hdr.includes('class="hids"'), true,
+    "the ids span still renders for the session-only pair");
+
+  // A task row without a task_id contributes nothing — never "null"/"undefined".
+  X._setTasks([task({ task_id: null, session_id: "s2" })]);
+  X.renderSessionHeader();
+  hdr = elCache["#hwrap"].innerHTML;
+  eq(hdr.includes("session s2"), true, "session_id survives a null task_id");
+  eq(/null|undefined/.test(hdr), false,
+    "missing ids never render literal null/undefined");
+
+  // Ids are data — escaped verbatim, never interpreted as markup.
+  X._setSessions([{ session_id: "s<1>", proc_state: "ready", title: "T",
+    agent: "devin" }]);
+  X._setTasks([task({ task_id: "t<b>", session_id: "s<1>" })]);
+  X._setSelected("s<1>");
+  X.renderSessionHeader();
+  hdr = elCache["#hwrap"].innerHTML;
+  eq(hdr.includes("t&lt;b&gt;"), true, "task_id is HTML-escaped");
+  eq(hdr.includes("s&lt;1&gt;"), true, "session_id is HTML-escaped");
+  eq(hdr.includes("t<b>"), false, "raw id markup never reaches the title");
+
+  // Labels localize through the dictionaries; the ids stay verbatim data.
+  X._setSessions([{ session_id: "s1", proc_state: "busy", title: "Researcher",
+    agent: "devin" }]);
+  X._setTasks([task({ task_id: "task_1", session_id: "s1" })]);
+  X._setSelected("s1");
+  X.setLocalePref("zh-CN");
+  hdr = elCache["#hwrap"].innerHTML;
+  eq(hdr.includes("任务 task_1") && hdr.includes("会话 s1"), true,
+    "zh-CN id labels with verbatim ids");
+  X.setLocalePref("zh-TW");
+  hdr = elCache["#hwrap"].innerHTML;
+  eq(hdr.includes("任務 task_1") && hdr.includes("工作階段 s1"), true,
+    "zh-TW id labels with verbatim ids");
+  X.setLocalePref("en");
+
+  // No resolvable selection -> the placeholder owns the header, no id chrome.
+  X._setSelected("gone");
+  X.renderSessionHeader();
+  hdr = elCache["#hwrap"].innerHTML;
+  eq(hdr.includes("hids"), false, "no ids without a selected session");
+  X._setSelected("s1");
+
   /* ================= weekly total + batched live usage ================= */
 
 // --- weekStartMs: browser-local calendar Monday 00:00 boundary ---
