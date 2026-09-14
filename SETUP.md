@@ -66,6 +66,15 @@ The helper writes `$AGENT_BRIDGE_HOME/dsh-acp` (default `~/.agent-bridge/dsh-acp
 
 Restart Codex after editing `config.toml`.
 
+Optional — only for a single ~90-minute `wait_task` per call; most setups should keep 600:
+
+```toml
+[mcp_servers.agent_bridge]
+tool_timeout_sec = 5700
+```
+
+Then `wait_task(timeout_sec=5400)` can stay pending as one request. Keep margin — do not set both values to exactly 5400. This ceiling is enforced by the host, not Bridge: whether a given Codex version accepts and honors it must be verified (upstream defaults have moved across versions), and it only helps a *direct* MCP call. If the model routes tools through Code Mode, the outer `exec` still yields on its own cadence and every yield/wait boundary is a model-visible turn. Codex-side `features.code_mode.direct_only_tool_namespaces` can force direct exposure for the Agent Bridge namespace, but the generated name (likely `mcp__agent_bridge` for this server key) is client-derived and version-sensitive — verify it instead of assuming. See [Waiting and timeouts](#waiting-and-timeouts).
+
 MCP tool definitions are negotiated when the stdio connection starts. Adding
 or changing a tool in Bridge therefore does not update a coordinator that is
 already connected: its in-memory catalog can continue to show the previous
@@ -350,6 +359,20 @@ Abandoned server instances self-exit: after `server.idle_exit_sec` (default 7200
 Linger only covers an orderly close while the Bridge process itself stays alive and keeps owning the worker pipes. Force-killing it (`taskkill /f`, `kill -9`, Codex terminating its MCP Job Object) loses the live turn regardless of policy — linger cannot defeat a host force-kill. To carry work across one, park the turn with `pause_task` first and continue it with `resume_task` after the restart. Stronger guarantees would need a persistent daemon, which Bridge deliberately is not.
 
 `pause_task` is the graceful way to park an in-flight turn: the adapter's own cancel runs first so the partial result, usage, transcript, and native session id all land through the normal return path, then the task ends terminal — `status=cancelled`, `stop_reason="paused"`, `paused=true`, `resumable=true`. It is a safe cancel, not frozen execution; no worker protocol can suspend a turn mid-flight. `resume_task` (accepting paused, cancelled, or failed rows) dispatches a **new** continuation task on the same session and native conversation — the old row is never rewritten, it just gains `resumed_by`, and the new one carries `resume_of` and `source="resume"`. Omitting `message` sends a default "pick up where the paused turn left off" prompt. Snapshots and `list_tasks` report `paused` / `resumable` / `resume_hint`, and `resume_task` rejects a live sibling's task while adopting a dead owner's — reaping the orphaned worker first so two executors never drive one conversation.
+
+## Waiting and timeouts
+
+Five separate clocks decide how long things run — do not conflate them:
+
+| Control | Owner | What it bounds |
+| --- | --- | --- |
+| `wait_task timeout_sec` | This call | How long one observation call blocks (default 180). `timed_out` ends the call only; a host-side MCP cancel likewise cuts the waiter, never the worker's background task. |
+| `[agents.<name>] stall_timeout_sec` | Worker | Silence budget before Bridge fails the turn as `stalled` (default 1800, 0 disables). Worker lifetime is bounded by this plus process survival — not by any waiter. |
+| `[server] idle_exit_sec`, `shutdown_policy`, `linger_max_sec` | Bridge server | Abandoned-server self-exit and orderly-close behavior (see Server lifecycle). A queued/running task already suppresses idle exit. |
+| Host MCP tool timeout | Coordinator host | The per-call ceiling that decides how long one `wait_task` may stay pending: Codex `tool_timeout_sec`, Kimi `toolTimeoutMs`, ZCode `timeoutMs`, Claude `timeout`, Grok `tool_timeout_sec`, Cursor ~45–60 s fixed. |
+| Codex Code Mode exec/wait yield | Codex host | When MCP calls route through Code Mode, the outer `exec` yields and each yield/wait boundary is a model-visible turn (inspected Codex defaults are ~10 s, not a universal 60 s). Bridge cannot set it. |
+
+Token cost: a pending `wait_task` does not poll the model — a local wait parks one Bridge coroutine on an event, and a sibling-owned wait only polls `state.json` inside the Bridge process. What spends coordinator turns is each returned timeout or Code Mode yield the model must re-decide. The zero-polling pattern for long tasks is dispatch-and-later-check: `dispatch_task`, end the turn (or do other work), then `list_tasks` / `check_task` / `get_result` on a later turn. Bridge cannot wake a dormant coordinator at completion — that needs a host scheduler or notification mechanism.
 
 ## Remaining quota in `list_agents`
 

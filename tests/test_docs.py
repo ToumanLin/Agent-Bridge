@@ -140,3 +140,32 @@ def test_skill_mentions_stall_watchdog():
     assert "stall_timeout_sec" in skill
     assert "silent_for_sec" in skill
     assert _read("README.md").count("stall_timeout_sec") >= 2
+
+
+def test_docs_cover_long_wait_and_token_efficient_patterns():
+    setup = _read("SETUP.md")
+    en = _read("ORCHESTRATION.md")
+    zh = _read("ORCHESTRATION.zh-CN.md")
+    readme = _read("README.md")
+    # Optional Codex single-long-wait example keeps margin above 5400.
+    assert "tool_timeout_sec = 5700" in setup
+    assert "wait_task(timeout_sec=5400)" in setup
+    # The distinct timeout controls are named by owner.
+    for token in (
+        "stall_timeout_sec",
+        "idle_exit_sec",
+        "shutdown_policy",
+        "linger_max_sec",
+        "Code Mode",
+        "yield",
+    ):
+        assert token in setup
+    # Dispatch-and-later-check is the zero-poll pattern; docs never claim
+    # Bridge can wake a dormant coordinator by itself.
+    assert "dispatch-and-later-check" in setup
+    assert "cannot wake a dormant coordinator" in setup
+    assert "cannot wake a dormant coordinator" in en
+    assert "5400" in en
+    assert "5400" in zh
+    assert "5400" in readme
+    assert "休眠的协调者" in zh

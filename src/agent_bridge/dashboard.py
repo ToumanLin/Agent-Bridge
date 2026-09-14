@@ -55,6 +55,30 @@ def _wait_for_dashboard(url: str) -> bool:
     return False
 
 
+def _popen_detached(argv: list[str], out) -> None:
+    """Popen ``argv`` detached so the dashboard outlives the launching Bridge."""
+    kw: dict = {"stdin": subprocess.DEVNULL, "stdout": out, "stderr": subprocess.STDOUT}
+    if sys.platform != "win32":
+        subprocess.Popen(argv, start_new_session=True, **kw)
+        return
+    # DETACHED_PROCESS and CREATE_NEW_PROCESS_GROUP isolate only the console
+    # and Ctrl+C group — a child still joins any Job Object an agent host
+    # placed this Bridge process into, and JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    # then kills the dashboard when the launching Bridge exits.
+    # CREATE_BREAKAWAY_FROM_JOB removes the child from that job at creation;
+    # a job without JOB_OBJECT_LIMIT_BREAKAWAY_OK refuses it
+    # (ERROR_ACCESS_DENIED), so the plain process-group flags stay a retry.
+    base = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+    try:
+        subprocess.Popen(argv, creationflags=base | breakaway, **kw)
+    except OSError:
+        if not breakaway:
+            raise
+        log.warning("dashboard auto-open: job breakaway refused; relaunching within job")
+        subprocess.Popen(argv, creationflags=base, **kw)
+
+
 def _launch(home: Path, host: str, port: int) -> bool:
     # Prefer the packaged page so upgrades cannot be shadowed indefinitely by
     # an old dashboard.py copied into the data directory.  The home copy is a
@@ -67,20 +91,10 @@ def _launch(home: Path, host: str, port: int) -> bool:
         return False
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    kwargs: dict = {}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-    else:
-        kwargs["start_new_session"] = True
+    argv = [sys.executable, str(script), "--port", str(port), "--dir", str(home)]
     try:
         with open(log_dir / "dashboard.log", "ab") as out:
-            subprocess.Popen(
-                [sys.executable, str(script), "--port", str(port), "--dir", str(home)],
-                stdin=subprocess.DEVNULL,
-                stdout=out,
-                stderr=subprocess.STDOUT,
-                **kwargs,
-            )
+            _popen_detached(argv, out)
     except Exception:
         log.exception("dashboard auto-open: failed to launch %s", script)
         return False

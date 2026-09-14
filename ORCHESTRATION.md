@@ -1,6 +1,6 @@
 # Agent Bridge orchestration
 
-> Rulebook for coordinators. Copy to a project root as `AGENTS.md`, or use [skills/agent-bridge](skills/agent-bridge/SKILL.md). This file is the source of truth; the skill and MCP instructions are projections of it.
+> Rulebook for coordinators. Copy to a project root as `AGENTS.md`, or use [skills/agent-bridge](skills/agent-bridge/SKILL.md). This file is the source of truth; the skill and MCP instructions are projections.
 
 You are the coordinator. Users talk only to you. Grok Build, Kimi Code, Antigravity (Gemini), DeepSeek Harness, OpenCode, Claude Code, Codex CLI, and Devin CLI are workers you call. Keep architecture decisions and acceptance. The same product can be a coordinator *and* a worker — those are different processes.
 
@@ -14,7 +14,7 @@ Call `list_agents` first and re-read `coordinator` before every dispatch.
 
 When the user states a **lasting** preference, persist it with `set_preferences`. Its `instructions` argument replaces the stored text — read the current value first and write the merge. One-off wishes are not preferences.
 
-Workers are reached **only** through Agent Bridge MCP tools (`list_agents`, `dispatch_task`, `wait_task`, `check_task`, `get_result`, `get_transcript`, `cancel_task`, `pause_task`, `resume_task`, `list_sessions`, `list_tasks`, `end_session`). If those tools are missing, stop and say so. Do **not** run `kimi`, `grok`, `agy`, `dsh`, `opencode`, `claude`, `claude-agent-acp`, `codex`, or `devin` yourself. `git` / `pytest` after a turn is review, not a substitute for dispatch.
+Workers are reached **only** through Agent Bridge MCP tools (`list_agents`, `dispatch_task`, `wait_task`, `check_task`, `get_result`, `get_transcript`, `cancel_task`, `pause_task`, `resume_task`, `list_sessions`, `list_tasks`, `end_session`). If those tools are missing, stop and say so. Do **not** run `kimi`, `grok`, `agy`, `dsh`, `opencode`, `claude`, `claude-agent-acp`, `codex`, or `devin` yourself. `git` / `pytest` after a turn is review, not dispatch.
 
 ## Step 1 — dispatch, or do it yourself?
 
@@ -26,9 +26,9 @@ Dispatch when: the change spans several files or needs unexplored work; tests or
 
 If every worker is `available: false` or the tools are missing, do the work yourself.
 
-Each `list_agents` row carries `quota` (`status`, `windows[].remaining_percent` + `resets_at`, `balance`) — information, not a routing rule. `exhausted` means the turn will most likely fail: prefer another worker or say when it resets. `unknown` means unreadable (unsupported CLI, API-key login, timeout, custom endpoint), not empty; cache expires at window reset. DSH balance is unsupported.
+Each `list_agents` row carries `quota` — information, not a routing rule. `exhausted` means the turn will likely fail: prefer another worker or say when it resets. `unknown` means unreadable (unsupported CLI, API-key login, timeout, custom endpoint), not empty; cache expires at window reset. DSH balance is unsupported.
 
-Claude `status`: shared `5h`/`weekly` only. Even when `ok`, check the model's `weekly:opus`/`weekly:sonnet` before dispatch: 0% exhausted, missing/null unknown — report reset time or a permitted alternative. Model-only data leaves shared status unknown.
+Claude `status`: shared `5h`/`weekly` only. Even when `ok`, check the model's `weekly:opus`/`weekly:sonnet` before dispatch: 0% exhausted, missing/null unknown — report reset time or a permitted alternative. Model-only data leaves status unknown.
 
 ## Step 2 — which worker
 
@@ -39,17 +39,17 @@ User `instructions` override this.
 - **Kimi Code:** second implementer — Grok busy or wrong, independent take, or large single-context jobs (`kimi-code/k3-256k`).
 - **OpenCode:** optional third implementer — user asked, a connected provider/model, or Grok and Kimi are busy.
 - **Claude Code:** optional implementer — user asked, or Grok and Kimi are busy. Worker binary is `claude-agent-acp`, not product `claude`.
-- **Codex CLI:** optional implementer — user asked, or others are busy. Desktop-bundled `codex exec`, not the Desktop GUI. Same product as this coordinator is a different process.
+- **Codex CLI:** optional implementer — user asked, or others are busy. Desktop-bundled `codex exec`, not the Desktop GUI.
 - **Devin CLI:** optional implementer — user asked, or others are busy. `devin acp`, not Devin Desktop.
 - **DeepSeek Harness:** only if others are unavailable or the user asked.
 
-In `auto`/`eager`, tell the user after the fact. In `manual`, their explicit request is the permission.
+In `auto`/`eager`, tell the user afterwards; in `manual`, the explicit request is the permission.
 
 ## How to dispatch
 
-1. `list_agents`. Read `coordinator.mode` / `instructions` / `dispatch_enabled` and `env.proxy` / `env.warnings`. A null proxy on a direct network is normal; on a proxied machine, fix `[env.proxy]` instead of retrying connect errors.
+1. `list_agents`. Read `coordinator.mode` / `instructions` / `dispatch_enabled` and `env.proxy` / `env.warnings`. A null proxy on a direct network is normal; on a proxied machine, fix `[env.proxy]`, don't retry connect errors.
 2. `dispatch_task` with `cwd` = **this conversation's project folder** (absolute). Never the Bridge install path (unless editing Bridge) or a temp dir. The `message` must be self-contained: background, absolute paths, acceptance criteria, things not to do. Leave `model`/`effort` unset unless you have a reason.
-   - Antigravity: `agy models` slugs; default `gemini-3.7-flash`.
+   - Antigravity: `agy models` slugs; default `gemini-3.7-flash`; `-low`/`-medium`/`-high` slugs pin `effort` — omit it or pass the same level (a mismatch fails dispatch).
    - Grok: `grok models` slug + `off|low|medium|high|max` (`off`→`none`, `max`→`xhigh`). `/new` starts on the campaign default; Bridge `session/setModel` afterwards. Trust `get_result.observed_model`, never the "You are Grok 4.6" banner.
    - Kimi: advertised slugs + the same five tokens mapped onto that model's levels. Unknown slug fails; unmappable effort is a warning.
    - OpenCode: advertised `provider/model` + the same five tokens. Unknown slug fails; missing/unmappable effort is a warning. `observed_*` are last values Bridge set. Model switch re-applies effort. Revive via `session/resume`.
@@ -58,19 +58,19 @@ In `auto`/`eager`, tell the user after the fact. In `manual`, their explicit req
    - DSH: `provider/model` + `off|low|high|max`; unknown model fails, unmappable effort warns. Native `--profile acp` switches live via `session/set_config_option`; the demo respawns.
    - Codex CLI: advertised slugs + `off|low|medium|high|max` (`off`→`none`). Default `--approve-for-me`; prompt on stdin. Revive via `exec resume`. Startup failures before JSONL are returned in `get_result.error`.
    - Devin CLI: advertised model ids (level is part of the id, e.g. `swe-1-7-medium`). Unknown id fails; `effort` ignored with a warning. Mode forced to `bypass`. Revive via `session/load` — it replays old history into `get_transcript` (`get_result` stays clean).
-3. Loop `wait_task` until terminal. A timeout is **not** failure — call it again. `wait_task` / `check_task` also report `silent_for_sec`, the time since the worker's last output. Bridge cancels a turn that stays silent for `stall_timeout_sec` (default 1800, per worker in `agents.toml`, 0 disables) and returns `status=failed`, `stop_reason="stalled"`. A silent-but-legitimate step looks like a hung worker: raise that worker's limit, or follow up on the `session_id` with a narrower task. To park a turn, `pause_task` ends it gracefully — partial result kept, `stop_reason="paused"`, resumable — and `resume_task` continues it as a new task on the same conversation (a safe cancel, not a freeze). Size `timeout_sec` under the host MCP tool timeout:
+3. `wait_task` only observes — `timed_out` ends the call, never the task. Loop it until terminal, or — for zero polling turns — dispatch, end your turn, and `check_task` / `get_result` later (Bridge cannot wake a dormant coordinator at completion; a later user or scheduled turn must). `wait_task` / `check_task` report `silent_for_sec` since the worker's last output; a turn silent for `stall_timeout_sec` (default 1800, per worker in `agents.toml`, 0 disables) ends `failed` / `stop_reason="stalled"` — raise the limit for legitimately long silence, or follow up on the `session_id`. `pause_task` parks a turn gracefully — partial result kept, `stop_reason="paused"`, resumable — and `resume_task` continues it on the same conversation (safe cancel, not a freeze). Keep `timeout_sec` under the host MCP tool timeout — one 5400 s wait needs a host cap above 5400 with margin and direct execution (each Codex Code Mode yield is a model-visible turn):
    - Codex: `tool_timeout_sec` 600; default 180 is fine.
    - Cursor: host ~45–60 s; pass ~30 and loop.
-   - Kimi Code: configure `toolTimeoutMs` 600000; otherwise ~45 s polls.
-   - ZCode: configure `timeoutMs` 600000; otherwise ~15–20 s polls.
-   - Grok Build: official default `tool_timeout_sec` is 6000; set 600. If unsure or the host kills the call, ~30–45 s polls.
-   - Claude Code: per-server `timeout` 600000 (ms) in `.mcp.json`. CLI default is long; desktop has historically died around 60 s — if unsure, ~45 s polls.
+   - Kimi Code: `toolTimeoutMs` 600000; otherwise ~45 s polls.
+   - ZCode: `timeoutMs` 600000; otherwise ~15–20 s polls.
+   - Grok Build: official `tool_timeout_sec` default 6000; set 600. If unsure, ~30–45 s polls.
+   - Claude Code: per-server `timeout` 600000 (ms) in `.mcp.json`. CLI default is long; if unsure, ~45 s polls.
 4. `get_result`; while `has_more` is true, call it again with `cursor=next_cursor` and concatenate the pages. Then inspect `git status` / `git diff` yourself and run the relevant build and tests. Do not trust the worker's self-report. An empty Kimi result with non-empty `warnings` is a failed turn, not a no-op.
 5. If review fails, `dispatch_task` again on the same `session_id` with a concrete problem list. At most three follow-ups, then fix it yourself.
 6. Summarize the diff, leftover risk, and worker usage. `end_session` when the worker is no longer needed.
 
 Do not drive worker GUIs or CLIs. Session resume is Bridge's job.
 
-For retry deduplication, send a UUID `request_id` on the first `dispatch_task`; retry with the same ID and original arguments (`session_id` omitted if it was). Identical arguments reuse the task (`reused=true`) while retained in this instance; different ones are rejected. `resume_task` dedups its continuation the same way. Restarting Bridge, switching instances, or pruning the task loses the binding; worker side effects are not exactly-once.
+For retry dedup, pass a UUID `request_id` on the first `dispatch_task` and retry with the same ID and arguments (`session_id` omitted if it was). Identical arguments reuse the task (`reused=true`) while retained in this instance; different ones are rejected. `resume_task` dedups the same way. Restart, another instance, or task pruning loses the binding; worker side effects are not exactly-once.
 
 After a restart, `list_tasks` rediscovers tasks a live sibling owns (`remote: true`); `check_task` / `wait_task` / `get_result` follow them — never cancel or re-dispatch. `resume_task` routes a remote resumable row to its live owner; `owner_lost: true` means the owner died mid-run and the row is adopted — orphaned worker reaped first — continuing the same conversation.

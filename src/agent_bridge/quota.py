@@ -56,6 +56,35 @@ QUOTA_ERROR_MARKERS = (
     "exceeded",
 )
 
+# Provider-side transient failures — capacity exhaustion, overload, deadlines —
+# are worth a resume/retry, not a config fix. Kept strictly separate from
+# QUOTA_ERROR_MARKERS: a capacity 503 ("No capacity available for model ...")
+# is not plan exhaustion and must not masquerade as it.
+TRANSIENT_ERROR_MARKERS = (
+    "no capacity available",
+    "model_capacity_exhausted",
+    "unavailable (code 503)",
+    "code 503",
+    "http 503",
+    "service unavailable",
+    "overloaded",
+    "deadline exceeded",
+)
+
+# The worker rejected the request itself — a bad model slug or an effort the
+# slug contradicts. Re-dispatching the same arguments cannot help.
+CONFIG_ERROR_MARKERS = (
+    "invalid model selection",
+    "unknown model",
+    "invalid model",
+    "unsupported model",
+    "invalid effort",
+    "conflicts with --effort",
+)
+
+# Stable values classify_error returns; surfaced as task snapshot error_kind.
+ERROR_KINDS = ("transient_provider", "quota", "config", "unknown")
+
 
 class QuotaWindow(BaseModel):
     """One rolling limit: ``5h``, ``weekly``, ``daily`` or whatever the CLI names it."""
@@ -399,6 +428,36 @@ def looks_like_quota_error(text: str | None) -> bool:
         return False
     lowered = text.lower()
     return any(marker in lowered for marker in QUOTA_ERROR_MARKERS)
+
+
+def looks_like_transient_error(text: str | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in TRANSIENT_ERROR_MARKERS)
+
+
+def looks_like_config_error(text: str | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in CONFIG_ERROR_MARKERS)
+
+
+def classify_error(text: str | None) -> str:
+    """Classify a task error string into one of ERROR_KINDS.
+
+    Transient is checked first: capacity/overload text like "deadline
+    exceeded" also trips the "exceeded" quota marker, but it is a retryable
+    provider blip, not plan exhaustion.
+    """
+    if looks_like_transient_error(text):
+        return "transient_provider"
+    if looks_like_quota_error(text):
+        return "quota"
+    if looks_like_config_error(text):
+        return "config"
+    return "unknown"
 
 
 def resolve_provider(

@@ -76,11 +76,107 @@ def load_state():
         return {"sessions": [], "tasks": []}
 
 
+# The Antigravity adapter used to persist the raw stream-json object as
+# data.payload with no normalized fields; the flat names below lift those
+# records back into the schema the feed expects. Keep in sync with
+# adapters/antigravity.py's write-side mapping.
+_AGY_TOOL_KINDS = {
+    "view_file": "read", "read_file": "read", "open_file": "read",
+    "list_dir": "read",
+    "find_by_name": "search", "find_in_file": "search", "grep_search": "search",
+    "search_web": "search", "web_search": "search",
+    "run_command": "execute", "send_command_input": "execute",
+    "command_status": "execute", "run_terminal_command": "execute",
+    "write_to_file": "edit", "replace_file_content": "edit",
+    "multi_replace_file_content": "edit", "sed_file": "edit",
+    "notebook_edit": "edit", "create_file": "edit",
+    "read_url_content": "fetch", "fetch_url": "fetch",
+}
+_AGY_KIND_HINTS = (
+    ("edit", ("write", "edit", "replace", "patch", "create", "delete", "rename")),
+    ("search", ("search", "find", "grep")),
+    ("execute", ("command", "exec", "shell", "terminal", "run")),
+    ("read", ("read", "view", "list", "open", "show")),
+    ("fetch", ("fetch", "url")),
+)
+_AGY_DONE_STATES = {"DONE", "FAILED", "FAILURE", "ERROR", "CANCELLED", "CANCELED", "INTERRUPTED"}
+
+
+def _agy_tool_kind(name):
+    key = str(name or "").strip().lower()
+    if key in _AGY_TOOL_KINDS:
+        return _AGY_TOOL_KINDS[key]
+    for kind, markers in _AGY_KIND_HINTS:
+        if any(m in key for m in markers):
+            return kind
+    return "tool"
+
+
+def _legacy_payload_flat(d):
+    """Recover flat normalized fields from a legacy ``{"payload": <obj>}`` record.
+
+    Payload-derived values only fill gaps — real ``data`` keys always win, so
+    new records that carry both shapes are unaffected.
+    """
+    p = d.get("payload")
+    if not isinstance(p, dict):
+        return d
+    step = p.get("step_update")
+    if not isinstance(step, dict):
+        step = {}
+    flat = {}
+    text = step.get("text_delta") or p.get("text_delta") or p.get("delta")
+    if not (isinstance(text, str) and text):
+        for source in (step, p):
+            for key in ("text", "thought", "summary", "message", "error"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    text = value
+                    break
+            if text:
+                break
+    if isinstance(text, str) and text:
+        flat["text"] = text
+        flat["error"] = text
+    info = step.get("tool_info")
+    info = info if isinstance(info, dict) else {}
+    is_tool = step.get("step_type") == "tool" or p.get("event") in {"tool", "tool_call"}
+    if is_tool:
+        name = info.get("name") or step.get("tool_name") or p.get("tool_name") or p.get("name")
+        if name:
+            flat["title"] = str(name)
+            flat["kind"] = _agy_tool_kind(name)
+        call_id = step.get("tool_call_id") or p.get("tool_call_id")
+        if not (isinstance(call_id, str) and call_id):
+            cid = step.get("conversation_id") or p.get("conversation_id") or "agy"
+            call_id = f"{cid}:{step.get('step_index', p.get('step_index', 0))}"
+        flat["tool_call_id"] = call_id
+        params = info.get("parameters")
+        if params is not None:
+            flat["input"] = json.dumps(params, ensure_ascii=False, default=str)
+        state = str(step.get("state") or p.get("state") or "").upper()
+        if state in _AGY_DONE_STATES:
+            err = info.get("error") or step.get("error")
+            flat["status"] = "failed" if state != "DONE" or err else "completed"
+            out = info.get("output") or step.get("output") or err
+            if isinstance(out, str) and out.strip():
+                flat["output"] = out[:4000]
+            elif out is not None:
+                flat["output"] = json.dumps(out, ensure_ascii=False, default=str)[:4000]
+    merged = dict(flat)
+    for k, v in d.items():
+        if k != "payload" and v is not None:
+            merged[k] = v
+    return merged
+
+
 def normalize_event(rec):
     """Convert a raw transcript JSONL record into a compact dashboard event."""
     t = rec.get("type")
     ts = rec.get("ts")
     d = rec.get("data") or {}
+    if isinstance(d.get("payload"), dict):
+        d = _legacy_payload_flat(d)
 
     if t == "prompt_sent":
         return {
@@ -91,9 +187,15 @@ def normalize_event(rec):
             "task": d.get("task_id"),
         }
     if t == "message_chunk":
-        return {"t": "msg", "ts": ts, "text": d.get("text", "")}
+        text = d.get("text", "")
+        if not text:
+            return None  # usage-only DONE steps carry no text to paint
+        return {"t": "msg", "ts": ts, "text": text}
     if t == "thought_chunk":
-        return {"t": "think", "ts": ts, "text": d.get("text", "")}
+        text = d.get("text", "")
+        if not text:
+            return None
+        return {"t": "think", "ts": ts, "text": text}
     if t == "tool_call":
         raw_input = d.get("input")
         inp = raw_input
@@ -102,10 +204,15 @@ def normalize_event(rec):
                 inp = json.loads(raw_input)
             except Exception:
                 inp = raw_input
-        s = json.dumps(inp, ensure_ascii=False) if not isinstance(inp, str) else inp
+        if inp is None:
+            s = ""
+        elif isinstance(inp, str):
+            s = inp
+        else:
+            s = json.dumps(inp, ensure_ascii=False)
         if s and len(s) > MAX_INPUT_CHARS:
             s = s[:MAX_INPUT_CHARS] + "…"
-        return {
+        ev = {
             "t": "tool",
             "ts": ts,
             "id": d.get("tool_call_id"),
@@ -113,6 +220,13 @@ def normalize_event(rec):
             "title": d.get("title") or "",
             "input": s,
         }
+        # Legacy DONE steps normalize to a complete row; addTool folds it into
+        # the ACTIVE twin's row by id instead of painting a duplicate.
+        if d.get("status"):
+            ev["status"] = d["status"]
+        if d.get("output"):
+            ev["output"] = d["output"]
+        return ev
     if t == "tool_call_update":
         status = d.get("status")
         if not status:
@@ -1654,8 +1768,17 @@ function toolKindLabel(kind){
 const TOOL_STATES={in_progress:1,completed:1,failed:1,error:1};
 function addTool(e){
   flushBlocks();
-  const g=toolGroup();curMsg=null;curThink=null;
   const kind=String(e.kind||"tool").toLowerCase();
+  const prev=e.id?tools[e.id]:null;
+  if(prev){
+    /* A second full record for the same call (a legacy agy DONE step that
+       normalized to a complete row) folds into the existing row instead of
+       painting a duplicate. */
+    if(e.title){const tt=prev.el.querySelector(".ttitle");tt.textContent=e.title;tt.title=e.input||""}
+    if(e.status)addToolStatus({t:"tool_status",id:e.id,status:e.status,ts:e.ts});
+    return;
+  }
+  const g=toolGroup();curMsg=null;curThink=null;
   const row=document.createElement("div");row.className="tool";
   row.innerHTML=`<span class="ticon">${icon(TOOL_ICON[kind]||"gear",15)}</span>
     <span class="tmain"><span class="tcap">${esc(toolKindLabel(kind))}</span>
@@ -1668,6 +1791,10 @@ function addTool(e){
     det.innerHTML=`<summary><span class="chev">${icon("chevron",11)}</span>${esc(t("tool.input"))}</summary><pre>${esc(e.input)}</pre>`;
     row.after(det);
     row.style.cursor="pointer";row.onclick=()=>det.open=!det.open;}
+  /* A record that already carries a terminal status (legacy DONE step whose
+     ACTIVE twin was truncated/never seen) closes immediately — no ts, so no
+     invented 0ms duration. */
+  if(e.status)addToolStatus({t:"tool_status",id:e.id,status:e.status});
 }
 function addToolStatus(e){
   const r=tools[e.id];if(!r)return;

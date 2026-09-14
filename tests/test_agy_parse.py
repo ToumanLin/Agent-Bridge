@@ -6,6 +6,8 @@ import pytest
 from agent_bridge.adapters.antigravity import (
     AgyAdapter,
     _scoped_usage,
+    agy_model_effort,
+    check_agy_model_effort,
     collect_tool_paths,
     conversation_id_of,
     is_agy_tool_schema_error,
@@ -204,6 +206,72 @@ def test_agy_follow_up_uses_conversation_not_new_project(tmp_path, monkeypatch):
     assert task.message not in cmd
 
 
+def _agy_cmd(tmp_path, monkeypatch, model, effort):
+    monkeypatch.setattr(
+        "agent_bridge.adapters.antigravity.resolve_command",
+        lambda command, fallbacks=None: ["agy"],
+    )
+    adapter = AgyAdapter(
+        AgentConfig(name="antigravity", protocol="agy", command=["agy"]),
+        tmp_path,
+    )
+    session = Session(
+        session_id="sess_eff",
+        agent="antigravity",
+        cwd=str(tmp_path),
+        model=model,
+        effort=effort,
+    )
+    task = Task(
+        task_id="task_eff",
+        session_id=session.session_id,
+        agent="antigravity",
+        message="do it",
+        cwd=str(tmp_path),
+        model=model,
+        effort=effort,
+    )
+    return adapter._build_cmd(session, task)
+
+
+def test_agy_effort_suffixed_slug_parsing():
+    assert agy_model_effort("gemini-3.8-flash-medium") == "medium"
+    assert agy_model_effort("gemini-3.8-flash-high") == "high"
+    assert agy_model_effort("gemini-3.7-flash") is None
+    assert agy_model_effort("medium") is None  # no hyphen, not a suffix
+    assert agy_model_effort(None) is None
+    # check_agy_model_effort compares after the Bridge->agy effort mapping.
+    check_agy_model_effort("gemini-3.8-flash-medium", "medium")
+    check_agy_model_effort("gemini-3.8-flash-high", "max")  # max -> high
+    check_agy_model_effort("gemini-3.8-flash-medium", None)
+    check_agy_model_effort("gemini-3.7-flash", "high")
+
+
+def test_agy_mismatched_explicit_effort_fails_early(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="invalid model selection"):
+        _agy_cmd(tmp_path, monkeypatch, "gemini-3.8-flash-medium", "high")
+    with pytest.raises(ValueError, match="invalid model selection") as excinfo:
+        check_agy_model_effort("gemini-3.8-flash-medium", "low")
+    assert "-low" in str(excinfo.value) and "omit effort" in str(excinfo.value)
+
+
+def test_agy_matching_effort_drops_the_redundant_flag(tmp_path, monkeypatch):
+    cmd = _agy_cmd(tmp_path, monkeypatch, "gemini-3.8-flash-medium", "medium")
+    assert cmd[cmd.index("--model") + 1] == "gemini-3.8-flash-medium"
+    assert "--effort" not in cmd
+
+
+def test_agy_effort_omitted_on_suffixed_slug_sends_model_only(tmp_path, monkeypatch):
+    cmd = _agy_cmd(tmp_path, monkeypatch, "gemini-3.8-flash-medium", None)
+    assert cmd[cmd.index("--model") + 1] == "gemini-3.8-flash-medium"
+    assert "--effort" not in cmd
+
+
+def test_agy_unsuffixed_slug_still_passes_effort(tmp_path, monkeypatch):
+    cmd = _agy_cmd(tmp_path, monkeypatch, "gemini-3.7-flash", "high")
+    assert cmd[cmd.index("--effort") + 1] == "high"
+
+
 def _agy_adapter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AgyAdapter:
     monkeypatch.setattr(
         "agent_bridge.adapters.antigravity.resolve_command",
@@ -314,3 +382,31 @@ async def test_run_turn_early_exit_reports_stderr(tmp_path, monkeypatch):
     assert result.error is not None
     assert "agy exit 3" in result.error
     assert "fake agy refused to start" in result.error
+
+
+@pytest.mark.asyncio
+async def test_run_turn_capacity_503_keeps_partial_result_and_session(tmp_path, monkeypatch):
+    """The real failure shape: mid-stream 503 with an absorbed error_message
+    step, a partial response, and a live conversation id — all resumable."""
+    adapter = _agy_adapter(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_AGY_MODE", "capacity_503")
+    session = Session(session_id="sess_503", agent="antigravity", cwd=str(tmp_path))
+    task = Task(
+        task_id="task_503",
+        session_id=session.session_id,
+        agent="antigravity",
+        message="hello",
+        cwd=str(tmp_path),
+        model="gemini-3.8-flash-medium",
+    )
+    result = await adapter.run_turn(session, task)
+    assert result.stop_reason == "error"
+    assert result.error is not None
+    assert "No capacity available for model gemini-3.8-flash-medium" in result.error
+    # The partial response survives and the native conversation id is set, so
+    # resume_task can continue the same conversation.
+    assert result.text == "echo:hello...partial report"
+    assert result.native_session_id == "conv-fake-agy"
+    assert session.native_session_id == "conv-fake-agy"
+    # The opaque error_message step agy absorbed is counted, not invisible.
+    assert any("1 mid-turn error step" in w for w in result.warnings)

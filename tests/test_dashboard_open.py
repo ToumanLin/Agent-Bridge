@@ -188,3 +188,116 @@ def test_maybe_open_dashboard_attempt_debounce(tmp_path, threads):
     dl.maybe_open_dashboard(tmp_path, _cfg())
     dl.maybe_open_dashboard(tmp_path, _cfg())
     assert len(threads) == 1
+
+
+# --- _launch spawn strategy -------------------------------------------------
+#
+# The singleton dashboard must survive the orderly idle exit of whichever
+# Bridge instance launched it. On Windows that requires escaping the Job
+# Object the agent host put this Bridge into — DETACHED_PROCESS and
+# CREATE_NEW_PROCESS_GROUP cannot do that — so CREATE_BREAKAWAY_FROM_JOB is
+# attempted first and the old flags remain a retry. Popen is stubbed; no
+# real process is ever spawned.
+
+_WIN32_BASE_FLAGS = 0x200 | 0x8  # CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+_WIN32_BREAKAWAY = 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
+
+
+def _as_platform(monkeypatch, platform):
+    monkeypatch.setattr(dl.sys, "platform", platform)
+    if platform == "win32":
+        # POSIX test hosts lack these constants; pinning them keeps the flag
+        # assertions identical wherever the suite runs.
+        monkeypatch.setattr(dl.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+        monkeypatch.setattr(dl.subprocess, "DETACHED_PROCESS", 0x8, raising=False)
+        monkeypatch.setattr(dl.subprocess, "CREATE_BREAKAWAY_FROM_JOB", _WIN32_BREAKAWAY, raising=False)
+
+
+def _stub_spawn(tmp_path, monkeypatch, fail_times=0):
+    """Point ``_launch`` at a real script file and record Popen calls.
+
+    ``fail_times`` leading calls raise PermissionError, matching the
+    ERROR_ACCESS_DENIED a Job Object without breakaway permission gives.
+    """
+    script = tmp_path / "dashboard.py"
+    script.write_text("# stub\n", encoding="utf-8")
+    monkeypatch.setattr(dl, "bundled_dashboard", lambda: script)
+    calls: list[dict] = []
+    state = {"failures": fail_times}
+
+    def fake_popen(argv, **kw):
+        calls.append({"argv": list(argv), **kw})
+        if state["failures"]:
+            state["failures"] -= 1
+            raise PermissionError(5, "Access is denied")
+        return object()
+
+    monkeypatch.setattr(dl.subprocess, "Popen", fake_popen)
+    return calls
+
+
+def test_launch_windows_breaks_out_of_host_job(tmp_path, monkeypatch):
+    """Detached flags alone keep the dashboard inside the host's Job Object,
+    so it dies when the launching Bridge exits; breakaway leaves the job."""
+    _as_platform(monkeypatch, "win32")
+    calls = _stub_spawn(tmp_path, monkeypatch)
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is True
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["creationflags"] == _WIN32_BASE_FLAGS | _WIN32_BREAKAWAY
+    assert "start_new_session" not in call
+    assert call["stdin"] is dl.subprocess.DEVNULL
+    assert call["argv"] == [dl.sys.executable, str(tmp_path / "dashboard.py"), "--port", "8787", "--dir", str(tmp_path)]
+
+
+def test_launch_windows_retries_inside_job_when_breakaway_refused(tmp_path, monkeypatch):
+    """A job without JOB_OBJECT_LIMIT_BREAKAWAY_OK fails CreateProcess with
+    ERROR_ACCESS_DENIED; relaunch with the previous flags, not an error."""
+    _as_platform(monkeypatch, "win32")
+    calls = _stub_spawn(tmp_path, monkeypatch, fail_times=1)
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is True
+    assert [c["creationflags"] for c in calls] == [
+        _WIN32_BASE_FLAGS | _WIN32_BREAKAWAY,
+        _WIN32_BASE_FLAGS,
+    ]
+
+
+def test_launch_windows_failure_returns_false(tmp_path, monkeypatch):
+    _as_platform(monkeypatch, "win32")
+    calls = _stub_spawn(tmp_path, monkeypatch, fail_times=99)
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is False
+    assert len(calls) == 2  # breakaway attempt + one fallback, never a third
+
+
+def test_launch_windows_without_breakaway_constant(tmp_path, monkeypatch):
+    """Python builds lacking CREATE_BREAKAWAY_FROM_JOB keep the old flags and
+    do not retry the identical spawn."""
+    _as_platform(monkeypatch, "win32")
+    monkeypatch.delattr(dl.subprocess, "CREATE_BREAKAWAY_FROM_JOB", raising=False)
+    calls = _stub_spawn(tmp_path, monkeypatch, fail_times=99)
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is False
+    assert [c["creationflags"] for c in calls] == [_WIN32_BASE_FLAGS]
+
+
+def test_launch_posix_uses_new_session(tmp_path, monkeypatch):
+    _as_platform(monkeypatch, "linux")
+    calls = _stub_spawn(tmp_path, monkeypatch)
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is True
+    assert len(calls) == 1
+    assert calls[0]["start_new_session"] is True
+    assert "creationflags" not in calls[0]
+
+
+def test_launch_posix_failure_returns_false(tmp_path, monkeypatch):
+    _as_platform(monkeypatch, "linux")
+    calls = _stub_spawn(tmp_path, monkeypatch, fail_times=99)
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is False
+    assert len(calls) == 1  # POSIX has no second flag set to retry with
+
+
+def test_launch_missing_script_never_spawns(tmp_path, monkeypatch):
+    monkeypatch.setattr(dl, "bundled_dashboard", lambda: tmp_path / "nope.py")
+    calls = []
+    monkeypatch.setattr(dl.subprocess, "Popen", lambda argv, **kw: calls.append(kw))
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is False
+    assert calls == []

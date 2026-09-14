@@ -448,6 +448,157 @@ async def test_failed_turn_keeps_its_accumulated_run_usage(bridge_home, tmp_path
         await registry.stop()
 
 
+AGY_CAPACITY_503 = (
+    "API error (attempt 1): UNAVAILABLE (code 503): "
+    "No capacity available for model gemini-3.8-flash-medium on the server"
+)
+
+
+@pytest.mark.asyncio
+async def test_transient_capacity_failure_is_retryable_and_resumable(bridge_home, tmp_path, monkeypatch):
+    """A provider 503 lands as failed but classified: error_kind marks it
+    transient_provider (not quota), retryable, resumable — and resume_task
+    dispatches a continuation on the same session."""
+
+    async def capacity_error(self, session, task):
+        return TurnResult(
+            text="partial report",
+            stop_reason="error",
+            error=AGY_CAPACITY_503,
+            native_session_id="fake-conv",
+        )
+
+    monkeypatch.setattr(FakeAdapter, "run_turn", capacity_error)
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task(
+            "fake", "survey", cwd=str(work.resolve()), model="gemini-3.8-flash-medium"
+        )
+        waited = await registry.wait_task(dispatched["task_id"], timeout_sec=5)
+        assert waited["status"] == "failed"
+        assert waited["error"] == AGY_CAPACITY_503
+        assert waited["error_kind"] == "transient_provider"
+        assert waited["retryable"] is True
+        assert waited["resumable"] is True
+        assert "transient provider failure" in waited["resume_hint"]
+        assert "resume_task" in waited["resume_hint"]
+        assert "resume_task" in waited["hint"]
+        # check_task and list_tasks carry the same classification.
+        checked = registry.check_task(dispatched["task_id"])
+        assert checked["error_kind"] == "transient_provider"
+        assert checked["retryable"] is True
+        row = next(t for t in registry.list_tasks() if t["task_id"] == dispatched["task_id"])
+        assert row["error_kind"] == "transient_provider"
+        assert row["retryable"] is True
+        # resume_task continues the same session/conversation.
+        resumed = await registry.resume_task(dispatched["task_id"])
+        assert resumed["session_id"] == dispatched["session_id"]
+        assert resumed["task_id"] != dispatched["task_id"]
+        continued = await registry.wait_task(resumed["task_id"], timeout_sec=5)
+        assert continued["status"] == "failed"
+        assert registry.tasks[resumed["task_id"]].resume_of == dispatched["task_id"]
+        assert registry.tasks[dispatched["task_id"]].resumed_by == resumed["task_id"]
+    finally:
+        await registry.stop()
+
+
+@pytest.mark.asyncio
+async def test_non_transient_failure_is_not_marked_retryable(bridge_home, tmp_path, monkeypatch):
+    async def auth_error(self, session, task):
+        return TurnResult(text="", stop_reason="error", error="authentication required")
+
+    monkeypatch.setattr(FakeAdapter, "run_turn", auth_error)
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        dispatched = await registry.dispatch_task("fake", "x", cwd=str(work.resolve()))
+        waited = await registry.wait_task(dispatched["task_id"], timeout_sec=5)
+        assert waited["status"] == "failed"
+        assert waited["error_kind"] == "unknown"
+        assert waited["retryable"] is False
+        assert waited["resumable"] is True  # still resumable, just not transient
+        assert "transient provider failure" not in waited["resume_hint"]
+    finally:
+        await registry.stop()
+
+
+def _write_agy_config(bridge_home: Path) -> None:
+    """Point the antigravity agent at the fake agy script so dispatches run."""
+    bridge_home.mkdir(parents=True, exist_ok=True)
+    fake = Path(__file__).resolve().with_name("fake_agy.py")
+    command = ", ".join(json.dumps(part) for part in [sys.executable, str(fake)])
+    (bridge_home / "agents.toml").write_text(
+        "[agents.antigravity]\n"
+        'protocol = "agy"\n'
+        f"command = [{command}]\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+async def test_agy_effort_suffixed_model_validation_at_dispatch(bridge_home, tmp_path):
+    _write_agy_config(bridge_home)
+    work = tmp_path / "work"
+    work.mkdir()
+    registry = Registry.create(bridge_home)
+    await registry.start()
+    try:
+        # Mismatched explicit effort fails before any task is created.
+        with pytest.raises(ValueError, match="invalid model selection"):
+            await registry.dispatch_task(
+                "antigravity",
+                "x",
+                cwd=str(work.resolve()),
+                model="gemini-3.8-flash-medium",
+                effort="high",
+            )
+        assert registry.tasks == {}
+        # Matching effort and omitted effort are valid.
+        matching = await registry.dispatch_task(
+            "antigravity",
+            "x",
+            cwd=str(work.resolve()),
+            model="gemini-3.8-flash-medium",
+            effort="medium",
+        )
+        assert (await registry.wait_task(matching["task_id"], timeout_sec=15))["status"] == "completed"
+        # An effort stored on the session still guards follow-up dispatches:
+        # switching to a slug that pins a different level conflicts with it.
+        with pytest.raises(ValueError, match="invalid model selection"):
+            await registry.dispatch_task(
+                "antigravity",
+                "x",
+                cwd=str(work.resolve()),
+                session_id=matching["session_id"],
+                model="gemini-3.8-flash-low",
+            )
+        corrected = await registry.dispatch_task(
+            "antigravity",
+            "x",
+            cwd=str(work.resolve()),
+            session_id=matching["session_id"],
+            model="gemini-3.8-flash-low",
+            effort="low",
+        )
+        assert (await registry.wait_task(corrected["task_id"], timeout_sec=15))["status"] == "completed"
+        # Unsuffixed slugs take any effort.
+        free = await registry.dispatch_task(
+            "antigravity",
+            "x",
+            cwd=str(work.resolve()),
+            model="gemini-3.7-flash",
+            effort="high",
+        )
+        assert (await registry.wait_task(free["task_id"], timeout_sec=15))["status"] == "completed"
+    finally:
+        await registry.stop()
+
+
 @pytest.mark.asyncio
 async def test_orphaned_running_task_recovers_partial_run_usage(bridge_home, monkeypatch):
     """A running task whose owner bridge died keeps the transcript's last

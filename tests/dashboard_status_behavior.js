@@ -1015,6 +1015,38 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   X.setLocalePref("en");
   eq(X.toolKindLabel("execute"), "Execute", "tool kind execute en");
 
+  // --- agy pairing: a second full record for the same tool_call_id folds
+  //     into the existing row instead of painting a duplicate, and a carried
+  //     status closes it. ---
+  const beforeMerge = created.length;
+  X.addTool({ t: "tool", ts: "2026-01-01T00:00:10Z", id: "conv:7",
+    kind: "search", title: "find_by_name", input: '{"Pattern":"*"}' });
+  const mergeRow = created.slice(beforeMerge)
+    .find((e) => e.className === "tool");
+  X.addTool({ t: "tool", ts: "2026-01-01T00:00:12Z", id: "conv:7",
+    kind: "search", title: "find_by_name", status: "completed" });
+  eq(created.slice(beforeMerge).filter((e) => e.className === "tool").length,
+    1, "same tool_call_id merges — no duplicate row");
+  eq(mergeRow._q[".st"].attrs["aria-label"], "completed",
+    "merged record applies the carried status");
+  eq(mergeRow._q[".st"].className, "st completed",
+    "merged row status class flips off in_progress");
+  // A legacy DONE record whose ACTIVE twin was truncated still lands a
+  // complete, already-completed row.
+  const beforeSolo = created.length;
+  X.addTool({ t: "tool", ts: "2026-01-01T00:00:20Z", id: "conv:8",
+    kind: "read", title: "view_file", input: "{}", status: "completed" });
+  const soloRow = created.slice(beforeSolo)
+    .find((e) => e.className === "tool");
+  eq(soloRow._q[".st"].attrs["aria-label"], "completed",
+    "standalone DONE row renders completed, never spins forever");
+  eq(soloRow._q[".dur"] ? soloRow._q[".dur"].textContent : "", "",
+    "standalone DONE row invents no 0ms duration");
+  // Status for a never-seen id stays a silent no-op.
+  X.addToolStatus({ t: "tool_status", id: "conv:nope", status: "completed" });
+  eq(created.slice(beforeSolo).filter((e) => e.className === "tool").length,
+    1, "orphan tool_status creates nothing");
+
   // --- send states: stable keys + params, re-render on locale switch ---
   eq(X.sendKey({ state: "waiting_busy" }), "send.waiting_busy",
     "waiting_busy maps to its key");

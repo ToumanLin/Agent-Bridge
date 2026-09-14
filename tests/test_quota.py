@@ -18,10 +18,13 @@ from agent_bridge.quota import (
     QuotaStatus,
     QuotaWindow,
     _proxy_map,
+    classify_error,
     default_providers,
     describe_quotas,
     fetch_quota,
+    looks_like_config_error,
     looks_like_quota_error,
+    looks_like_transient_error,
     parse_timestamp,
     provider_table,
     resolve_provider,
@@ -128,6 +131,64 @@ def test_looks_like_quota_error():
     assert looks_like_quota_error("Insufficient Balance")
     assert not looks_like_quota_error("bridge_restarted")
     assert not looks_like_quota_error(None)
+
+
+AGY_CAPACITY_503 = (
+    "API error (attempt 1): UNAVAILABLE (code 503): "
+    "No capacity available for model gemini-3.8-flash-medium on the server"
+)
+AGY_EFFORT_CONFLICT = (
+    'invalid model selection (--model "gemini-3.8-flash-medium" --effort "high"): '
+    "--model gemini-3.8-flash-medium conflicts with --effort=high"
+)
+
+
+def test_looks_like_transient_error_matches_real_503_capacity_strings():
+    assert looks_like_transient_error(AGY_CAPACITY_503)
+    # The upstream JSON payload the stream text is wrapped from.
+    assert looks_like_transient_error(
+        '{"code": 503, "status": "UNAVAILABLE", "reason": "MODEL_CAPACITY_EXHAUSTED",'
+        ' "message": "No capacity available for model x on the server"}'
+    )
+    assert looks_like_transient_error("The model is overloaded right now")
+    assert looks_like_transient_error("gRPC DEADLINE_EXCEEDED / deadline exceeded")
+    # Auth, config, and quota text must not classify as transient.
+    for text in (
+        "authentication required",
+        AGY_EFFORT_CONFLICT,
+        "unknown model foo",
+        "quota exceeded",
+        "HTTP 429 Rate limit reached",
+        "bridge_restarted",
+        "",
+        None,
+    ):
+        assert not looks_like_transient_error(text)
+
+
+def test_capacity_503_is_not_quota():
+    # Guards against misclassifying provider capacity as plan exhaustion.
+    assert not looks_like_quota_error(AGY_CAPACITY_503)
+    # "deadline exceeded" trips the "exceeded" quota marker but is transient.
+    assert looks_like_quota_error("deadline exceeded")
+    assert looks_like_transient_error("deadline exceeded")
+
+
+def test_looks_like_config_error():
+    assert looks_like_config_error(AGY_EFFORT_CONFLICT)
+    assert looks_like_config_error("unknown model foo-9")
+    assert not looks_like_config_error(AGY_CAPACITY_503)
+    assert not looks_like_config_error("authentication required")
+    assert not looks_like_config_error(None)
+
+
+def test_classify_error_kinds():
+    assert classify_error(AGY_CAPACITY_503) == "transient_provider"
+    assert classify_error("deadline exceeded") == "transient_provider"
+    assert classify_error("quota exceeded") == "quota"
+    assert classify_error(AGY_EFFORT_CONFLICT) == "config"
+    assert classify_error("authentication required") == "unknown"
+    assert classify_error(None) == "unknown"
 
 
 def test_proxy_map_prefers_upper_case_and_skips_blank():

@@ -13,6 +13,7 @@ from typing import Any, Literal
 import psutil
 
 from agent_bridge.adapters import build_adapter
+from agent_bridge.adapters.antigravity import check_agy_model_effort
 from agent_bridge.adapters.base import Adapter
 from agent_bridge.config import (
     COORDINATOR_MODE_HINTS,
@@ -44,7 +45,15 @@ from agent_bridge.processes import (
     reap_orphan_for_session,
     reap_orphans,
 )
-from agent_bridge.quota import QuotaCache, fetch_quota, looks_like_quota_error, provider_table, unknown_quota
+from agent_bridge.quota import (
+    QuotaCache,
+    classify_error,
+    fetch_quota,
+    looks_like_quota_error,
+    looks_like_transient_error,
+    provider_table,
+    unknown_quota,
+)
 from agent_bridge.transcript import (
     append_event,
     flush_pending,
@@ -1194,7 +1203,13 @@ class Registry:
         if not cwd_path.is_dir():
             raise ValueError(f"cwd is not a directory: {cwd_path}")
         effort = normalize_effort(effort)
-        self.config.get(agent)
+        agent_cfg = self.config.get(agent)
+        if agent_cfg.protocol == "agy" and not session_id:
+            # agy rejects a -low/-medium/-high model slug paired with a
+            # different --effort; fail the dispatch instead of the turn.
+            # Existing-session combinations are checked under the lock, once
+            # inherited model/effort are known.
+            check_agy_model_effort(model, effort)
         # Compare supplied arguments, not selections inherited from a mutable session.
         request = (
             agent,
@@ -1265,6 +1280,8 @@ class Registry:
                 )
                 self._stamp_owner(session)
                 self.sessions[session.session_id] = session
+            if agent_cfg.protocol == "agy" and session_id:
+                check_agy_model_effort(model or session.model, effort or session.effort)
             if model:
                 session.model = model
             if effort:
@@ -1419,8 +1436,12 @@ class Registry:
             if task.finished_at is None:
                 task.finished_at = iso()
             # A Kimi quota failure arrives as a warning on a "completed" turn.
-            if (task.status == TaskStatus.failed and looks_like_quota_error(task.error)) or any(
-                looks_like_quota_error(w) for w in task.warnings
+            # Transient-classified text (e.g. "deadline exceeded") can trip a
+            # quota marker without being plan exhaustion — never invalidate on it.
+            if (task.status == TaskStatus.failed and looks_like_quota_error(task.error)
+                and not looks_like_transient_error(task.error)) or any(
+                looks_like_quota_error(w) and not looks_like_transient_error(w)
+                for w in task.warnings
             ):
                 # The cached "ok" is now a lie; make the next list_agents re-read it.
                 self._quota_cache.invalidate(session.agent)
@@ -1749,6 +1770,13 @@ class Registry:
                 "status": task.status.value,
                 "stop_reason": task.stop_reason,
                 "error": task.error,
+                "error_kind": classify_error(task.error)
+                if task.status == TaskStatus.failed
+                else None,
+                "retryable": (
+                    task.status == TaskStatus.failed
+                    and classify_error(task.error) == "transient_provider"
+                ),
                 "source": task.source,
                 "model": task.model,
                 "effort": task.effort,
@@ -1853,11 +1881,18 @@ class Registry:
                 "session (reaping its orphaned worker) and continues the same conversation"
             )
         why = "paused" if task.paused else task.status.value
-        return True, (
+        hint = (
             f"this {why} turn kept its partial result, transcript, and session — "
             f"resume_task(task_id=\"{task.task_id}\") dispatches a continuation turn on the same "
             "conversation, or dispatch_task(session_id=...) sends a free-form follow-up"
         )
+        if task.status == TaskStatus.failed and looks_like_transient_error(task.error):
+            hint = (
+                "the error looks like a transient provider failure (capacity/overload, "
+                "not quota or a bad request) — retrying it later is likely to work. "
+                + hint
+            )
+        return True, hint
 
     @staticmethod
     def _result_hint(task: Task, prefix: str) -> str:
@@ -1893,6 +1928,12 @@ class Registry:
                 " Devin observed_model is the last id Bridge set on the session; "
                 "observed_effort is always null because the level is part of the model id."
             )
+        if task.status == TaskStatus.failed and classify_error(task.error) == "transient_provider":
+            hint += (
+                " This is a transient provider failure (capacity/overload), not quota "
+                "or a bad request: resume_task continues the same conversation with "
+                "its partial result, or retry later / dispatch on a different model."
+            )
         if task.files_changed_truncated:
             hint += (
                 f" files_changed lists the first {FILES_CHANGED_MAX} of "
@@ -1922,6 +1963,13 @@ class Registry:
             "status": task.status.value,
             "stop_reason": task.stop_reason,
             "error": task.error,
+            "error_kind": classify_error(task.error)
+            if task.status == TaskStatus.failed
+            else None,
+            "retryable": (
+                task.status == TaskStatus.failed
+                and classify_error(task.error) == "transient_provider"
+            ),
             "warnings": task.warnings,
             "files_changed": task.files_changed,
             "files_changed_total": task.files_changed_total,

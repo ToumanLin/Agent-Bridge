@@ -104,7 +104,7 @@ Close coordinators that are holding Bridge, then `agent-bridge upgrade`, then re
 | `list_agents` | Probe workers, report remaining quota, proxy/env + coordinator policy |
 | `set_preferences` | Persist coordinator mode / routing preferences |
 | `dispatch_task` | Start or resume a turn in the project `cwd` |
-| `wait_task` | Block up to `timeout_sec` (default 180) |
+| `wait_task` | Block up to `timeout_sec` (default 180); a timeout ends the call, never the worker |
 | `check_task` | Non-blocking status |
 | `get_result` | Complete final result in pages + changed files |
 | `get_transcript` | Paged session log |
@@ -125,6 +125,16 @@ turn ends; a normal stop flushes everything, so only a crash or a hard kill can
 lose that last window. A turn whose worker stays silent past `stall_timeout_sec`
 (default 1800 s, per worker) ends `failed` / `stalled`; `check_task` shows
 `silent_for_sec`.
+
+A pending `wait_task` never polls the model — local waits are event-driven
+inside Bridge — but each returned timeout is a model-visible turn. For a long
+task the token-free pattern is dispatch-and-later-check: `dispatch_task`, end
+the turn, then `check_task` / `get_result` on a later one. Bridge cannot wake a
+dormant coordinator at completion; that takes a host scheduler or a later user
+turn. A single ~90-minute wait (`timeout_sec=5400`) works only when the host
+MCP tool timeout exceeds it with margin and the call executes directly — Codex
+Code Mode turns it into repeated model-visible yields. Details:
+[SETUP.md](SETUP.md#waiting-and-timeouts).
 
 Tasks keep their owning Bridge instance. After a coordinator restart, a task a
 live sibling still owns shows `remote: true` in `list_tasks` / `check_task` /
@@ -273,7 +283,7 @@ revivable = true
 | `list_agents` | 探测 worker，报告剩余额度、代理 / 环境 + 协调者策略 |
 | `set_preferences` | 持久化协调者模式 / 路由偏好 |
 | `dispatch_task` | 在项目 `cwd` 里开始或续上一次回合 |
-| `wait_task` | 最多等待 `timeout_sec`（默认 180） |
+| `wait_task` | 最多等待 `timeout_sec`（默认 180）；超时只结束本次调用，不会杀 Worker |
 | `check_task` | 非阻塞状态查询 |
 | `get_result` | 分页读取完整结果 + 改过的文件 |
 | `get_transcript` | 分页会话日志 |
@@ -291,6 +301,14 @@ revivable = true
 缓冲事件在累计 64 KB、间隔 30 秒或一轮结束时落盘；正常停止会全部刷出，只有崩溃或被强杀才可能丢掉最后这一窗口。
 Worker 静默超过 `stall_timeout_sec`（默认 1800 秒，可按 Worker 设置）的一轮会以
 `failed` / `stalled` 结束；`check_task` 会给出 `silent_for_sec`。
+
+挂起的 `wait_task` 不会轮询模型——本地等待在 Bridge 内部由事件驱动——但每次
+超时返回都是一个模型可见的回合。长任务的零轮询模式是「派发后稍后再查」：
+`dispatch_task` 之后结束本轮，稍后 `check_task` / `get_result`。Bridge 无法
+在任务完成时唤醒休眠的协调者——得靠宿主定时机制或用户的下一轮。单次约
+90 分钟的等待（`timeout_sec=5400`）只在宿主 MCP 工具超时高于它并留余量、
+且该调用直接执行时成立——Codex Code Mode 会把它切成一串模型可见的 yield。
+细节见 [SETUP.md](SETUP.md#waiting-and-timeouts)。
 
 任务始终归属创建它的 Bridge 实例。协调者重启后，仍由其他存活实例持有的任务在
 `list_tasks` / `check_task` / `wait_task` / `get_result` 中显示 `remote: true`
