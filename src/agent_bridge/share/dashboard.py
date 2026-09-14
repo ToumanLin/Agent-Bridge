@@ -564,7 +564,7 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
 .subav-wrap.pulse{animation:ui-pulse 1.25s ease-in-out infinite;
   transform-origin:50%;will-change:transform;backface-visibility:hidden}
 @keyframes ui-pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.25)}}
-.sdur,.hdur,.stok,.htok{color:var(--dimmer);font-variant-numeric:tabular-nums;
+.sdur,.hdur,.stok,.htok,.htps{color:var(--dimmer);font-variant-numeric:tabular-nums;
   white-space:nowrap}
 /* ---------- pane header ---------- */
 /* --railw is the ruler strip's width. --railin is the measured native
@@ -950,6 +950,8 @@ const LOCALES=Object.freeze({
 "tokens.live":"live",
 "tokens.estimate":"estimate",
 "tokens.unit":"tok",
+"tokens.per_sec":"{n} tok/s",
+"tokens.out_speed":"Output speed: {rate} ({out} output tokens in {dur})",
 "tokens.week_label":"This week",
 "tokens.week_title":{"one":"Tokens since {date} · {n} task","other":"Tokens since {date} · {n} tasks"},
 "tokens.week_scope":"based on retained Agent Bridge task history",
@@ -1057,6 +1059,8 @@ const LOCALES=Object.freeze({
 "tokens.live":"实时",
 "tokens.estimate":"估算",
 "tokens.unit":"token",
+"tokens.per_sec":"{n} token/秒",
+"tokens.out_speed":"输出速率: {rate}（{dur} 内输出 {out} token）",
 "tokens.week_label":"本周",
 "tokens.week_title":{"other":"自 {date} 以来的 token · {n} 个任务"},
 "tokens.week_scope":"基于已保留的 Agent Bridge 任务历史",
@@ -1164,6 +1168,8 @@ const LOCALES=Object.freeze({
 "tokens.live":"即時",
 "tokens.estimate":"估算",
 "tokens.unit":"token",
+"tokens.per_sec":"{n} token/秒",
+"tokens.out_speed":"輸出速率: {rate}（{dur} 內輸出 {out} token）",
 "tokens.week_label":"本週",
 "tokens.week_title":{"other":"自 {date} 以來的 token · {n} 個任務"},
 "tokens.week_scope":"基於已保留的 Agent Bridge 任務歷史",
@@ -1513,6 +1519,47 @@ function tokSpan(tk,cls,live){
   const title=tokTitle({...info,live:isLive,estimate:est,ctxOnly});
   return `<span class="${cls}" title="${esc(title)}" aria-label="${esc(title)}"> · ${est?"~":""}${s} ${t("tokens.unit")}</span>`;
 }
+/* Output tokens per second for the latest task — output tokens only (never
+   input/prefill) over elapsed task time. While queued/running the live
+   consumed snapshot leads, then the persisted run_usage; terminal tasks
+   read run_usage with the same legacy raw-usage fallback tokSpan uses. The
+   interval is taskDur's started_at->finished_at clock (Date.now() while
+   active), so terminal rates freeze permanently. Missing/nonpositive
+   output, unparseable timestamps, inverted intervals and sub-second runs
+   render nothing rather than a spike. */
+function calcTps(tk,live){
+  if(!tk)return null;
+  let out=null;
+  if((tk.status==="running"||tk.status==="queued")&&live){
+    const info=runTok(live);
+    if(info)out=info.output;
+  }
+  const hasRun=tk.run_usage&&typeof tk.run_usage==="object"&&
+    Object.keys(tk.run_usage).length>0;
+  if(out===null&&hasRun){
+    const info=runTok(tk.run_usage);
+    if(info)out=info.output;
+  }
+  if(out===null&&!hasRun&&tk.usage&&typeof tk.usage==="object")
+    out=usageNums(tk.usage).output;
+  if(!Number.isFinite(out)||out<=0)return null;
+  const d=taskDur(tk);
+  if(!d)return null;
+  const sec=((d.end===null?Date.now():d.end)-d.start)/1e3;
+  if(sec<1)return null;
+  const rate=out/sec;
+  if(!Number.isFinite(rate)||rate<=0)return null;
+  return{rate,output:out,sec};
+}
+function tpsSpan(tk,cls,live){
+  const res=calcTps(tk,live);
+  if(!res)return"";
+  const r=res.rate>=10?Math.round(res.rate):res.rate.toFixed(1);
+  const text=t("tokens.per_sec",{n:r});
+  const title=t("tokens.out_speed",{rate:text,out:fmtNum(res.output),
+    dur:fmtDur(res.sec*1e3)});
+  return `<span class="${cls}" title="${esc(title)}" aria-label="${esc(title)}"> · ${esc(text)}</span>`;
+}
 function tickDurations(){
   document.querySelectorAll("[data-tid]").forEach(el=>{
     const d=taskDur(tasks.find(x=>x.task_id===el.dataset.tid));
@@ -1683,7 +1730,7 @@ function renderSessionHeader(){
     <div class="hbody">
       <h2 class="htitle">${esc(s.title||s.session_id)}</h2>
       <div class="hsub">
-        <span class="hstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,13)}</span> <span${st.raw?` title="${esc(st.raw)}"`:""}>${esc(t(st.key))}</span>${durSpan(tk,"hdur")}${tokSpan(tk,"htok",livePartial(s.session_id,tk))}</span>
+        <span class="hstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,13)}</span> <span${st.raw?` title="${esc(st.raw)}"`:""}>${esc(t(st.key))}</span>${durSpan(tk,"hdur")}${tokSpan(tk,"htok",livePartial(s.session_id,tk))}${tpsSpan(tk,"htps",livePartial(s.session_id,tk))}</span>
         <span class="badge">${esc(s.agent)}</span>
         ${s.model?`<span class="badge">${esc(s.model)}</span>`:""}
         ${repo?`<span class="hsep">|</span><span class="hrepo" title="${esc(s.cwd||"")}">${esc(t("session.working_repo",{repo}))}</span>`:""}

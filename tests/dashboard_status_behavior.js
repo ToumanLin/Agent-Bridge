@@ -195,7 +195,8 @@ vm.runInContext(
   code +
     "\n;globalThis.__x = { statusOf, latestTask, taskDur, fmtDur, durText," +
     " durSpan, PROC_STATUS, subSeed, agentAvatar, statusGlyph, icon," +
-    " usageNums, tokCount, runTok, tokTitle, fmtTok, tokSpan, turnDurMs," +
+    " usageNums, tokCount, runTok, tokTitle, fmtTok, tokSpan, calcTps," +
+    " tpsSpan, turnDurMs," +
     " addTurn, addPrompt, addTool, addToolStatus, applyEvents," +
     " MARK_SEL," +
     " scheduleRail, layoutRail, jumpToMark, updateCurMark, updateRulerWave," +
@@ -488,6 +489,90 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   eq(X.tokSpan(task({}), "stok"), "", "no usage -> empty span");
   eq(X.tokSpan(task({ usage: { junk: 1 } }), "stok"), "",
     "unusable usage -> empty span");
+
+  // --- output tokens/sec: output-only rate over elapsed task seconds ---
+  // Terminal: 1200 output tokens over the fixture's 40s -> "30 tok/s",
+  // frozen at finished_at and immune to a stale live snapshot.
+  const tpsTk = task({ run_usage: { scope: "run", quality: "exact",
+    input: 3000, output: 1200, total: 4200 } });
+  const tpsHtml = X.tpsSpan(tpsTk, "htps");
+  eq(tpsHtml.includes('class="htps"'), true,
+    "rate span carries the htps class");
+  eq(tpsHtml.includes("30 tok/s"), true,
+    "terminal rate = output tokens / elapsed");
+  eq(tpsHtml.includes('aria-label="Output speed'), true,
+    "rate span exposes the localized aria label");
+  eq(tpsHtml.includes("1,200"), true,
+    "rate tooltip names the output token count");
+  eq(X.tpsSpan(tpsTk, "htps", { input: 0, output: 99999, total: 99999 })
+    .includes("30 tok/s"), true,
+    "terminal rate freezes on run_usage, ignoring stale live output");
+  // Formatting: >=10 rounds to an integer, lower rates keep one decimal.
+  eq(X.tpsSpan(task({ run_usage: { scope: "run", quality: "exact",
+    output: 164, total: 164 } }), "htps").includes("4.1 tok/s"), true,
+    "sub-10 rate keeps one decimal");
+  // Running: the live consumed output snapshot wins over persisted rows.
+  const tpsRun = task({ status: "running", finished_at: null,
+    started_at: new Date(Date.now() - 10000).toISOString(),
+    run_usage: { scope: "run", quality: "exact", output: 10, total: 10 } });
+  const tpsLiveHtml = X.tpsSpan(tpsRun, "htps",
+    { input: 50, output: 350, total: 400 });
+  const tpsRate = parseFloat(
+    (tpsLiveHtml.match(/([\d.]+) tok\/s/) || [])[1]);
+  eq(tpsRate > 30 && tpsRate <= 35, true,
+    "running rate divides the live output snapshot (~35 tok/s)");
+  const tpsNoLive = X.tpsSpan(tpsRun, "htps", null);
+  eq(tpsNoLive.includes(" tok/s"), true,
+    "running task falls back to run_usage without a live snapshot");
+  // Codex-style: nothing streams and nothing persisted while running -> blank.
+  eq(X.tpsSpan(task({ task_id: "tc", status: "running", finished_at: null,
+    started_at: new Date(Date.now() - 60000).toISOString() }), "htps",
+    { input: 9, output: 0, total: 9 }), "",
+    "running with only input counted -> hidden, never invented");
+  // Suppression matrix: bad output, bad times, inverted or sub-second runs.
+  eq(X.tpsSpan(task({ run_usage: { scope: "run", quality: "exact",
+    output: 0, total: 5 } }), "htps"), "", "zero output -> hidden");
+  eq(X.tpsSpan(task({ run_usage: { scope: "run", quality: "exact",
+    input: 50, total: 50 } }), "htps"), "", "input-only run_usage -> hidden");
+  eq(X.tpsSpan(task({ started_at: null,
+    run_usage: { scope: "run", quality: "exact", output: 10, total: 10 } }),
+    "htps"), "", "missing started_at -> hidden");
+  eq(X.tpsSpan(task({ finished_at: null,
+    run_usage: { scope: "run", quality: "exact", output: 10, total: 10 } }),
+    "htps"), "", "terminal without finished_at -> hidden");
+  eq(X.tpsSpan(task({ started_at: "2026-01-01T00:10:00Z",
+    finished_at: "2026-01-01T00:00:00Z",
+    run_usage: { scope: "run", quality: "exact", output: 10, total: 10 } }),
+    "htps"), "", "finished before started -> hidden, never a negative rate");
+  eq(X.tpsSpan(task({ started_at: "2026-01-01T00:00:41.600Z",
+    finished_at: "2026-01-01T00:00:42Z",
+    run_usage: { scope: "run", quality: "exact", output: 50, total: 50 } }),
+    "htps"), "", "sub-second elapsed -> hidden (spike guard)");
+  // Legacy raw-usage fallback, same precedence convention as tokSpan.
+  eq(X.tpsSpan(task({ usage: { output_tokens: 800 } }), "htps")
+    .includes("20 tok/s"), true, "legacy raw output snapshot still rates");
+  // Localized rate unit + tooltip in all three dictionaries.
+  X.setLocalePref("zh-CN");
+  eq(X.tpsSpan(tpsTk, "htps").includes("30 token/秒"), true,
+    "rate unit zh-CN");
+  eq(X.tpsSpan(tpsTk, "htps").includes("输出速率"), true,
+    "rate tooltip zh-CN");
+  X.setLocalePref("zh-TW");
+  eq(X.tpsSpan(tpsTk, "htps").includes("30 token/秒"), true,
+    "rate unit zh-TW");
+  eq(X.tpsSpan(tpsTk, "htps").includes("輸出速率"), true,
+    "rate tooltip zh-TW");
+  X.setLocalePref("system");
+  // Header integration: .htps lands inside .hstatus right after .htok.
+  X._setSessions([sess("dead", "s1")]);
+  X._setTasks([tpsTk]);
+  X._setSelected("s1");
+  X.renderSessionHeader();
+  const hsub = elCache["#hwrap"].innerHTML;
+  eq(hsub.includes('class="htps"'), true,
+    "session header renders the tok/s metric");
+  eq(hsub.indexOf('class="htok"') < hsub.indexOf('class="htps"'), true,
+    "tok/s sits beside the token count in .hstatus");
 
   // --- addTurn: visible text is exactly "turn ended · <dur>" (+reason) ---
   let lastDiv = null;

@@ -555,6 +555,65 @@ def test_token_counter_helpers():
     assert "stok" not in tick and "htok" not in tick
 
 
+def test_output_tokens_per_second():
+    """Header-only output tok/s: output tokens over elapsed task seconds —
+    live while queued/running, frozen at finished_at for terminal tasks."""
+    for needle in (
+        "function calcTps(",
+        "function tpsSpan(",
+        '"htps"',
+        '"tokens.per_sec"',
+        '"tokens.out_speed"',
+    ):
+        assert needle in PAGE
+    # Same tabular-numeral styling rule as the other inline metrics.
+    assert re.search(r"\.sdur,\.hdur,\.stok,\.htok,\.htps\{", PAGE)
+    calc = re.search(r"function calcTps\(tk,live\)\{([\s\S]*?)\n\}", PAGE)
+    assert calc, "calcTps helper missing"
+    body = calc.group(1)
+    # Output tokens only — never the input or the consumed total.
+    assert "info.output" in body and "usageNums" in body
+    # The live consumed snapshot only applies to queued/running; the
+    # persisted run_usage and the legacy raw usage mirror tokSpan precedence.
+    assert 'tk.status==="running"||tk.status==="queued"' in body
+    assert "tk.run_usage" in body and "tk.usage" in body
+    # Elapsed interval is taskDur's started_at->finished_at clock (Date.now()
+    # while active), so terminal rates freeze and inverted/sub-second runs
+    # are suppressed instead of spiking.
+    assert "taskDur(tk)" in body and "Date.now()" in body and "sec<1" in body
+    span = re.search(r"function tpsSpan\(tk,cls,live\)\{([\s\S]*?)\n\}", PAGE)
+    assert span, "tpsSpan helper missing"
+    sbody = span.group(1)
+    # >=10 renders as an integer, lower positive rates keep one decimal; the
+    # tooltip doubles as the aria-label.
+    assert ">=10" in sbody and "toFixed(1)" in sbody
+    assert 't("tokens.per_sec"' in sbody and 't("tokens.out_speed"' in sbody
+    assert "aria-label" in sbody
+    # Placement: inside .hstatus directly after the existing .htok span —
+    # never the sidebar's .sstatus, never the .htitle line.
+    hstatus = next(
+        line for line in PAGE.splitlines() if 'class="hstatus"' in line)
+    assert 'tokSpan(tk,"htok"' in hstatus and 'tpsSpan(tk,"htps"' in hstatus
+    assert hstatus.index('tokSpan(tk,"htok"') < hstatus.index('tpsSpan(tk,"htps"')
+    sstatus = next(
+        line for line in PAGE.splitlines() if 'class="sstatus"' in line)
+    assert "tpsSpan" not in sstatus
+    htitle = next(
+        line for line in PAGE.splitlines() if 'class="htitle"' in line)
+    assert "tpsSpan" not in htitle and "htps" not in htitle
+    # Poll/event-driven updates only — the 1s duration tick never churns it.
+    tick = re.search(r"function tickDurations\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    for gone in ("tpsSpan", "calcTps", "htps"):
+        assert gone not in tick
+    # Localized in all three dictionaries with the documented placeholders.
+    locales = _locales()
+    for loc in ("en", "zh-CN", "zh-TW"):
+        d = locales[loc]
+        assert "{n}" in d["tokens.per_sec"]
+        for ph in ("{rate}", "{out}", "{dur}"):
+            assert ph in d["tokens.out_speed"], f"{ph} missing in {loc}"
+
+
 def test_perf_architecture_hooks():
     # Batch flush: chunk handlers mark blocks dirty, never re-render per chunk.
     assert "const dirty=new Set()" in PAGE
