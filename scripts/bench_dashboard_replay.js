@@ -273,9 +273,9 @@ async function waitStable() {
   const nodes = await waitStable();
   const coldMs = performance.now() - t;
   const expected = streams.find((s) => s.id === coldId).stream.events.length;
-  // Nav rail: jsdom has no layout metrics, so layoutRail takes the
-  // unclustered fallback — one .mark button per card matching MARK_SEL. This
-  // cross-checks the live rail against the selector the page actually applies.
+  // Nav rail: the compact ruler keeps one .mark button per element matching
+  // MARK_SEL — this cross-checks the live rail against the selector the
+  // page actually applies.
   const markCount = () => w.document.querySelectorAll("#rail .mark").length;
   const cardCount = () => MARK_SEL
     ? w.document.querySelector("#content").querySelectorAll(MARK_SEL).length

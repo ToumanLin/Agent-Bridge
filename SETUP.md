@@ -66,6 +66,16 @@ The helper writes `$AGENT_BRIDGE_HOME/dsh-acp` (default `~/.agent-bridge/dsh-acp
 
 Restart Codex after editing `config.toml`.
 
+MCP tool definitions are negotiated when the stdio connection starts. Adding
+or changing a tool in Bridge therefore does not update a coordinator that is
+already connected: its in-memory catalog can continue to show the previous
+set (for example, without `pause_task` / `resume_task`). After any tool
+registration or signature change, close every coordinator that holds a Bridge
+connection, update the installation if needed, and restart the coordinator so
+it performs a fresh `tools/list` request. A plain restart is enough when the
+configured executable is an editable checkout; a packaged install needs
+`agent-bridge upgrade` first.
+
 Inspect what Bridge reconstructed:
 
 ```powershell

@@ -607,10 +607,25 @@ def test_nav_rail():
     assert sel.group(1) == ".block.card.msg,.block.card.prompt:not(.user),.turnend:not(.err)"
     layout = re.search(r"function layoutRail\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
     assert "querySelectorAll(MARK_SEL)" in layout
-    # Layout, clustering, wave and interaction machinery.
+    # Compact centered geometry (Voyager buildCompactMarkerOffsets): one tick
+    # per markable element, evenly spaced around the rail midpoint with
+    # step=min(8px,160px/(n-1)) — never a document-fraction map, never a
+    # cluster of merged sources.
+    assert "Math.min(8,160/Math.max(1,n-1))" in layout
+    assert "(i-(n-1)/2)*step" in layout
+    assert "clusterYs" not in PAGE and "MARK_GAP" not in PAGE
+    assert "offsetTop/doc" not in PAGE
+    # No proportional bare-track seek: compact offsets carry no document
+    # position, so the rail registers no click-to-seek listener at all.
+    assert 'rail.addEventListener("click"' not in PAGE
+    # The measured scrollbar gutter (--railin) insets the overlaid rail from
+    # the pane's right edge, keeping it immediately LEFT of the native
+    # scrollbar; offsetWidth-clientWidth is the platform-agnostic measure.
+    assert "offsetWidth" in layout and "clientWidth" in layout
+    assert 'pane.style.setProperty("--railin"' in layout
+    # Layout, wave and interaction machinery.
     for needle in (
-        "MARK_GAP",
-        "clusterYs",
+        "markRank",
         "scheduleRail",
         "layoutRail",
         "jumpToMark",
@@ -640,10 +655,20 @@ def test_nav_rail():
         "rail.hidden",
     ):
         assert needle in PAGE
-    # Theme-aware CSS: token colors only, focus ring, current-mark accent,
-    # mobile narrowing via --railw inside the existing 900px media block.
+    # The rail is an absolute overlay inside #conv — not a flex sibling — so
+    # #conv must be its positioned containing block.
+    assert re.search(r"#conv\{[^}]*position:relative[^}]*display:flex", PAGE)
     rail_css = re.search(r"#rail\{([^}]*)\}", PAGE).group(1)
-    assert "width:var(--railw)" in rail_css and "position:relative" in rail_css
+    assert "position:absolute" in rail_css
+    assert "right:var(--railin)" in rail_css and "width:var(--railw)" in rail_css
+    # Voyager ruler mode: no full-height spine behind the ticks.
+    assert "#rail::before" not in PAGE
+    # #content keeps a stable native-scrollbar gutter and symmetric padding,
+    # so the overlay can never cover card text.
+    content_css = re.search(r"#content\{([^}]*)\}", PAGE).group(1)
+    assert "scrollbar-gutter:stable" in content_css
+    assert "overflow-y:auto" in content_css and "position:relative" in content_css
+    assert "padding:20px 26px 24px" in content_css
     # Every graduation is the same fixed 14px length; only thickness encodes
     # kind (2/3/4px) — no scaleX or per-tick length variation anywhere.
     mark_css = re.search(r"\.mark\{([^}]*)\}", PAGE).group(1)
@@ -656,27 +681,26 @@ def test_nav_rail():
     assert re.search(r"\.mark:focus-visible\{[^}]*outline:2px", PAGE)
     narrow = re.search(r"@media \(max-width:900px\)\{([\s\S]*?)\n\}", PAGE).group(1)
     assert "#pane{--railw:14px}" in narrow
-    # #conv wraps the scroller; #content stays the positioned offset parent so
-    # card.offsetTop maps proportionally onto the rail.
-    assert re.search(r"#conv\{[^}]*display:flex", PAGE)
-    content_css = re.search(r"#content\{([^}]*)\}", PAGE).group(1)
-    assert "position:relative" in content_css and "overflow-y:auto" in content_css
+    assert "calc(16px + var(--railin))" in narrow
     # Scroll and session-switch hooks keep the current mark and wave live.
     scroll = re.search(r'content\.addEventListener\("scroll",\(\)=>\{([\s\S]*?)\}\)', PAGE)
     assert "updateCurMark" in scroll.group(1) and "updateRulerWave" in scroll.group(1)
     sel_body = re.search(r"function select\(id\)\{([\s\S]*?)\n\}", PAGE).group(1)
     assert "scheduleRail()" in sel_body
-    # Mark aria-labels/tooltips come from the dictionary, keyed by card kind.
+    # Mark aria-labels/tooltips come from the dictionary, keyed by card kind —
+    # one tick per source, so no "N messages" cluster label exists.
     assert '"rail.agent_message"' in PAGE
     assert '"rail.dispatched_message"' in PAGE
     assert '"rail.turn_end"' in PAGE
     assert "MARK_LBL[rank]" in PAGE
-    assert 't("rail.messages"' in PAGE
+    assert 't("rail.messages"' not in PAGE
+    assert '"rail.messages"' not in PAGE
 
 
 def test_centered_content_axis():
-    # Every right-pane inner column centers on one axis compensated for the
-    # right rail's width via --railw; bars keep full-width chrome.
+    # Every right-pane inner column centers on one axis — the scrollbar-free
+    # viewport center — with the measured gutter reserved via --railin; bars
+    # keep full-width chrome.
     block = re.search(r"\.block\{([^}]*)\}", PAGE).group(1)
     assert "margin:0 auto 14px" in block and "max-width:960px" in block
     hwrap = re.search(r"#hwrap\{([^}]*)\}", PAGE).group(1)
@@ -686,17 +710,35 @@ def test_centered_content_axis():
     assert 'class="chatinner"' in PAGE
     turnend = re.search(r"\.turnend\{([^}]*)\}", PAGE).group(1)
     assert "margin:20px auto" in turnend and "max-width:960px" in turnend
-    # --railw compensation: header/composer right padding = pad + rail width.
+    # --railin compensation: header/composer right padding = pad + gutter.
     pane = re.search(r"#pane\{([^}]*)\}", PAGE).group(1)
-    assert "--railw:18px" in pane
+    assert "--railw:18px" in pane and "--railin:0px" in pane
     head = re.search(r"#sesshead\{([^}]*)\}", PAGE).group(1)
-    assert "calc(26px + var(--railw))" in head
+    assert "calc(26px + var(--railin))" in head
     assert "border-bottom:1px solid var(--border)" in head  # full-width chrome kept
     bar = re.search(r"#chatbar\{([^}]*)\}", PAGE).group(1)
-    assert "calc(26px + var(--railw))" in bar
+    assert "calc(26px + var(--railin))" in bar
     assert "border-top:1px solid var(--border)" in bar
     # The redundant latest button is gone entirely — markup, CSS, JS, i18n.
     assert "backtop" not in PAGE and "nav.latest" not in PAGE
+
+
+def test_composer_status_never_skews_input_row():
+    # The send-status line lives on its own row under the input, on the same
+    # 960px axis — it can never push the visible textarea/send group off
+    # center, whether empty or populated.
+    chatbar = re.search(
+        r'<div id="chatbar">([\s\S]*?)</div>\s*</div>\s*</div>', PAGE).group(1)
+    inner = re.search(
+        r'<div class="chatinner">([\s\S]*?)</div>', chatbar).group(1)
+    assert 'id="chatstatus"' not in inner, "status must not sit in the input row"
+    assert 'id="chatstatus"' in chatbar and 'aria-live="polite"' in chatbar
+    status_css = re.search(r"#chatstatus\{([^}]*)\}", PAGE).group(1)
+    assert "max-width:960px" in status_css and "margin:8px auto 0" in status_css
+    # No reserved inline width ever — the old min-width:96px flex skew is
+    # gone, and an empty status collapses to zero height.
+    assert "min-width" not in status_css
+    assert re.search(r"#chatstatus:empty\{[^}]*display:none", PAGE)
 
 
 # ---------- i18n: bundled en / zh-CN / zh-TW dictionaries ----------

@@ -69,7 +69,9 @@ INSTRUCTIONS = (
     "pause_task(task_id) ends a turn gracefully and keeps it resumable "
     "(partial result and transcript are preserved); resume_task(task_id) "
     "continues it later on the same conversation — including after a "
-    "coordinator restart, where a dead owner's session is adopted."
+    "coordinator restart, where a dead owner's session is adopted, and "
+    "across instances, where a live sibling's resumable task is resumed by "
+    "routing the request to that owner through the shared queue."
 )
 
 mcp = MCPServer[Registry]("agent-bridge", instructions=INSTRUCTIONS, lifespan=lifespan)
@@ -162,7 +164,7 @@ async def wait_task(ctx: Context, task_id: str, timeout_sec: float = DEFAULT_WAI
 
 @mcp.tool(annotations=READ_ONLY)
 async def check_task(ctx: Context, task_id: str) -> dict[str, Any]:
-    """Non-blocking status, elapsed time, and recent activity for a task. files_changed is capped at 200 paths; files_changed_total carries the real count. silent_for_sec is the time since the worker's last output; Bridge fails the task with stop_reason "stalled" once it passes stall_timeout_sec. With server.remote_tasks on (default), a task owned by another live Bridge instance sharing this data directory resolves as remote: true with owner {pid, create_time, alive} instead of "unknown task"; owner_lost: true means its owner died mid-run. Remote tasks are read-only — only the owning instance runs or cancels them. Payloads also carry paused / resumable / resume_hint: resumable means the turn ended unfinished and resume_task can continue it on the same conversation (adopting it first when the owner died)."""
+    """Non-blocking status, elapsed time, and recent activity for a task. files_changed is capped at 200 paths; files_changed_total carries the real count. silent_for_sec is the time since the worker's last output; Bridge fails the task with stop_reason "stalled" once it passes stall_timeout_sec. With server.remote_tasks on (default), a task owned by another live Bridge instance sharing this data directory resolves as remote: true with owner {pid, create_time, alive} instead of "unknown task"; owner_lost: true means its owner died mid-run. Remote tasks are read-only — only the owning instance runs, pauses, or cancels them. Payloads also carry paused / resumable / resume_hint: resumable means the turn ended unfinished and resume_task can continue it on the same conversation — adopted first when the owner died, or routed to the owning instance through the shared queue when a live sibling owns it."""
     try:
         return {"ok": True, **_registry(ctx).check_task(task_id)}
     except Exception as exc:
@@ -225,7 +227,7 @@ async def pause_task(ctx: Context, task_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def resume_task(ctx: Context, task_id: str, message: str | None = None, request_id: str | None = None) -> dict[str, Any]:
-    """Continue an unfinished task's work as a NEW task on the same session/native conversation. Accepts paused, cancelled, and failed tasks — including a dead owner's row after a coordinator restart or a sibling's death: the session is adopted and its orphaned worker is reaped before a replacement spawns. The original task row stays final and auditable — never rewritten — gaining resumed_by, while the new task carries resume_of and source="resume". message is optional; when omitted a safe explicit "pick up the paused work" continuation prompt is sent. request_id is an optional UUID for retry deduplication, same semantics as dispatch_task. Running tasks are rejected (pause_task or wait first), completed tasks too (dispatch_task with session_id sends a follow-up), and a task owned by a live sibling Bridge is rejected — only its owner can resume it. Rejected when coordinator.dispatch_enabled is false."""
+    """Continue an unfinished task's work as a NEW task on the same session/native conversation. Accepts paused, cancelled, and failed tasks — including a dead owner's row after a coordinator restart or a sibling's death: the session is adopted and its orphaned worker is reaped before a replacement spawns. A task owned by a live sibling Bridge is not executed here — the resume is routed to that owning instance through the shared queue and its dispatch result (the real new task_id/session_id) is relayed back within a bounded wait; the new task may stay remote-owned — poll it with wait_task/check_task as usual. If the recorded owner dies mid-delegation, the row is adopted locally and resumed here. The original task row stays final and auditable — never rewritten — gaining resumed_by, while the new task carries resume_of and source="resume"; a task that already has a continuation returns it instead of dispatching again. message is optional; when omitted a safe explicit "pick up the paused work" continuation prompt is sent. request_id is an optional UUID for retry deduplication, same semantics as dispatch_task. Running tasks are rejected (pause_task or wait first), completed tasks too (dispatch_task with session_id sends a follow-up). Rejected when coordinator.dispatch_enabled is false."""
     try:
         return {
             "ok": True,
@@ -237,7 +239,7 @@ async def resume_task(ctx: Context, task_id: str, message: str | None = None, re
 
 @mcp.tool(annotations=READ_ONLY)
 async def list_tasks(ctx: Context, active_only: bool = False) -> dict[str, Any]:
-    """List tasks known to this Bridge instance plus — with server.remote_tasks on (default) — task rows other live Bridge instances still own on this shared data directory. Remote rows carry remote: true and owner {pid, create_time, alive} (owner_lost: true when the owner died mid-run); they are read-only — only the owning instance runs or cancels them. Use this after a coordinator restart to rediscover task_ids, then keep polling with wait_task. active_only=true keeps only queued/running."""
+    """List tasks known to this Bridge instance plus — with server.remote_tasks on (default) — task rows other live Bridge instances still own on this shared data directory. Remote rows carry remote: true and owner {pid, create_time, alive} (owner_lost: true when the owner died mid-run); they are read-only — only the owning instance runs, pauses, or cancels them, while resume_task on a remote resumable row is routed to that owner. Use this after a coordinator restart to rediscover task_ids, then keep polling with wait_task. active_only=true keeps only queued/running."""
     try:
         return {"ok": True, "tasks": _registry(ctx).list_tasks(active_only=active_only)}
     except Exception as exc:

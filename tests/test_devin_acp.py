@@ -4,10 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_bridge.adapters.acp import AcpAdapter, _Live
+from agent_bridge.adapters.acp import AcpAdapter, _BridgeClient, _Live
 from agent_bridge.config import AgentConfig, EnvConfig, load_config
 from agent_bridge.devin_meta import DEVIN_MODE_BYPASS, apply_devin_env
-from agent_bridge.models import Session
+from agent_bridge.models import ProcState, Session, Task
 from agent_bridge.probes import probe_agent
 
 # Shape taken from a live `devin acp` session/new (CLI 3000.6.14): the mode
@@ -187,6 +187,78 @@ def test_bundled_config_lists_devin(tmp_path: Path):
     assert devin.command == ["devin", "acp"]
     assert devin.revivable is True
     assert "WINDSURF_API_KEY" in cfg.env.inherit
+
+
+class ReviveConn(FakeConn):
+    """Records the noReplay flag on session/load and answers prompt calls."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.no_replay = None
+        self.prompts: list[str] = []
+
+    async def load_session(self, cwd, session_id, mcp_servers=None, noReplay=None):
+        self.no_replay = noReplay
+        return await super().load_session(
+            cwd, session_id, mcp_servers=mcp_servers, noReplay=noReplay
+        )
+
+    async def prompt(self, session_id, prompt):
+        self.prompts.append(session_id)
+        return FakeResponse()
+
+
+@pytest.mark.asyncio
+async def test_adopted_idle_session_revives_via_load_noReplay_syncs_then_prompts(
+    monkeypatch, tmp_path
+):
+    """The restart-adoption shape end to end at the adapter: no live worker is
+    registered for the adopted idle_unloaded row, so ensure_session spawns,
+    revives the persisted native session via session/load(noReplay), runs the
+    Devin mode/model sync, and only then does run_turn send the prompt."""
+    conn = ReviveConn()
+    adapter = AcpAdapter(
+        AgentConfig(name="devin", protocol="acp", command=["devin", "acp"], revivable=True),
+        tmp_path,
+    )
+    live = _Live()
+    live.conn = conn
+    live.config_options = [MODE_OPTION, MODEL_OPTION]
+    session = Session(
+        session_id="sess_adopted",
+        agent="devin",
+        cwd=str(tmp_path),
+        native_session_id="swift-jumper",
+        model="swe-1-7",
+        proc_state=ProcState.idle_unloaded,
+    )
+
+    async def fake_spawn(_session):
+        adapter._live[session.session_id] = live
+        return live
+
+    monkeypatch.setattr(adapter, "_spawn", fake_spawn)
+    await adapter.ensure_session(session)
+
+    assert conn.calls[0] == ("load", "swift-jumper")
+    assert conn.no_replay is True
+    assert ("set_mode", DEVIN_MODE_BYPASS) in conn.calls
+    assert ("model", "swe-1-7") in conn.calls
+    assert session.native_session_id == "swift-jumper"
+    assert live.conversation_continued is True
+
+    live.client = _BridgeClient(session.session_id, tmp_path, "devin")
+    task = Task(
+        task_id="task_cont",
+        session_id=session.session_id,
+        agent="devin",
+        message="continue where you left off",
+        cwd=str(tmp_path),
+        source="resume",
+    )
+    result = await adapter.run_turn(session, task)
+    assert conn.prompts == ["swift-jumper"]
+    assert result.stop_reason == "end_turn"
 
 
 @pytest.mark.asyncio

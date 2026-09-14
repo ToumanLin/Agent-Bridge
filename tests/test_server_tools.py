@@ -33,6 +33,42 @@ def test_thirteen_tools_registered():
     ]
 
 
+@pytest.mark.asyncio
+async def test_public_mcp_catalog_exposes_all_tools_and_pause_schemas():
+    """The public MCP catalog is the contract coordinators actually consume.
+
+    Keep this separate from the private tool-manager test above: a Registry
+    method can exist, and a decorator can be present, while the public
+    ``tools/list`` representation still has a schema/serialization problem.
+    """
+    tools = await mcp.list_tools()
+    by_name = {tool.name: tool for tool in tools}
+
+    assert set(by_name) == {
+        "cancel_task",
+        "check_task",
+        "dispatch_task",
+        "end_session",
+        "get_result",
+        "get_transcript",
+        "list_agents",
+        "list_sessions",
+        "list_tasks",
+        "pause_task",
+        "resume_task",
+        "set_preferences",
+        "wait_task",
+    }
+
+    pause_schema = by_name["pause_task"].input_schema
+    assert pause_schema["properties"]["task_id"]["type"] == "string"
+    assert pause_schema["required"] == ["task_id"]
+
+    resume_schema = by_name["resume_task"].input_schema
+    assert resume_schema["properties"]["task_id"]["type"] == "string"
+    assert resume_schema["required"] == ["task_id"]
+
+
 def test_handshake_instructions_carry_hard_rules():
     assert mcp.instructions == INSTRUCTIONS
     for phrase in (

@@ -453,12 +453,15 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
 .sdur,.hdur,.stok,.htok{color:var(--dimmer);font-variant-numeric:tabular-nums;
   white-space:nowrap}
 /* ---------- pane header ---------- */
-/* --railw reserves the right rail's width in the header/composer padding so
-   every inner column centers on the same axis as the conversation blocks. */
+/* --railw is the ruler strip's width. --railin is the measured native
+   scrollbar gutter (JS sets it): it insets the overlaid ruler from the
+   pane's right edge and is reserved in the header/composer padding, so
+   every inner column centers on the same axis as the conversation blocks —
+   the center of the scrollbar-free viewport. */
 #pane{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--panel);
-  --railw:18px}
+  --railw:18px;--railin:0px}
 #sesshead{display:flex;align-items:center;gap:14px;
-  padding:16px calc(26px + var(--railw)) 14px 26px;
+  padding:16px calc(26px + var(--railin)) 14px 26px;
   border-bottom:1px solid var(--border);min-height:78px}
 #menubtn{display:none;flex:none;width:34px;height:34px;align-items:center;
   justify-content:center;background:none;border:1px solid var(--border);
@@ -482,15 +485,19 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
 .hmeta{flex:none;margin-left:auto;font-size:11.5px;color:var(--dimmer);white-space:nowrap}
 .hplaceholder{color:var(--dimmer);font-size:14px}
 /* ---------- conversation cards ---------- */
-#conv{flex:1;min-height:0;display:flex}
-#content{flex:1;position:relative;overflow-y:auto;padding:20px 26px 24px}
-#rail{flex:none;width:var(--railw);position:relative}
-#rail::before{content:"";position:absolute;top:0;bottom:0;left:0;width:1px;
-  background:var(--border)}
+#conv{flex:1;min-height:0;position:relative;display:flex}
+#content{flex:1;position:relative;overflow-y:auto;padding:20px 26px 24px;
+  scrollbar-gutter:stable}
+/* The ruler overlays the content viewport at its right edge, inset by the
+   measured scrollbar gutter (--railin) so it sits immediately LEFT of the
+   native scrollbar — Voyager ruler mode has no full-height spine, just the
+   compact centered tick group. */
+#rail{position:absolute;top:0;bottom:0;right:var(--railin);width:var(--railw);
+  z-index:2}
 /* Timeline ruler graduations: every tick is the same fixed 14px length,
-   anchored at the rail's content-facing edge and centered on its document
-   fraction via --my + translateY(-50%). Kind shows as thickness only —
-   agent message 2px, dispatched message 3px, turn end 4px. */
+   anchored at the rail's content-facing edge and centered on the compact
+   group's center-relative offset via --my + translateY(-50%). Kind shows as
+   thickness only — agent message 2px, dispatched message 3px, turn end 4px. */
 .mark{position:absolute;top:0;left:0;width:14px;height:2px;padding:0;
   border:0;border-radius:2px;background:var(--dimmer);cursor:pointer;
   transform:translateY(var(--my,0px)) translateY(-50%);
@@ -499,10 +506,9 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
     background-color .15s ease}
 .mark.k-disp{height:3px}
 .mark.k-turn{height:4px}
-/* Hit zone: cluster anchors stay >=6px apart (MARK_GAP) and the thickest
-   tick is 4px, so 1px of vertical expansion fills the gap exactly —
-   adjacent hit zones can touch but can never overlap. */
-.mark::after{content:"";position:absolute;inset:-1px -4px}
+/* Hit zone: extends toward the conversation only — never toward the
+   scrollbar on the rail's right edge, so track clicks stay native. */
+.mark::after{content:"";position:absolute;inset:-1px 0 -1px -4px}
 .mark:hover{opacity:1}
 .mark.cur{opacity:1;background:var(--accent)}
 .mark:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
@@ -572,7 +578,7 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
 .empty{color:var(--dimmer);text-align:center;margin-top:80px;font-size:14px}
 /* ---------- composer ---------- */
 #chatbar{border-top:1px solid var(--border);background:var(--panel);
-  padding:14px calc(26px + var(--railw)) 14px 26px}
+  padding:14px calc(26px + var(--railin)) 14px 26px}
 .chatinner{display:flex;gap:10px;align-items:flex-end;width:100%;
   max-width:960px;margin:0 auto}
 #chatinput{flex:1;resize:none;background:var(--panel);border:1px solid var(--border);
@@ -587,7 +593,12 @@ details.tooldetail pre{background:var(--panel2);border:1px solid var(--border);
 #chatsend:hover{background:var(--accent-hover)}
 #chatsend:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 #chatsend:disabled{opacity:.45;cursor:default}
-#chatstatus{font-size:11.5px;color:var(--dim);min-width:96px;align-self:center}
+/* Status line: its own row under the input on the same 960px axis, so it
+   never skews the visible textarea/send group; collapses fully when empty
+   while keeping the aria-live region mounted. */
+#chatstatus{display:block;width:100%;max-width:960px;margin:8px auto 0;
+  font-size:11.5px;color:var(--dim);text-align:right}
+#chatstatus:empty{display:none}
 .clamp{max-height:120px;overflow:hidden;position:relative}
 .clamp::after{content:"";position:absolute;bottom:0;left:0;right:0;height:40px;
   background:linear-gradient(transparent,var(--panel))}
@@ -607,9 +618,9 @@ html[data-i18n-pending] [data-i18n]{visibility:hidden}
   #backdrop.open{display:block;position:fixed;inset:0;z-index:35;
     background:rgba(0,0,0,.35)}
   #pane{--railw:14px}
-  #sesshead{padding:12px calc(16px + var(--railw)) 12px 16px;min-height:0}
+  #sesshead{padding:12px calc(16px + var(--railin)) 12px 16px;min-height:0}
   #content{padding:14px 16px}
-  #chatbar{padding:10px calc(16px + var(--railw)) 10px 16px}
+  #chatbar{padding:10px calc(16px + var(--railin)) 10px 16px}
 }
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
@@ -682,8 +693,8 @@ html[data-i18n-pending] [data-i18n]{visibility:hidden}
           width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
           stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
           focusable="false"><path d="M3 12h18m-9-9l9 9-9 9"/></svg></button>
-        <span id="chatstatus" aria-live="polite"></span>
       </div>
+      <span id="chatstatus" aria-live="polite"></span>
     </div>
   </div>
 </div>
@@ -732,7 +743,6 @@ const LOCALES=Object.freeze({
 "rail.agent_message":"Agent message",
 "rail.dispatched_message":"Dispatched message",
 "rail.turn_end":"Turn end",
-"rail.messages":"{n} messages",
 "a11y.sessions":"Sessions",
 "a11y.show_session_list":"Show session list",
 "a11y.message_selected_session":"Message the selected session",
@@ -840,7 +850,6 @@ const LOCALES=Object.freeze({
 "rail.agent_message":"Agent 消息",
 "rail.dispatched_message":"已派发消息",
 "rail.turn_end":"回合结束",
-"rail.messages":"{n} 条消息",
 "a11y.sessions":"会话",
 "a11y.show_session_list":"显示会话列表",
 "a11y.message_selected_session":"向所选会话发送消息",
@@ -948,7 +957,6 @@ const LOCALES=Object.freeze({
 "rail.agent_message":"Agent 訊息",
 "rail.dispatched_message":"已派發訊息",
 "rail.turn_end":"回合結束",
-"rail.messages":"{n} 則訊息",
 "a11y.sessions":"工作階段",
 "a11y.show_session_list":"顯示工作階段清單",
 "a11y.message_selected_session":"傳送訊息給所選工作階段",
@@ -1735,13 +1743,16 @@ function applyEvents(evs){
 }
 
 /* ---------- conversation nav rail ----------
-   Voyager-style timeline ruler: proportional graduation ticks on the rail
-   right of the scroller, one per rendered conversation beat. The mark list
-   is re-derived from the live DOM on each rAF-coalesced layout pass, so
+   Voyager ruler-mode timeline: one fixed-length tick per markable beat,
+   packed as an evenly-spaced column centered on the rail's midpoint —
+   positions are compact, not document fractions, so scrolling moves only
+   the focus wave through the static group. The rail overlays the content
+   viewport immediately left of the native scrollbar. The mark list is
+   re-derived from the live DOM on each rAF-coalesced layout pass, so
    incremental appends, chunked replay, transcript resets, pane
    stash/restore, fold toggles, prompt expansion and resizes all self-heal
    with no bookkeeping in the render path. */
-const rail=$("#rail");
+const rail=$("#rail"),pane=$("#pane");
 /* Mark taxonomy — the single source of truth, applied by layoutRail via
    querySelectorAll and consumed verbatim by the tests and benchmark: Agent
    message cards, MCP-dispatched prompt cards and successful turn ends.
@@ -1749,10 +1760,8 @@ const rail=$("#rail");
    tool groups, error dividers (.turnend.err — an error is not a turn end),
    empty states and usage events never get a mark. */
 const MARK_SEL=".block.card.msg,.block.card.prompt:not(.user),.turnend:not(.err)";
-const MARK_GAP=6;                    // px: nearer marks merge into one cluster
 /* Kind is encoded by thickness only — every tick keeps the same fixed 14px
-   length: agent message 2px, dispatched message 3px, turn end 4px. A mixed
-   cluster wears its thickest member's weight. */
+   length: agent message 2px, dispatched message 3px, turn end 4px. */
 const MARK_CLS=["k-msg","k-disp","k-turn"],MARK_H=[2,3,4];
 const MARK_LBL=["rail.agent_message","rail.dispatched_message","rail.turn_end"];
 let railQueued=false,railBtns=[],curIdx=-1;
@@ -1771,19 +1780,6 @@ try{
   markVars=!!tr&&tr!=="none";p.remove();
 }catch(e){}
 
-/* Groups sorted mark tops into clusters: each top joins the open cluster
-   when it is within `gap` of the cluster's last member. A zero gap never
-   clusters — the fallback for unmeasurable layouts (no offsetTop metrics). */
-function clusterYs(ys,gap){
-  const groups=[];
-  ys.forEach((y,i)=>{
-    const g=groups[groups.length-1];
-    if(g&&y-g.y1<gap){g.idx.push(i);g.y1=y}
-    else groups.push({y,y1:y,idx:[i]});
-  });
-  return groups;
-}
-
 function scheduleRail(){
   if(railQueued)return;railQueued=true;
   requestAnimationFrame(()=>{railQueued=false;layoutRail()});
@@ -1796,7 +1792,18 @@ function markRank(el){
     :el.classList.contains("prompt")?1:0;
 }
 
+/* Ruler geometry (Voyager buildCompactMarkerOffsets): one tick per markable
+   element, evenly spaced in a compact column centered on the rail's
+   midpoint — never a document-fraction mapping and never clustered, so
+   every source keeps its own tick and label. step = min(8px, 160px/(n-1))
+   caps the whole group near 160px; clamping the center keeps every tick
+   fully inside the rail. The scrollbar gutter is measured here too
+   (offsetWidth-clientWidth) and exposed as --railin, so the rail hugs the
+   native scrollbar's left edge while header/composer reserve the same
+   strip — one shared center axis. */
 function layoutRail(){
+  const sw=Math.max(0,(content.offsetWidth||0)-content.clientWidth);
+  pane.style.setProperty("--railin",sw+"px");
   const els=[...content.querySelectorAll(MARK_SEL)];
   if(!selected||!els.length){
     rail.hidden=true;railBtns=[];curIdx=-1;
@@ -1804,33 +1811,25 @@ function layoutRail(){
     return;
   }
   rail.hidden=false;
-  const doc=content.scrollHeight,RH=rail.clientHeight;
-  // Read phase: batch every offsetTop before the write phase below.
-  const ys=els.map(el=>Math.max(0,Math.min(RH,el.offsetTop/doc*RH))||0);
-  const groups=clusterYs(ys,doc&&RH?MARK_GAP:0);
-  while(railBtns.length>groups.length)railBtns.pop().remove();
-  groups.forEach((g,i)=>{
+  const RH=rail.clientHeight,n=els.length;
+  const step=Math.min(8,160/Math.max(1,n-1)),mid=RH/2;
+  while(railBtns.length>n)railBtns.pop().remove();
+  els.forEach((el,i)=>{
     let b=railBtns[i];
     if(!b){b=document.createElement("button");b.type="button";b.className="mark";
       // Keyboard-activated clicks (detail 0) also move focus to the card.
       b.onclick=e=>jumpToMark(b,e&&e.detail===0);
       rail.appendChild(b);railBtns.push(b)}
-    b._els=g.idx.map(j=>els[j]);
-    /* The tick centers on its first member's document fraction; clamping
-       the center keeps the whole tick inside the rail no matter how close
-       to an edge the anchor sits. */
-    let rank=0;g.idx.forEach(j=>{const r=markRank(els[j]);if(r>rank)rank=r});
+    b._els=[el];
+    const rank=markRank(el);
     b.className="mark "+MARK_CLS[rank];
     const th=MARK_H[rank];
-    const c=Math.max(th/2,Math.min(g.y,RH-th/2));
+    const c=Math.max(th/2,Math.min(mid+(i-(n-1)/2)*step,RH-th/2));
     b.style.setProperty("--my",c.toFixed(1)+"px");
     if(!markVars)
       b.style.transform=`translateY(${c.toFixed(1)}px) translateY(-50%)`;
-    const first=b._els[0];
-    const cts=(first.querySelector(".ctime")||{}).textContent||"";
-    const lbl=g.idx.length>1
-      ?[t("rail.messages",{n:g.idx.length}),cts].filter(Boolean).join(" · ")
-      :[t(MARK_LBL[rank]),cts].filter(Boolean).join(" · ");
+    const cts=(el.querySelector(".ctime")||{}).textContent||"";
+    const lbl=[t(MARK_LBL[rank]),cts].filter(Boolean).join(" · ");
     b.setAttribute("aria-label",lbl);b.title=lbl;
   });
   curIdx=-2;                    // force the aria-current/tab-stop sync below
@@ -1913,17 +1912,6 @@ rail.addEventListener("keydown",e=>{
   if(n===i)return;
   railBtns[n].tabIndex=0;railBtns[i].tabIndex=-1;
   railBtns[n].focus();
-});
-/* Bare-track click seeks proportionally down the transcript — the same
-   document fraction the marks are positioned by, so clicking level with a
-   mark lands its card at the top of the viewport. */
-rail.addEventListener("click",e=>{
-  if(e.target!==rail)return;
-  const doc=content.scrollHeight,vh=content.clientHeight,RH=rail.clientHeight;
-  if(!doc||!RH||doc<=vh)return;
-  const top=Math.max(0,Math.min(doc-vh,e.offsetY/RH*doc));
-  if(content.scrollTo)content.scrollTo({top,behavior:rmo.matches?"auto":"smooth"});
-  else content.scrollTop=top;
 });
 /* Wheeling over the rail scrolls the conversation (Voyager parity). */
 rail.addEventListener("wheel",e=>{

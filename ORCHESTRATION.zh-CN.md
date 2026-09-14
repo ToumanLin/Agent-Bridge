@@ -79,4 +79,4 @@ Claude 的 `quota.status` 只汇总通用的 `5h` / `weekly` 额度。派发前�
 
 需要重试去重时，在首次调用 `dispatch_task` 前生成 UUID `request_id`，首次调用就传入。重试须使用同一 ID 和原始参数；首次省略了 `session_id`，重试也保持省略。只在重试时补 ID 无法对首次调用去重。相同参数复用原任务（`reused=true`），不同参数直接拒绝。去重只在同一 Bridge 实例内、原任务仍保留时有效，仍须通过正常派发校验。重启 Bridge、切换实例或清理原任务后不再保留绑定；Worker 的外部副作用不保证 exactly-once。
 
-协调者重启后，`list_tasks` 能找回仍由其他存活 Bridge 实例持有的任务（`remote: true`）；用 `check_task` / `wait_task` / `get_result` 继续跟踪和读取——不要取消或重新派发。`owner_lost: true` 表示持有方已中途退出；其 `resumable` 的任务可被 `resume_task` 收养——先清掉孤儿 worker——并在同一会话上以新任务继续。
+协调者重启后，`list_tasks` 能找回仍由其他存活 Bridge 实例持有的任务（`remote: true`）；用 `check_task` / `wait_task` / `get_result` 继续跟踪和读取——不要取消或重新派发。远端可续的任务由 `resume_task` 路由给其存活持有方执行；`owner_lost: true` 表示持有方已中途退出，该行随即被收养——先清掉孤儿 worker——并在同一会话上继续。

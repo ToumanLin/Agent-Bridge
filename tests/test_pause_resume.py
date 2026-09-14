@@ -383,13 +383,225 @@ async def test_resume_adopts_dead_owner_at_runtime(bridge_home, tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_resume_rejects_live_remote_owner(bridge_home, tmp_path, monkeypatch):
-    """A paused task a LIVE sibling still owns is remote: pause, resume, and
-    cancel are all rejected — no takeover."""
+async def test_resume_delegates_to_live_remote_owner(bridge_home, tmp_path, monkeypatch):
+    """A paused task a LIVE sibling still owns is never driven by the caller:
+    resume_task routes the request through the shared outbox, the owning
+    instance runs the normal resume path, and the caller relays the real new
+    task — pause/cancel stay rejected, and the continuation is a remote row
+    the caller can poll like any other sibling task."""
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "30")
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_FOREIGN_RETRY_SEC", 0.1)
+    monkeypatch.setattr("agent_bridge.registry.RESUME_DELEGATE_POLL_SEC", 0.05)
+    monkeypatch.setattr("agent_bridge.registry.REMOTE_TASK_POLL_SEC", 0.05)
+    monkeypatch.setattr(
+        "agent_bridge.registry.owner_alive",
+        lambda pid, create_time=None: pid in (4242, 2002, os.getpid()),
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    cwd = str(work.resolve())
+    a = Registry.create(bridge_home, owner_pid=4242, owner_create_time=7.0)
+    await a.start()
+    try:
+        dispatched = await a.dispatch_task("fake", "sibling work", cwd=cwd)
+        task_id = dispatched["task_id"]
+        session_id = dispatched["session_id"]
+        await asyncio.sleep(0.2)
+        await a.pause_task(task_id)
+        await a.flush_state()
+        monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "0.01")
+
+        b = Registry.create(bridge_home, owner_pid=2002, owner_create_time=22.0)
+        await b.start()
+        try:
+            assert task_id not in b.tasks
+            # The remote view resolves read-only and resumable — the hint
+            # names the routed path, not a rejection.
+            checked = b.check_task(task_id)
+            assert checked["remote"] is True
+            assert checked["paused"] is True
+            assert checked["resumable"] is True
+            assert "routes" in checked["resume_hint"]
+
+            resumed = await asyncio.wait_for(b.resume_task(task_id), timeout=30)
+            new_id = resumed["task_id"]
+            assert resumed["resumed_from"] == task_id
+            assert resumed["session_id"] == session_id
+            assert new_id != task_id
+            assert resumed["delegated"] is True
+
+            # The continuation was dispatched and is owned by A — the audit
+            # links live on the owning instance's rows.
+            assert a.tasks[task_id].resumed_by == new_id
+            assert a.tasks[new_id].resume_of == task_id
+            assert a.tasks[new_id].source == "resume"
+            assert a.tasks[new_id].owner_pid == 4242
+            assert a.tasks[new_id].session_id == session_id
+
+            # B sees both rows as remote and can poll the new one to done.
+            remote_new = b.check_task(new_id)
+            assert remote_new["remote"] is True
+            assert remote_new["owner"]["pid"] == 4242
+            waited = await b.wait_task(new_id, timeout_sec=15)
+            assert waited["status"] == "completed", waited
+            assert waited["remote"] is True
+
+            # Pause and cancel on a live sibling's row are still refused.
+            with pytest.raises(RuntimeError, match="cannot be paused"):
+                await b.pause_task(task_id)
+            with pytest.raises(RuntimeError, match="cannot be cancelled"):
+                await b.cancel_task(task_id)
+
+            # Exactly one continuation ever landed on disk.
+            disk = read_json(state_path(bridge_home), {})
+            conts = [r for r in disk["tasks"] if r.get("resume_of") == task_id]
+            assert len(conts) == 1 and conts[0]["task_id"] == new_id
+        finally:
+            await b.stop()
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_resume_delegation_replays_request_id(bridge_home, tmp_path, monkeypatch):
+    """Replaying a delegated resume_task with the same request_id returns the
+    already-dispatched continuation — the persisted resumed_by dedupes the
+    retry even though the caller never owned the task."""
+    import uuid
+
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "30")
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_FOREIGN_RETRY_SEC", 0.1)
+    monkeypatch.setattr("agent_bridge.registry.RESUME_DELEGATE_POLL_SEC", 0.05)
+    monkeypatch.setattr(
+        "agent_bridge.registry.owner_alive",
+        lambda pid, create_time=None: pid in (4242, 2002, os.getpid()),
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    cwd = str(work.resolve())
+    a = Registry.create(bridge_home, owner_pid=4242, owner_create_time=7.0)
+    await a.start()
+    try:
+        dispatched = await a.dispatch_task("fake", "sibling work", cwd=cwd)
+        task_id = dispatched["task_id"]
+        await asyncio.sleep(0.2)
+        await a.pause_task(task_id)
+        await a.flush_state()
+        monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "0.01")
+
+        b = Registry.create(bridge_home, owner_pid=2002, owner_create_time=22.0)
+        await b.start()
+        try:
+            rid = str(uuid.uuid4())
+            first = await asyncio.wait_for(
+                b.resume_task(task_id, request_id=rid), timeout=30
+            )
+            replay = await asyncio.wait_for(
+                b.resume_task(task_id, request_id=rid), timeout=30
+            )
+            assert replay["task_id"] == first["task_id"]
+            assert replay["resumed_from"] == task_id
+            # The owner also answers a plain repeat with the same continuation.
+            again = await a.resume_task(task_id)
+            assert again["task_id"] == first["task_id"]
+            disk = read_json(state_path(bridge_home), {})
+            conts = [r for r in disk["tasks"] if r.get("resume_of") == task_id]
+            assert len(conts) == 1
+        finally:
+            await b.stop()
+    finally:
+        await a.stop()
+
+
+@pytest.mark.asyncio
+async def test_resume_delegation_owner_death_adopts_locally(bridge_home, tmp_path, monkeypatch):
+    """The recorded owner dying mid-delegation falls back to lazy adoption:
+    the caller adopts the row after a short grace and runs the continuation
+    itself — no idle_exit wait, and exactly one continuation lands."""
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "30")
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_POLL_SEC", 0.05)
+    monkeypatch.setattr("agent_bridge.registry.OUTBOX_FOREIGN_RETRY_SEC", 0.1)
+    monkeypatch.setattr("agent_bridge.registry.RESUME_DELEGATE_POLL_SEC", 0.05)
+    monkeypatch.setattr("agent_bridge.registry.RESUME_FALLBACK_GRACE_SEC", 0.2)
+    monkeypatch.setattr("agent_bridge.registry.REMOTE_TASK_POLL_SEC", 0.05)
+    alive = {4242: True}
+    monkeypatch.setattr(
+        "agent_bridge.registry.owner_alive",
+        lambda pid, create_time=None: pid == os.getpid() or alive.get(pid, False),
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    cwd = str(work.resolve())
+    a = Registry.create(bridge_home, owner_pid=4242, owner_create_time=7.0)
+    await a.start()
+    dispatched = await a.dispatch_task("fake", "sibling work", cwd=cwd)
+    task_id = dispatched["task_id"]
+    session_id = dispatched["session_id"]
+    await asyncio.sleep(0.2)
+    await a.pause_task(task_id)
+    monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "0.01")
+
+    b = Registry.create(bridge_home, owner_pid=2002, owner_create_time=22.0)
+    await b.start()
+    try:
+        # First the owner is alive-but-unresponsive — the orphaned-bridge
+        # shape: its pid still passes liveness, so the caller must queue and
+        # wait rather than steal the row, but its outbox loop is gone so
+        # nothing can claim the request.
+        monkeypatch.setattr(a, "save", lambda: None)
+        for bg in (a._watchdog, a._outbox_task):
+            if bg is not None:
+                bg.cancel()
+        resume_call = asyncio.ensure_future(b.resume_task(task_id))
+        outbox = bridge_home / "outbox"
+        for _ in range(100):
+            if resume_call.done():
+                pytest.fail("resume finished while its owner was still live")
+            if any(p.name.startswith("req_resume_") for p in outbox.iterdir()):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("delegated resume request never reached the outbox")
+        # Confirm the caller really waits on a live owner before the flip.
+        await asyncio.sleep(0.3)
+        assert not resume_call.done()
+        # Now the owner actually dies mid-delegation.
+        alive[4242] = False
+
+        resumed = await asyncio.wait_for(resume_call, timeout=30)
+        new_id = resumed["task_id"]
+        assert resumed["resumed_from"] == task_id
+        assert resumed["session_id"] == session_id
+        assert new_id != task_id
+        # B adopted the paused row and dispatched the continuation itself.
+        assert b.tasks[task_id].owner_pid == 2002
+        assert b.tasks[task_id].resumed_by == new_id
+        assert b.tasks[new_id].owner_pid == 2002
+        assert b.tasks[new_id].resume_of == task_id
+        assert b.tasks[new_id].source == "resume"
+        waited = await b.wait_task(new_id, timeout_sec=15)
+        assert waited["status"] == "completed"
+        # No second continuation was dispatched by any path.
+        disk = read_json(state_path(bridge_home), {})
+        conts = [r for r in disk["tasks"] if r.get("resume_of") == task_id]
+        assert len(conts) == 1 and conts[0]["task_id"] == new_id
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_live_remote_when_remote_tasks_disabled(
+    bridge_home, tmp_path, monkeypatch
+):
+    """remote_tasks=false keeps the sibling isolation contract: a live
+    sibling's paused row is invisible to control ops — resume must not
+    route around it through the outbox either."""
     monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "30")
     monkeypatch.setattr(
         "agent_bridge.registry.owner_alive",
-        lambda pid, create_time=None: pid in (4242, os.getpid()),
+        lambda pid, create_time=None: pid in (4242, 2002, os.getpid()),
     )
     work = tmp_path / "work"
     work.mkdir()
@@ -402,21 +614,14 @@ async def test_resume_rejects_live_remote_owner(bridge_home, tmp_path, monkeypat
         await asyncio.sleep(0.2)
         await a.pause_task(task_id)
 
+        (bridge_home / "agents.toml").write_text(
+            "[server]\nremote_tasks = false\n", encoding="utf-8"
+        )
         b = Registry.create(bridge_home, owner_pid=2002, owner_create_time=22.0)
         await b.start()
         try:
-            assert task_id not in b.tasks
-            with pytest.raises(RuntimeError, match="cannot be resumed"):
+            with pytest.raises(KeyError, match="unknown task"):
                 await b.resume_task(task_id)
-            with pytest.raises(RuntimeError, match="cannot be paused"):
-                await b.pause_task(task_id)
-            with pytest.raises(RuntimeError, match="cannot be cancelled"):
-                await b.cancel_task(task_id)
-            # The remote view still resolves read-only, marked not-resumable.
-            checked = b.check_task(task_id)
-            assert checked["remote"] is True
-            assert checked["paused"] is True
-            assert checked["resumable"] is False
         finally:
             await b.stop()
     finally:

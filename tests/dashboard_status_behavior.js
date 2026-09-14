@@ -6,10 +6,11 @@
 // npm packages. Covers the centralized proc_state map, latestTask chronology,
 // the taskDur/fmtDur/durText rules end to end, the bundled i18n layer
 // (en / zh-CN / zh-TW), and the timeline ruler end to end: MARK_SEL taxonomy,
-// layoutRail geometry (fixed-length ticks, kind thickness, rail bounds),
-// updateCurMark's 0.45 reference, the updateRulerWave focus crest,
-// jumpToMark, track-click seeking, wheel forwarding, roving tabindex, and
-// the MutationObserver/ResizeObserver + rAF-coalesced update loop.
+// layoutRail compact centered geometry (fixed-length ticks, kind thickness,
+// rail bounds), the measured --railin scrollbar gutter, updateCurMark's 0.45
+// reference, the updateRulerWave focus crest, jumpToMark, wheel forwarding,
+// roving tabindex, and the MutationObserver/ResizeObserver + rAF-coalesced
+// update loop.
 //
 // Usage: node tests/dashboard_status_behavior.js   (exit 0 = all pass)
 "use strict";
@@ -70,6 +71,7 @@ const el = () => {
     open: false, hidden: false, isConnected: true, offsetTop: 0,
     children: [], _parent: null, _htmlSets: 0,
     scrollTop: 0, scrollHeight: 0, clientHeight: 0,
+    clientWidth: 0, offsetWidth: 0,
     attrs: {}, _q: {}, _ls: {}, focused: 0, onclick: null,
     appendChild(c) {
       if (c._parent) c._parent.children.splice(c._parent.children.indexOf(c), 1);
@@ -194,8 +196,8 @@ vm.runInContext(
     "\n;globalThis.__x = { statusOf, latestTask, taskDur, fmtDur, durText," +
     " durSpan, PROC_STATUS, subSeed, agentAvatar, statusGlyph, icon," +
     " usageNums, tokCount, runTok, tokTitle, fmtTok, tokSpan, turnDurMs," +
-    " addTurn, addPrompt, addTool, addToolStatus, clusterYs, applyEvents," +
-    " MARK_SEL, MARK_GAP," +
+    " addTurn, addPrompt, addTool, addToolStatus, applyEvents," +
+    " MARK_SEL," +
     " scheduleRail, layoutRail, jumpToMark, updateCurMark, updateRulerWave," +
     " t, LOCALES, LOCALE_PREFS, localePref, resolveSystemLocale," +
     " setLocalePref, applyLocale, rerenderLocale, ago, fmtTs, fmtNum," +
@@ -558,7 +560,6 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   //     get one. ---
   eq(X.MARK_SEL, ".block.card.msg,.block.card.prompt:not(.user),.turnend:not(.err)",
     "MARK_SEL is the pinned taxonomy selector");
-  eq(X.MARK_GAP, 6, "cluster gap is 6px");
   X._setSelected("rail-sess");
   X._setTasks([task({})]);
   contentEl.children = [];
@@ -604,11 +605,24 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   eq(thOf(bs[0]), 3, "dispatched tick is 3px thick");
   eq(thOf(bs[1]), 2, "agent tick is 2px thick");
   eq(thOf(bs[2]), 4, "turn-end tick is 4px thick");
-  // Document-fraction positions: offsetTop / scrollHeight * railHeight —
+  // Compact centered offsets (Voyager buildCompactMarkerOffsets): n=3 ->
+  // step=min(8,160/2)=8, the group centered on the rail midpoint (RH/2=50).
   // --my is the tick CENTER (the tick self-centers via translateY(-50%)).
-  eq(yOf(bs[0]), 2.5, "mark y is the card's document fraction (20/800*100)");
-  eq(yOf(bs[1]), 32.5, "mark y is the card's document fraction (260/800*100)");
-  eq(yOf(bs[2]), 77.5, "turn-end y is its document fraction (620/800*100)");
+  eq(yOf(bs[0]), 42, "compact offset: midpoint + (0-1)*8");
+  eq(yOf(bs[1]), 50, "compact offset: rail midpoint");
+  eq(yOf(bs[2]), 58, "compact offset: midpoint + (2-1)*8");
+
+  // --- --railin: measured native scrollbar gutter on #pane ---
+  const paneEl = elCache["#pane"];
+  contentEl.clientWidth = 400;
+  contentEl.offsetWidth = 417;          // 17px classic-scrollbar gutter
+  X.layoutRail();
+  eq(paneEl.style.getPropertyValue("--railin"), "17px",
+    "railin = offsetWidth - clientWidth");
+  contentEl.offsetWidth = 400;          // overlay scrollbar: no gutter
+  X.layoutRail();
+  eq(paneEl.style.getPropertyValue("--railin"), "0px",
+    "overlay scrollbars inset the rail by 0");
 
   // --- a sensible current mark exists at scrollTop = 0 ---
   contentEl.scrollTop = 0;
@@ -646,38 +660,38 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
       `tick ${i} never scaled`);
   });
 
-  // --- cluster ticks: anchored at the first member, thickest member's
-  //     weight, never painting outside the rail ---
+  // --- compact geometry: every source keeps its own tick — sources are
+  //     never merged by document proximity ---
   bs = railScene([["block card msg", 100], ["block card msg", 400],
     ["block card msg", 430]], 1000, 100);
-  eq(bs.length, 2, "3px-apart marks cluster, the 30px one stays single");
-  eq(yOf(bs[1]), 40, "cluster anchored at its first member");
-  eq(thOf(bs[1]), 2, "all-message cluster keeps the 2px tick");
-  // A mixed cluster wears its thickest member's weight.
-  bs = railScene([["block card msg", 100], ["block card msg", 980],
-    ["block card msg", 985], ["block card prompt", 990],
-    ["block card msg", 995]], 1000, 100);
-  eq(bs.length, 2, "four close marks merge into one bottom cluster");
-  eq(bs[1].classList.contains("k-disp"), true,
-    "mixed cluster takes the dispatched member's 3px weight");
+  eq(bs.length, 3, "one tick per source even when cards sit close together");
+  eq(yOf(bs[0]), 42, "n=3 -> first tick mid-8");
+  eq(yOf(bs[1]), 50, "n=3 -> middle tick on the midpoint");
+  eq(yOf(bs[2]), 58, "n=3 -> last tick mid+8");
+  // n=1 centers exactly; n=2 flanks the midpoint.
+  bs = railScene([["block card msg", 100]], 1000, 100);
+  eq(bs.length, 1, "single source -> single tick");
+  eq(yOf(bs[0]), 50, "lone tick centered on the rail midpoint");
+  bs = railScene([["block card msg", 100], ["block card prompt", 700]],
+    1000, 100);
+  eq(yOf(bs[0]), 46, "n=2 -> mid-4");
+  eq(yOf(bs[1]), 54, "n=2 -> mid+4");
+  // Large n: step shrinks to 160/(n-1); edge centers clamp inside the rail.
+  bs = railScene(
+    Array.from({ length: 30 }, (_, i) => ["block card msg", i * 30]),
+    1000, 100);
+  eq(bs.length, 30, "30 sources -> 30 ticks, still no merging");
   bs.forEach((b, i) => eq(
     yOf(b) - thOf(b) / 2 >= 0 &&
       yOf(b) + thOf(b) / 2 <= railEl.clientHeight, true,
-    `tick ${i} fully inside rail bounds`));
-  // A turn-end cluster flush with the bottom edge lands exactly on it.
-  bs = railScene([["block card msg", 100], ["turnend", 995]], 1000, 100);
-  eq(yOf(bs[1]) + thOf(bs[1]) / 2, 100,
-    "bottom turn-end tick lands exactly on the rail's bottom edge");
-  // Cluster label: localized count + the first member's timestamp.
-  bs = railScene([["block card msg", 100], ["block card msg", 980],
-    ["block card msg", 985], ["block card prompt", 990],
-    ["block card msg", 995]], 1000, 100);
-  contentEl.children[1].querySelector(".ctime").textContent = "10:00";
-  X.layoutRail();
-  eq(bs[1].attrs["aria-label"], "4 messages · 10:00",
-    "cluster label = localized count + first member time");
+    `tick ${i} inside rail bounds`));
+  eq(yOf(bs[0]), 1, "first tick clamps to th/2");
+  eq(yOf(bs[29]), 99, "last tick clamps to RH-th/2");
+  eq(yOf(bs[15]), 52.8, "interior step = 160/(n-1)");
 
   // --- mark buttons are reused across layout passes (no DOM churn) ---
+  bs = railScene([["block card msg", 100], ["block card msg", 400],
+    ["block card msg", 430]], 1000, 100);
   const reused = bs[0];
   X.layoutRail();
   eq(X._railBtns()[0], reused, "layout passes reuse existing mark buttons");
@@ -708,15 +722,15 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   eq(bs[1].tabIndex, 0, "the tab stop moved with focus");
   eq(bs[0].tabIndex, -1, "the previous mark leaves the tab order");
   fire(railEl, "keydown", { key: "End", preventDefault: () => pd++ });
-  eq(documentStub.activeElement, bs[1], "End focuses the last mark");
+  eq(documentStub.activeElement, bs[2], "End focuses the last mark");
   fire(railEl, "keydown", { key: "Home", preventDefault: () => pd++ });
   eq(documentStub.activeElement, bs[0], "Home focuses the first mark");
   // While the rail is in use the tab stop stays on the focused mark even
   // when scroll position makes another mark current.
   bs[1].focus();
-  contentEl.scrollTop = 985;          // probe passes the cluster's first member
+  contentEl.scrollTop = 985;          // probe 1165 passes every card top
   X.updateCurMark();
-  eq(bs[1].classList.contains("cur"), true, "current mark tracks scroll");
+  eq(bs[2].classList.contains("cur"), true, "current mark tracks scroll");
   contentEl.scrollTop = 0;
   X.updateCurMark();
   eq(bs[0].classList.contains("cur"), true, "current mark back to the first");
@@ -724,21 +738,14 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   eq(bs[0].tabIndex, -1,
     "current mark leaves the tab order while another is focused");
 
-  // --- bare-track click: same document fraction the marks are placed by ---
+  // --- no proportional bare-track seek: compact offsets carry no document
+  //     position, so clicking the bare rail never scrolls ---
   contentEl._scrollToArgs = null;
   fire(railEl, "click", { target: railEl, offsetY: 50 });
-  eq(contentEl._scrollToArgs.top, 500,
-    "track click seeks to offsetY/RH * scrollHeight");
-  // Clicking level with a mark lands that card at the top of the viewport.
+  eq(contentEl._scrollToArgs, null,
+    "bare-track clicks are not handled — no proportional seek");
   fire(railEl, "click", { target: railEl, offsetY: yOf(bs[0]) });
-  eq(contentEl._scrollToArgs.top, bs[0]._els[0].offsetTop,
-    "clicking level with a mark seeks exactly to its card");
-  fire(railEl, "click", { target: railEl, offsetY: 100 });
-  eq(contentEl._scrollToArgs.top, 600, "track bottom clamps to doc - viewport");
-  const lastTop = contentEl._scrollToArgs.top;
-  fire(railEl, "click", { target: bs[0], offsetY: 50 });
-  eq(contentEl._scrollToArgs.top, lastTop,
-    "mark clicks are not double-handled by the track listener");
+  eq(contentEl._scrollToArgs, null, "even level with a mark, the track ignores");
 
   // --- wheel over the rail scrolls the conversation (Voyager parity) ---
   const st0 = contentEl.scrollTop;
@@ -795,21 +802,6 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   stale.onclick({ detail: 0 });
   eq(contentEl._scrollToArgs, null, "detached mark click never scrolls");
   documentStub.activeElement = null;
-
-  // --- clusterYs single-linkage clustering within `gap` px ---
-  let g = X.clusterYs([0, 5, 20, 24, 50], 6);
-  eq(g.length, 3, "clusters: [0,5] [20,24] [50]");
-  eq(g[0].idx.length, 2, "first cluster holds two marks");
-  eq(g[0].y, 0, "cluster anchored at its first mark");
-  eq(g[2].idx[0], 4, "lonely last mark stays single");
-  eq(X.clusterYs([0, 5, 9], 6).length, 1,
-    "chained proximity merges (5-0<6, 9-5<6)");
-  eq(X.clusterYs([0, 6, 12], 6).length, 3,
-    "exactly-gap marks stay separate (boundary is exclusive)");
-  eq(X.clusterYs([10], 6).length, 1, "single mark -> single cluster");
-  eq(X.clusterYs([], 6).length, 0, "no marks -> no clusters");
-  eq(X.clusterYs([0, 0, 0], 0).length, 3,
-    "zero gap never clusters (unmeasurable-layout fallback)");
 
   /* ================= i18n: bundled dictionaries ================= */
 

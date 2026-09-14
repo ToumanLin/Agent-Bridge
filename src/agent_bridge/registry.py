@@ -35,7 +35,7 @@ from agent_bridge.models import (
     normalize_effort,
 )
 from agent_bridge.paths import ensure_home, is_safe_id, result_path, state_path, transcript_path
-from agent_bridge.persist import atomic_write_json, atomic_write_text, read_json
+from agent_bridge.persist import atomic_write_json, atomic_write_text, read_json, read_json_strict
 from agent_bridge.probes import probe_agent
 from agent_bridge.processes import (
     count_sibling_servers,
@@ -128,6 +128,20 @@ RESUME_DEFAULT_MESSAGE = (
     "the work where it left off, complete the remaining steps, and report the "
     "final result."
 )
+# resume_task delegation across Bridge instances rides the shared outbox: a
+# req_resume_*.json record is executed only by the instance owning the task
+# row (live siblings requeue it for the owner, a dead owner's row is adopted
+# by the claimer), and its dispatch result lands in outbox/done/ for the
+# caller to relay. The caller also watches the task row's resumed_by so a
+# lost done record cannot hide a dispatched continuation.
+RESUME_DELEGATE_TIMEOUT_SEC = 60.0
+RESUME_DELEGATE_POLL_SEC = 0.5
+# After the recorded owner dies mid-delegation, a sibling may already be
+# mid-delivery of the queued resume; wait this long for its done record or
+# the resumed_by stamp before adopting the row and resuming locally.
+RESUME_FALLBACK_GRACE_SEC = 5.0
+# done/req_* records a dead requester never consumed are swept after this.
+RESUME_DONE_RETAIN_SEC = 3600.0
 
 
 def _parse_outbox_claim(name: str) -> tuple[str, int | None, float | None]:
@@ -252,6 +266,11 @@ class Registry:
         self._requests: dict[str, tuple[tuple, str]] = {}
         self._adapters: dict[str, Adapter] = {}
         self._done: dict[str, asyncio.Event] = {}
+        # Serializes the resumed_by-check + dispatch section of a resume on
+        # one task: the outbox delivery of a delegated request and a local
+        # fallback can reach _resume_owned concurrently, and only one may
+        # dispatch a continuation.
+        self._resume_locks: dict[str, asyncio.Lock] = {}
         self._idle: dict[str, asyncio.Task[None]] = {}
         self._bg: dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
@@ -342,12 +361,15 @@ class Registry:
         # rewrites its own records, so the next save converges. Uses the
         # snapshot in `own` plus owner identity, never self.sessions / self.tasks.
         path = state_path(self.home)
-        disk = read_json(path, {})
-        if not isinstance(disk, dict):
-            disk = {}
-        atomic_write_json(
-            path,
-            {
+        # A locked state.json must not read as empty — the merge would drop
+        # every live sibling row. Surface the denial: the flush loop logs it
+        # and the next save() converges.
+        merged = None
+        for _ in range(4):
+            disk = read_json_strict(path, {})
+            if not isinstance(disk, dict):
+                disk = {}
+            merged = {
                 "sessions": self._merge_owned(
                     disk.get("sessions") or [],
                     {row["session_id"]: row for row in own["sessions"]},
@@ -358,8 +380,14 @@ class Registry:
                     {row["task_id"]: row for row in own["tasks"]},
                     "task_id",
                 ),
-            },
-        )
+            }
+            # Close the read-merge-write window: a sibling write landing
+            # between our read and our replace would be clobbered by a merge
+            # built on the stale read. Re-read just before writing; when the
+            # file still matches, the merge basis is current.
+            if read_json_strict(path, {}) == disk:
+                break
+        atomic_write_json(path, merged)
 
     def save(self) -> None:
         self._pending_state = self._own_rows()
@@ -446,6 +474,7 @@ class Registry:
                 # this instance started — rescue stale claims periodically.
                 last_sweep = now
                 self._outbox_rescue_claims(outbox)
+                self._outbox_sweep_done(outbox)
             for name, until in list(cooldown.items()):
                 if until <= now:
                     del cooldown[name]
@@ -527,6 +556,29 @@ class Registry:
             except OSError:
                 log.warning("could not rescue outbox claim %s", claim.name)
 
+    def _outbox_sweep_done(self, outbox: Path) -> None:
+        """Drop delegated-resume answers whose requester never read them.
+
+        ``done/msg_*`` records are consumed by the dashboard's status poll;
+        ``done/req_*`` records are consumed by the delegating Bridge — which
+        may die first — so the sweep removes them past a retention age.
+        """
+        done_dir = outbox / "done"
+        cutoff = time.time() - RESUME_DONE_RETAIN_SEC
+        try:
+            stale = [
+                path
+                for path in done_dir.iterdir()
+                if path.is_file()
+                and path.name.startswith("req_")
+                and path.stat().st_mtime < cutoff
+            ]
+        except OSError:
+            return
+        for path in stale:
+            with contextlib.suppress(OSError):
+                path.unlink()
+
     def _lookup_dead_session(self, session_id: str) -> tuple[Session | None, bool]:
         """(session, foreign) — read-only lookup of a disk session row.
 
@@ -588,6 +640,23 @@ class Registry:
         if consumed:
             task.run_usage = {**consumed, "partial": True}
 
+    def _disk_task_row(self, task_id: str) -> dict | None:
+        """The raw persisted row for ``task_id``, whatever its owner.
+
+        Uses the strict read: callers that decide adoption or dispatch must
+        distinguish "row absent" from "state locked" — a phantom empty read
+        would make a live foreign row look adoptable or gone.
+        """
+        if not is_safe_id(task_id):
+            return None
+        payload = read_json_strict(state_path(self.home), {})
+        if not isinstance(payload, dict):
+            return None
+        for raw in payload.get("tasks") or []:
+            if isinstance(raw, dict) and raw.get("task_id") == task_id:
+                return raw
+        return None
+
     def _adopt_dead_task(self, task_id: str) -> tuple[Task | None, bool]:
         """(task, foreign) — take over a dead owner's task row on disk.
 
@@ -599,52 +668,51 @@ class Registry:
         """
         if not self.config.server.remote_tasks:
             return None, False
-        if not is_safe_id(task_id):
+        raw = self._disk_task_row(task_id)
+        if raw is None:
             return None, False
-        for raw in self._disk_task_rows():
-            if raw.get("task_id") != task_id:
-                continue
-            if self._is_mine(raw.get("owner_pid"), raw.get("owner_create_time")):
-                return None, False
-            if self._foreign_live(raw.get("owner_pid"), raw.get("owner_create_time")):
-                return None, True
-            try:
-                task = Task.model_validate(raw)
-            except Exception:
-                return None, False
-            # session_id becomes a transcript path component downstream.
-            if not is_safe_id(task.session_id):
-                return None, False
-            self._stamp_owner(task)
-            if task.status in {TaskStatus.queued, TaskStatus.running}:
-                if task.paused:
-                    # The pause intent was persisted before the owner died;
-                    # honor it — the row ends cancelled/paused, not failed.
-                    task.status = TaskStatus.cancelled
-                    task.stop_reason = "paused"
-                else:
-                    task.status = TaskStatus.failed
-                    task.error = "bridge_restarted"
-                task.finished_at = iso()
-                self._recover_run_usage(task)
-            self.tasks[task.task_id] = task
-            done = asyncio.Event()
-            done.set()
-            self._done[task.task_id] = done
-            self.save()
-            log.info(
-                "task_adopted task_id=%s session_id=%s status=%s",
-                task.task_id,
-                task.session_id,
-                task.status.value,
-            )
-            return task, False
-        return None, False
+        if self._is_mine(raw.get("owner_pid"), raw.get("owner_create_time")):
+            return None, False
+        if self._foreign_live(raw.get("owner_pid"), raw.get("owner_create_time")):
+            return None, True
+        try:
+            task = Task.model_validate(raw)
+        except Exception:
+            return None, False
+        # session_id becomes a transcript path component downstream.
+        if not is_safe_id(task.session_id):
+            return None, False
+        self._stamp_owner(task)
+        if task.status in {TaskStatus.queued, TaskStatus.running}:
+            if task.paused:
+                # The pause intent was persisted before the owner died;
+                # honor it — the row ends cancelled/paused, not failed.
+                task.status = TaskStatus.cancelled
+                task.stop_reason = "paused"
+            else:
+                task.status = TaskStatus.failed
+                task.error = "bridge_restarted"
+            task.finished_at = iso()
+            self._recover_run_usage(task)
+        self.tasks[task.task_id] = task
+        done = asyncio.Event()
+        done.set()
+        self._done[task.task_id] = done
+        self.save()
+        log.info(
+            "task_adopted task_id=%s session_id=%s status=%s",
+            task.task_id,
+            task.session_id,
+            task.status.value,
+        )
+        return task, False
 
     async def _outbox_deliver(self, outbox: Path, claimed: Path, name: str) -> float | None:
         rec = read_json(claimed, {})
         if not isinstance(rec, dict):
             rec = {}
+        if rec.get("kind") == "resume":
+            return await self._outbox_resume(outbox, claimed, name, rec)
         session_id = str(rec.get("session_id") or "")
         text = str(rec.get("message") or "").strip()
         if not session_id or not text:
@@ -731,6 +799,95 @@ class Registry:
             "outbox_dispatch name=%s session_id=%s task_id=%s",
             name,
             session.session_id,
+            result.get("task_id"),
+        )
+        return None
+
+    async def _outbox_resume(self, outbox: Path, claimed: Path, name: str, rec: dict) -> float | None:
+        """Execute a delegated ``resume_task`` for the instance owning the task.
+
+        Non-owner bridges enqueue ``req_resume_*.json`` records; the instance
+        that owns the task row runs the normal resume path and reports through
+        ``done/`` for the requester to relay. A row owned by a live sibling is
+        requeued for that sibling (single-owner safety is preserved — the
+        claimer never drives it); a dead owner's row is adopted and resumed by
+        whichever live instance claims the record first. Records past their
+        ``expire_ts`` (the requester's bounded wait) resolve as expired so a
+        caller that already gave up cannot dispatch a surprise continuation.
+        """
+        task_id = str(rec.get("task_id") or "")
+        if not is_safe_id(task_id):
+            self._outbox_done(
+                outbox,
+                name,
+                {"ok": False, "state": "error", "error": "missing or invalid task_id", "code": "invalid_record"},
+            )
+            return None
+        queued_ts = rec.get("ts")
+        if not isinstance(queued_ts, (int, float)):
+            queued_ts = time.time()
+            rec["ts"] = queued_ts
+        expire_ts = rec.get("expire_ts")
+        if not isinstance(expire_ts, (int, float)):
+            expire_ts = queued_ts + OUTBOX_MAX_AGE_SEC
+        if time.time() > expire_ts or time.time() - queued_ts > OUTBOX_MAX_AGE_SEC:
+            self._outbox_done(
+                outbox,
+                name,
+                {
+                    "ok": False,
+                    "state": "error",
+                    "error": "delegated resume expired in queue; nothing was dispatched",
+                    "code": "expired",
+                },
+            )
+            return None
+        task = self.tasks.get(task_id)
+        if task is None:
+            row = self._disk_task_row(task_id)
+            if row is not None and not self._is_mine(
+                row.get("owner_pid"), row.get("owner_create_time")
+            ):
+                if owner_alive(row.get("owner_pid"), row.get("owner_create_time")) or (
+                    not self.config.server.remote_tasks
+                ):
+                    # A live sibling owns the row (or this instance never
+                    # touches remote rows): leave the request queued for an
+                    # instance allowed to serve it.
+                    rec["state"] = "waiting_owner"
+                    with contextlib.suppress(OSError):
+                        atomic_write_json(claimed, rec)
+                    return OUTBOX_FOREIGN_RETRY_SEC
+                task, _foreign = self._adopt_dead_task(task_id)
+            if task is None:
+                self._outbox_done(
+                    outbox,
+                    name,
+                    {"ok": False, "state": "error", "error": f"unknown task {task_id}", "code": "unknown_task"},
+                )
+                return None
+        try:
+            result = await self._resume_owned(
+                task,
+                message=rec.get("message"),
+                request_id=rec.get("request_id"),
+            )
+        except Exception as exc:
+            self._outbox_done(
+                outbox,
+                name,
+                {"ok": False, "state": "error", "error": f"{type(exc).__name__}: {exc}", "code": "resume_failed"},
+            )
+            return None
+        # save() only schedules the async flusher; the done record must not
+        # outrun the state rows it points at — the requester reads the new
+        # task_id/session_id off disk the moment it sees this answer.
+        await self.flush_state()
+        self._outbox_done(outbox, name, {"ok": True, "state": "resumed", **result})
+        log.info(
+            "outbox_resume name=%s task_id=%s new_task_id=%s",
+            name,
+            task_id,
             result.get("task_id"),
         )
         return None
@@ -1347,6 +1504,7 @@ class Registry:
             key: binding for key, binding in self._requests.items() if binding[1] != task_id
         }
         self._done.pop(task_id, None)
+        self._resume_locks.pop(task_id, None)
         try:
             result_path(task_id, self.home).unlink(missing_ok=True)
         except OSError:
@@ -1538,7 +1696,12 @@ class Registry:
         while True:
             if task is not None:
                 last = task
-                done = task.status in TERMINAL_STATUSES or result_path(task_id, self.home).is_file()
+                # Only the row's own terminal status counts: the result
+                # artifact is written before the final state flush lands, so
+                # an artifact-first peek would report a still-running task as
+                # finished. The artifact alone covers the vanished-row case in
+                # the branch below instead.
+                done = task.status in TERMINAL_STATUSES
                 if done or not owner_alive(task.owner_pid, task.owner_create_time):
                     return {
                         "timed_out": False,
@@ -1667,7 +1830,16 @@ class Registry:
                 "resumable; cancel_task cancels it outright"
             )
         if remote_alive is True:
-            return False, "owned by a live sibling Bridge (remote) — only that instance can resume it"
+            if task.status == TaskStatus.completed:
+                return False, (
+                    "owned by a live sibling Bridge and already completed — "
+                    "only that instance can send a follow-up on it"
+                )
+            return True, (
+                f"owned by a live sibling Bridge — resume_task(task_id=\"{task.task_id}\") "
+                "routes the resume to that instance through the shared queue and relays "
+                "the new task it dispatches"
+            )
         session = self.sessions.get(task.session_id)
         if session is not None and session.proc_state == ProcState.dead:
             return False, "the session was ended; dispatch_task starts a fresh task"
@@ -2041,11 +2213,18 @@ class Registry:
 
         Accepts paused, cancelled, and failed rows — including a dead owner's
         row, which is adopted first (its orphaned worker is reaped before a
-        replacement spawns). The original row stays final and auditable: it
-        is never rewritten; it gains ``resumed_by`` and the new task carries
-        ``resume_of``. ``message`` defaults to an explicit "pick up the paused
-        work" continuation prompt; ``request_id`` deduplicates like
-        dispatch_task's.
+        replacement spawns). A row owned by a *live* sibling Bridge is never
+        driven from here: the resume is routed through the shared outbox to
+        the owning instance, which runs the exact path below and reports the
+        new task back within a bounded wait; when the recorded owner dies
+        mid-delegation the row is adopted locally instead.
+
+        The original row stays final and auditable: it is never rewritten; it
+        gains ``resumed_by`` and the new task carries ``resume_of``. ``message``
+        defaults to an explicit "pick up the paused work" continuation prompt;
+        ``request_id`` deduplicates like dispatch_task's, and a task that
+        already has a continuation returns it instead of dispatching again —
+        that dedupe survives restarts and owner changes.
         """
         if not self.dispatch_enabled:
             raise RuntimeError(NESTED_RESUME_ERROR)
@@ -2056,54 +2235,286 @@ class Registry:
             task, foreign = self._adopt_dead_task(task_id)
             if task is None:
                 if foreign:
-                    raise RuntimeError(
-                        f"task {task_id} is owned by another live Bridge instance "
-                        "and cannot be resumed from here (remote tasks are read-only)"
-                    )
+                    return await self._resume_via_owner(task_id, message, request_id)
                 raise KeyError(f"unknown task {task_id}")
+        return await self._resume_owned(task, message=message, request_id=request_id)
+
+    async def _resume_owned(
+        self,
+        task: Task,
+        *,
+        message: str | None,
+        request_id: str | None,
+    ) -> dict:
+        """Resume a task this instance owns — the local path, never delegated.
+
+        Shared by resume_task and the outbox delivery of a delegated resume so
+        the audit contract is identical wherever it executes: validation
+        (running/completed), an idempotent answer when ``resumed_by`` already
+        records a continuation, then a normal dispatch_task carrying
+        ``source="resume"`` plus the resume_of/resumed_by links.
+        """
         if task.status in {TaskStatus.queued, TaskStatus.running}:
             raise RuntimeError(
-                f"task {task_id} is still {task.status.value}; "
+                f"task {task.task_id} is still {task.status.value}; "
                 "pause_task or cancel_task it, or wait for it to finish"
             )
         if task.status == TaskStatus.completed:
             raise RuntimeError(
-                f"task {task_id} already completed; send a follow-up with "
+                f"task {task.task_id} already completed; send a follow-up with "
                 f"dispatch_task(session_id={task.session_id}) instead"
             )
-        session = self.sessions.get(task.session_id)
-        if session is None:
-            session, foreign = await self._adopt_dead_session(task.session_id)
+        # The resumed_by check and the continuation dispatch must serialize
+        # per task: a delegated request delivered through the outbox can
+        # overlap a local fallback resume of the same row in this process.
+        lock = self._resume_locks.setdefault(task.task_id, asyncio.Lock())
+        async with lock:
+            if task.resumed_by is not None:
+                continuation = self.tasks.get(task.resumed_by)
+                if continuation is not None:
+                    # A previous resume (or a delegated request this instance
+                    # already served) dispatched the continuation; replaying
+                    # returns it instead of starting a second turn on the same
+                    # conversation.
+                    return {
+                        "resumed_from": task.task_id,
+                        "task_id": continuation.task_id,
+                        "session_id": continuation.session_id,
+                        "agent": continuation.agent,
+                        "model": continuation.model,
+                        "effort": continuation.effort,
+                        "reused": True,
+                        **({"request_id": request_id} if request_id is not None else {}),
+                    }
+                # The recorded continuation was pruned or never persisted;
+                # fall through and dispatch a fresh one — resumed_by is
+                # re-stamped.
+            session = self.sessions.get(task.session_id)
             if session is None:
-                if foreign:
-                    raise RuntimeError(
-                        f"session {task.session_id} is owned by another live "
-                        "Bridge instance and cannot be adopted here"
+                session, foreign = await self._adopt_dead_session(task.session_id)
+                if session is None:
+                    if foreign:
+                        raise RuntimeError(
+                            f"session {task.session_id} is owned by another live "
+                            "Bridge instance and cannot be adopted here"
+                        )
+                    raise KeyError(
+                        f"session {task.session_id} for task {task.task_id} is gone; "
+                        "dispatch a fresh task instead"
                     )
-                raise KeyError(
-                    f"session {task.session_id} for task {task_id} is gone; "
-                    "dispatch a fresh task instead"
+            if session.proc_state == ProcState.dead:
+                raise RuntimeError(
+                    f"session {session.session_id} was ended; dispatch a fresh task instead"
                 )
-        if session.proc_state == ProcState.dead:
-            raise RuntimeError(
-                f"session {session.session_id} was ended; dispatch a fresh task instead"
+            latest = self._disk_task_row(task.task_id)
+            if latest is not None and latest.get("resumed_by") and not task.resumed_by:
+                # A sibling instance persisted a continuation between our
+                # checks and dispatch (delegated resume racing a local
+                # fallback): report that continuation instead of starting a
+                # second turn.
+                return self._delegated_resume_result(task.task_id, row=latest, delegated=False)
+            text = (message or "").strip() or RESUME_DEFAULT_MESSAGE
+            result = await self.dispatch_task(
+                agent=session.agent,
+                message=text,
+                cwd=session.cwd,
+                session_id=session.session_id,
+                user_requested=True,
+                request_id=request_id,
+                source="resume",
             )
-        text = (message or "").strip() or RESUME_DEFAULT_MESSAGE
-        result = await self.dispatch_task(
-            agent=session.agent,
-            message=text,
-            cwd=session.cwd,
-            session_id=session.session_id,
-            user_requested=True,
-            request_id=request_id,
-            source="resume",
-        )
-        new_task = self.tasks.get(result["task_id"])
-        if new_task is not None:
-            new_task.resume_of = task.task_id
-        task.resumed_by = result["task_id"]
-        self.save()
-        return {"resumed_from": task.task_id, **result}
+            new_task = self.tasks.get(result["task_id"])
+            if new_task is not None:
+                new_task.resume_of = task.task_id
+            task.resumed_by = result["task_id"]
+            self.save()
+            return {"resumed_from": task.task_id, **result}
+
+    def _delegated_resume_poll(self, done_path: Path, task_id: str) -> tuple[str, Any]:
+        """One observation of the delegated-resume channels.
+
+        Returns ``("done", payload)`` when the executing instance answered,
+        ``("continued", row)`` once the task row carries ``resumed_by`` — the
+        continuation is already dispatched even if the done record was lost —
+        ``("waiting", row)`` while a live non-owner holds the row,
+        ``("adoptable", row)`` when the recorded owner is dead or absent, and
+        ``("gone", None)`` when the row vanished entirely.
+        """
+        if done_path.is_file():
+            return "done", read_json(done_path, {})
+        try:
+            row = self._disk_task_row(task_id)
+        except PermissionError:
+            # A persistently locked state file proves nothing about the row —
+            # keep waiting on the last known live owner rather than calling
+            # it gone or adoptable.
+            return "waiting", {}
+        if row is None:
+            return "gone", None
+        if row.get("resumed_by"):
+            return "continued", row
+        owner_pid = row.get("owner_pid")
+        owner_create_time = row.get("owner_create_time")
+        if self._is_mine(owner_pid, owner_create_time) or not owner_alive(
+            owner_pid, owner_create_time
+        ):
+            return "adoptable", row
+        return "waiting", row
+
+    def _delegated_resume_result(
+        self,
+        task_id: str,
+        *,
+        payload: dict | None = None,
+        row: dict | None = None,
+        delegated: bool = True,
+    ) -> dict:
+        """Normalize a delegated answer into resume_task's response shape.
+
+        ``payload`` is the executing instance's done record; ``row`` is the
+        task's persisted row used when ``resumed_by`` landed but the done
+        record never did — the continuation's own row supplies the fields.
+        """
+        if payload is not None:
+            result = {
+                key: value
+                for key, value in payload.items()
+                if key not in {"ok", "state", "error", "error_code", "code"}
+            }
+            result.setdefault("resumed_from", task_id)
+            result["delegated"] = delegated
+            return result
+        row = row or {}
+        continuation_id = row.get("resumed_by")
+        continuation = (
+            self._disk_task_row(continuation_id)
+            if isinstance(continuation_id, str)
+            else None
+        ) or {}
+        return {
+            "resumed_from": task_id,
+            "task_id": continuation_id,
+            "session_id": continuation.get("session_id") or row.get("session_id"),
+            "agent": continuation.get("agent") or row.get("agent"),
+            "model": continuation.get("model"),
+            "effort": continuation.get("effort"),
+            "delegated": delegated,
+        }
+
+    async def _resume_via_owner(
+        self,
+        task_id: str,
+        message: str | None,
+        request_id: str | None,
+    ) -> dict:
+        """Route the resume to the live Bridge instance owning the task row.
+
+        Drops a ``req_resume_*.json`` record into the shared outbox; the owning
+        instance (or the first live instance to adopt a dead owner's row)
+        claims it, runs ``_resume_owned``, and answers through ``done/``.
+        While waiting, the task row's ``resumed_by`` is watched as well — it
+        proves a continuation was dispatched even when the done record is
+        lost. If the recorded owner dies mid-wait, a short grace covers an
+        in-flight claim, then the row is adopted and resumed locally. The
+        request expires with this wait so it can never dispatch afterwards.
+        """
+        if request_id is not None:
+            try:
+                request_id = str(uuid.UUID(request_id))
+            except ValueError:
+                raise ValueError("request_id must be a UUID") from None
+        outbox = self.home / "outbox"
+        try:
+            outbox.mkdir(exist_ok=True)
+            name = f"req_resume_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.json"
+            record: dict[str, Any] = {
+                "kind": "resume",
+                "task_id": task_id,
+                "message": message,
+                "request_id": request_id,
+                "ts": time.time(),
+                "expire_ts": time.time() + RESUME_DELEGATE_TIMEOUT_SEC,
+                "requester_pid": self._owner_pid,
+                "requester_create_time": self._owner_create_time,
+            }
+            atomic_write_json(outbox / name, record)
+        except OSError as exc:
+            raise RuntimeError(
+                f"task {task_id} is owned by another live Bridge instance and "
+                f"the resume could not be queued for it: {exc}"
+            ) from exc
+        done_path = outbox / "done" / name
+        deadline = time.monotonic() + RESUME_DELEGATE_TIMEOUT_SEC
+        last_owner: dict[str, Any] = {}
+        grace_until: float | None = None
+        try:
+            while True:
+                state, data = self._delegated_resume_poll(done_path, task_id)
+                if state == "done":
+                    with contextlib.suppress(OSError):
+                        done_path.unlink()
+                    payload = data if isinstance(data, dict) else {}
+                    if payload.get("ok"):
+                        return self._delegated_resume_result(task_id, payload=payload)
+                    raise RuntimeError(
+                        str(payload.get("error"))
+                        or f"delegated resume of task {task_id} failed"
+                    )
+                if state == "continued":
+                    return self._delegated_resume_result(task_id, row=data)
+                if state == "gone":
+                    raise KeyError(f"unknown task {task_id}")
+                if state == "waiting":
+                    last_owner = {
+                        "pid": data.get("owner_pid"),
+                        "create_time": data.get("owner_create_time"),
+                    }
+                    grace_until = None
+                elif state == "adoptable":
+                    if grace_until is None:
+                        # The recorded owner died; a sibling may already hold
+                        # a claim on the queued request — give it a moment.
+                        grace_until = time.monotonic() + RESUME_FALLBACK_GRACE_SEC
+                    elif time.monotonic() >= grace_until:
+                        adopted, foreign = self._adopt_dead_task(task_id)
+                        local = adopted if adopted is not None else self.tasks.get(task_id)
+                        if local is not None:
+                            log.info(
+                                "resume_delegate_adopted task_id=%s (recorded owner died)",
+                                task_id,
+                            )
+                            # Withdraw the queued request before dispatching —
+                            # once this instance owns the row it must not let a
+                            # queued copy race the local continuation.
+                            with contextlib.suppress(OSError):
+                                (outbox / name).unlink(missing_ok=True)
+                            return await self._resume_owned(
+                                local, message=message, request_id=request_id
+                            )
+                        if not foreign:
+                            raise KeyError(f"unknown task {task_id}")
+                        # A sibling adopted the row first and will serve the
+                        # queued request; give the new owner a fresh window.
+                        grace_until = time.monotonic() + RESUME_FALLBACK_GRACE_SEC
+                if self._stopping:
+                    raise RuntimeError("bridge is shutting down; delegated resume aborted")
+                if time.monotonic() >= deadline:
+                    owner_pid = last_owner.get("pid")
+                    owner = f"pid {owner_pid}" if owner_pid is not None else "its owner"
+                    raise RuntimeError(
+                        f"task {task_id} is owned by another live Bridge instance "
+                        f"({owner}); the delegated resume did not finish within "
+                        f"{int(RESUME_DELEGATE_TIMEOUT_SEC)}s. The request is now "
+                        "expired — check_task / wait_task will report any "
+                        "continuation the owner still dispatched, or retry resume_task."
+                    )
+                await asyncio.sleep(RESUME_DELEGATE_POLL_SEC)
+        finally:
+            # Withdraw the request if it was never claimed — a late delivery
+            # after a local fallback or a caller timeout must not dispatch a
+            # second continuation.
+            with contextlib.suppress(OSError):
+                (outbox / name).unlink(missing_ok=True)
 
     def list_sessions(self, active_only: bool = False) -> list[dict]:
         rows = []
