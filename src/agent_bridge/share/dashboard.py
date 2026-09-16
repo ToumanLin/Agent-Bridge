@@ -737,38 +737,47 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
   max-width:960px;margin:0 auto}
 .avatar{flex:none;width:46px;height:46px;display:flex;align-items:center;
   justify-content:center}
-.hbody{flex:1;min-width:0}
-.htitle{font-size:17px;font-weight:700;margin:0;line-height:1.3;
-  display:flex;align-items:baseline;gap:10px;min-width:0}
+/* The header body is a four-row grid: the left column carries title,
+   status metrics, repo · agent/model, and the raw id pair; the right
+   column holds the 2x2 icon-only control cluster spanning the top two
+   rows, then right-aligned turns and age cells matching rows three and
+   four. */
+.hgrid{flex:1;min-width:0;display:grid;column-gap:14px;row-gap:3px;
+  align-items:center;grid-template-columns:minmax(0,1fr) auto;
+  grid-template-areas:"title side" "status side" "info turns" "ids age"}
+.htitle{grid-area:title;font-size:17px;font-weight:700;margin:0;line-height:1.3;
+  display:flex;align-items:center;gap:8px;min-width:0}
 .htext{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-/* The identifier pair is secondary chrome inside the title — dimmed mono
-   that never ellipsizes first: a long session title yields to it instead. */
-.hids{flex:none;max-width:55%;overflow:hidden;text-overflow:ellipsis;
+.hstatus{grid-area:status;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;font-size:12px;font-weight:600;color:var(--text)}
+.hinfo{grid-area:info;display:flex;align-items:baseline;gap:7px;min-width:0;
+  margin-top:5px;font-size:12px;color:var(--dim)}
+.hrepo{flex:0 1 auto;min-width:0;max-width:34ch;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.hagent{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.hsep{flex:none;color:var(--dimmer)}
+/* The raw task/session id pair sits on its own dimmed mono line — it
+   ellipsizes as a single row with the full pair kept on the tooltip. */
+.hids{grid-area:ids;min-width:0;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;font-family:var(--font-mono);font-size:11px;
   font-weight:500;color:var(--dimmer)}
-.hsub{display:flex;align-items:center;gap:9px;margin-top:4px;flex-wrap:wrap;
-  font-size:12px;color:var(--dim)}
-.hstatus{display:inline-flex;align-items:center;gap:6px;font-weight:600;color:var(--text)}
-.badge{display:inline-block;padding:1px 8px;border-radius:6px;font-size:11px;
-  font-weight:600;background:var(--panel3);border:1px solid var(--border);color:var(--dim)}
-.hsep{color:var(--dimmer)}
-.hrepo{display:inline-flex;align-items:center;overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;min-width:0;max-width:34ch}
-/* Session-task controls sit on a right-side column above the meta line so
-   the actions never squeeze the title/id row. */
-.hside{flex:none;margin-left:auto;display:flex;flex-direction:column;
-  align-items:flex-end;gap:6px;justify-content:center}
-.hrow{display:flex;align-items:center;gap:6px}
-.hactions{display:flex;gap:6px}
-.hact{display:inline-flex;align-items:center;gap:5px;font:inherit;
-  font-size:11.5px;font-weight:600;color:var(--dim);background:var(--panel);
-  border:1px solid var(--border);border-radius:7px;padding:3px 9px;
-  cursor:pointer;line-height:1.4}
+/* The four session controls form one 2x2 icon cluster inside the single
+   role=group element: pause/resume on the title row, cancel/download on
+   the status row. */
+.hactions{grid-area:side;justify-self:end;display:grid;
+  grid-template-columns:repeat(2,auto);gap:5px}
+.hact{display:inline-flex;align-items:center;justify-content:center;
+  width:28px;height:28px;padding:0;color:var(--dim);background:var(--panel);
+  border:1px solid var(--border);border-radius:7px;cursor:pointer}
 .hact:hover:not(:disabled){background:var(--panel3);color:var(--text)}
 .hact:disabled{opacity:.45;cursor:default}
 .hact:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .hact .ic{display:block}
-.hmeta{flex:none;font-size:11.5px;color:var(--dimmer);white-space:nowrap}
+.hturns{grid-area:turns;justify-self:end;margin-top:5px;font-size:11.5px;
+  color:var(--dimmer);white-space:nowrap}
+.hage{grid-area:age;justify-self:end;font-size:11.5px;color:var(--dimmer);
+  white-space:nowrap}
 .hplaceholder{color:var(--dimmer);font-size:14px}
 /* ---------- conversation cards ---------- */
 #conv{flex:1;min-height:0;position:relative;display:flex}
@@ -2017,44 +2026,43 @@ function renderSessionHeader(){
   const tk=latestTask(s.session_id);
   const repo=baseName(s.cwd);
   const agoStr=s.last_active_at?ago(s.last_active_at):"";
-  /* The title pair always names the displayed sub-agent: both ids resolve
-     fresh from this session's own rows on every render, and a missing value
-     drops out instead of leaving stale text behind. */
+  /* The header still names the displayed sub-agent's ids, now as the raw
+     pair on its own line: both resolve fresh from this session's own rows
+     on every render, and a missing value drops out instead of leaving
+     stale text behind. */
   const taskId=tk&&tk.task_id!=null?String(tk.task_id):"";
-  const ids=[taskId?t("session.task_id",{id:taskId}):"",
-    s.session_id?t("session.session_id",{id:s.session_id}):""]
-    .filter(Boolean).join(" · ");
+  const ids=[taskId,s.session_id?String(s.session_id):""]
+    .filter(Boolean).join(" / ");
+  const agentModel=[s.agent,s.model].filter(Boolean).join("/");
+  const info=[repo?`<span class="hrepo" title="${esc(s.cwd||"")}">${esc(repo)}</span>`:"",
+    agentModel?`<span class="hagent">${esc(agentModel)}</span>`:""]
+    .filter(Boolean).join('<span class="hsep">·</span>');
   /* Task controls gate on the latest applicable task: pause/cancel for an
      in-flight turn (a remote-owned row routes the request to its bridge),
      resume when the server's resumable gate says a continuation can land.
      While one req_* is in flight all three park — the pending reason lives
-     on the disabled title. */
+     on the disabled title. Icon-only in a 2x2 cluster: pause/resume on the
+     title row, cancel/download on the status row. */
   const can=taskActions(tk,s),busy=actPending(s.session_id);
-  const hbtns=["pause","cancel","resume"].map(a=>{
+  const hbtns=["pause","resume","cancel"].map(a=>{
     const on=!busy&&can[a];
     return actBtn(a,on,on?t("act."+a)
       :busy?t("act.pending"):a==="resume"?t("act.no_resumable"):t("act.no_active"));
   }).join("");
-  /* The transcript download sits right of the task group in the same row —
-     gated on the session's cached events, not on any task state. */
+  /* The transcript download fills the fourth grid cell inside the same
+     role=group — gated on the session's cached events, not on any task
+     state. */
   const dlOn=hasTranscript(s.session_id);
-  const dlBtn=`<button type="button" class="hact" data-act="download" id="dlbtn"${dlOn?"":" disabled"} title="${esc(t(dlOn?"act.download_hint":"act.no_transcript"))}" aria-label="${esc(t("act.download"))}">${icon("download",13)}<span>${esc(t("act.download"))}</span></button>`;
+  const dlBtn=`<button type="button" class="hact" data-act="download" id="dlbtn"${dlOn?"":" disabled"} title="${esc(t(dlOn?"act.download_hint":"act.no_transcript"))}" aria-label="${esc(t("act.download"))}">${icon("download",14)}</button>`;
   el.innerHTML=`<div class="avatar">${agentAvatar(s,26)}</div>
-    <div class="hbody">
-      <h2 class="htitle"><span class="htext">${esc(s.title||s.session_id)}</span>${ids?`<span class="hids" title="${esc(ids)}">${esc(ids)}</span>`:""}</h2>
-      <div class="hsub">
-        <span class="hstatus"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,13)}</span> <span${st.raw?` title="${esc(st.raw)}"`:""}>${esc(t(st.key))}</span>${durSpan(tk,"hdur")}${tokSpan(tk,"htok",livePartial(s.session_id,tk))}${tpsSpan(tk,"htps",livePartial(s.session_id,tk))}</span>
-        <span class="badge">${esc(s.agent)}</span>
-        ${s.model?`<span class="badge">${esc(s.model)}</span>`:""}
-        ${repo?`<span class="hsep">|</span><span class="hrepo" title="${esc(s.cwd||"")}">${esc(t("session.working_repo",{repo}))}</span>`:""}
-      </div>
-    </div>
-    <div class="hside">
-      <div class="hrow">
-        <div class="hactions" role="group" aria-label="${esc(t("a11y.task_actions"))}">${hbtns}</div>
-        ${dlBtn}
-      </div>
-      <div class="hmeta">${esc(t("session.turns",{n:s.turns??0}))}${agoStr?" · "+esc(agoStr):""}</div>
+    <div class="hgrid">
+      <h2 class="htitle"><span class="sgr glyph--${st.tone}">${statusGlyph(st.tone,15)}</span><span class="htext">${esc(s.title||s.session_id)}</span></h2>
+      <div class="hstatus"><span${st.raw?` title="${esc(st.raw)}"`:""}>${esc(t(st.key))}</span>${durSpan(tk,"hdur")}${tokSpan(tk,"htok",livePartial(s.session_id,tk))}${tpsSpan(tk,"htps",livePartial(s.session_id,tk))}</div>
+      ${info?`<div class="hinfo">${info}</div>`:""}
+      ${ids?`<div class="hids" title="${esc(ids)}">${esc(ids)}</div>`:""}
+      <div class="hactions" role="group" aria-label="${esc(t("a11y.task_actions"))}">${hbtns}${dlBtn}</div>
+      <span class="hturns">${esc(t("session.turns",{n:s.turns??0}))}</span>
+      ${agoStr?`<span class="hage">${esc(agoStr)}</span>`:""}
     </div>`;
   el.querySelectorAll(".hact").forEach(b=>b.onclick=()=>
     b.dataset.act==="download"?downloadTranscript():taskAction(b.dataset.act));
@@ -2846,7 +2854,7 @@ function actPending(sid){
 }
 function actBtn(act,on,why){
   const label=t("act."+act);
-  return `<button type="button" class="hact" data-act="${act}"${on?"":" disabled"} title="${esc(why)}" aria-label="${esc(label)}">${icon(ACT_ICON[act],13)}<span>${esc(label)}</span></button>`;
+  return `<button type="button" class="hact" data-act="${act}"${on?"":" disabled"} title="${esc(why)}" aria-label="${esc(label)}">${icon(ACT_ICON[act],14)}</button>`;
 }
 async function taskAction(act){
   const sid=selected;if(!sid)return;

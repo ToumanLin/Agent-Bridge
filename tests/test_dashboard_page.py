@@ -454,22 +454,23 @@ def test_subagent_busy_pulse_not_ring():
     assert ".subav-wrap.pulse{animation:none}" in rm
 
 
-def test_header_icon_has_no_tint_block():
-    avatar = re.search(r"\.avatar\{([^}]*)\}", PAGE)
-    assert avatar, "avatar rule missing"
-    rule = avatar.group(1)
-    assert "background" not in rule and "accent-tint" not in rule
-    # Icon slot stays sized and centered.
-    assert "width:46px" in rule and "height:46px" in rule
-    assert "align-items:center" in rule and "justify-content:center" in rule
+def test_session_header_has_no_avatar():
+    """The decorative avatar slot is gone from the pane header — the title
+    row leads with the status glyph. Sidebar rows keep their own icon."""
+    body = re.search(r"function renderSessionHeader\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert 'class="avatar"' not in body and "agentAvatar" not in body
+    # The orphaned slot rule went with the markup; the sidebar still renders
+    # its own .sicon avatar.
+    assert ".avatar{" not in PAGE
+    assert "agentAvatar(s,18)" in PAGE
 
 
 def test_session_header_identifiers():
     """The right-pane title names the displayed sub-agent's identifiers.
 
     The Agent Bridge task_id (the session's latest task row) and the
-    session_id render inside the h2 title — resolved per selection, escaped
-    as data, labeled via the bundled dictionaries, and dropped rather than
+    session_id render as a raw pair on their own header row — resolved per
+    selection, escaped as data, joined by " / ", and dropped rather than
     stale when absent. Executable end-to-end coverage lives in
     tests/dashboard_status_behavior.js.
     """
@@ -479,37 +480,43 @@ def test_session_header_identifiers():
     # task_id comes from the selected session's own latest task — never a
     # global or foreign row.
     assert "latestTask(s.session_id)" in body
-    for needle in ('"session.task_id"', '"session.session_id"', "esc(ids)"):
-        assert needle in body
+    # The pair joins raw ids with " / " — no localized labels in the header.
+    assert '" / "' in body and "esc(ids)" in body
+    assert '"session.task_id"' not in body and '"session.session_id"' not in body
     # Each id renders only when present: the join drops the missing part
     # instead of printing "undefined"/"null" or a stale value.
     assert "filter(Boolean)" in body
-    # The pair lives inside the h2 after the still-primary title text.
+    # The status glyph moved up beside the still-primary title text.
     h2 = re.search(r'<h2 class="htitle">([\s\S]*?)</h2>', body)
     assert h2, "htitle markup missing"
     frag = h2.group(1)
-    assert 'class="htext"' in frag and 'class="hids"' in frag
-    assert frag.index('class="htext"') < frag.index('class="hids"')
-    assert "esc(s.title||s.session_id)" in frag
-    # The full untruncated pair stays reachable via tooltip.
-    assert 'title="${esc(ids)}"' in frag
-    # The labels resolve in every bundled dictionary (id text stays data).
-    for loc in _locales().values():
-        assert "session.task_id" in loc and "session.session_id" in loc
-    # Layout: the title text ellipsizes first; the ids span stays put.
+    assert 'class="sgr' in frag and "statusGlyph" in frag
+    assert 'class="htext"' in frag and "esc(s.title||s.session_id)" in frag
+    assert frag.index('class="sgr') < frag.index('class="htext"')
+    # The raw pair lives on the fourth row, after the title; the full
+    # untruncated pair stays reachable via tooltip.
+    assert 'class="hids" title="${esc(ids)}"' in body
+    assert body.index('class="htitle"') < body.index('class="hids"')
+    # Turns and age are separately targetable right-aligned cells.
+    assert 'class="hturns"' in body and 'class="hage"' in body
+    # Layout: a four-row grid; the title text ellipsizes, the ids row too.
+    hgrid = re.search(r"\.hgrid\{([^}]*)\}", PAGE).group(1)
+    assert "display:grid" in hgrid and "grid-template-areas" in hgrid
+    for area in ('"title side"', '"info turns"', '"ids age"'):
+        assert area in hgrid
     htitle = re.search(r"\.htitle\{([^}]*)\}", PAGE).group(1)
     assert "display:flex" in htitle
     htext = re.search(r"\.htext\{([^}]*)\}", PAGE).group(1)
     assert "min-width:0" in htext and "text-overflow:ellipsis" in htext
     hids = re.search(r"\.hids\{([^}]*)\}", PAGE).group(1)
-    assert "flex:none" in hids and "var(--font-mono)" in hids
+    assert "text-overflow:ellipsis" in hids and "var(--font-mono)" in hids
 
 
 def test_transcript_download_contract():
     """A title-bar button exports the selected session's cached transcript as
     a Markdown file named MM-DD-YYYY-Title.md — entirely client-side.
 
-    The button sits right of the task controls in .hside, reuses .hact and
+    The button grids inside the task-control .hactions group, reuses .hact and
     the inline-SVG icon registry, stays disabled until the session has
     transcript events, and its enabled state refreshes from pollEvents so it
     flips when event data arrives — not only on selection. Filenames are
@@ -524,8 +531,22 @@ def test_transcript_download_contract():
     # Native accessible button, styled like the task controls.
     assert 'type="button" class="hact" data-act="download" id="dlbtn"' in body
     assert 'aria-label="${esc(t("act.download"))}"' in body
-    # Rendered inside the .hrow after the task-action group.
-    assert body.index("${hbtns}</div>") < body.index("${dlBtn}")
+    # Rendered inside the same .hactions role=group right after the task
+    # buttons, filling the fourth cell of the 2x2 icon cluster
+    # (pause/resume, cancel/download).
+    assert 'class="hactions" role="group"' in body
+    assert body.index("${hbtns}") < body.index("${dlBtn}")
+    assert "${dlBtn}</div>" in body
+    # Icon-only: no visible label span, but the accessible name/tooltip stay.
+    assert '<span>${esc(t("act.download"))}</span>' not in body
+    assert 'icon("download",14)' in body
+    hactions = re.search(r"\.hactions\{([^}]*)\}", PAGE).group(1)
+    assert "grid-area:side" in hactions
+    assert "display:grid" in hactions and "repeat(2,auto)" in hactions
+    # The cluster keeps >=24px targets and the visible focus ring.
+    hact = re.search(r"\.hact\{([^}]*)\}", PAGE).group(1)
+    assert "width:28px" in hact and "height:28px" in hact
+    assert re.search(r"\.hact:focus-visible\{[^}]*outline:2px", PAGE)
     # Disabled state is driven by the session's own cached events.
     assert "hasTranscript(s.session_id)" in body
     assert 'act.no_transcript' in body and 'act.download_hint' in body
@@ -677,6 +698,18 @@ def test_queue_cards_and_task_controls_contract():
     assert "tk.resumable" in gate and "tk.resumed_by" in gate
     head = re.search(r"function renderSessionHeader\(\)\{([\s\S]*?)\n\}", PAGE).group(1)
     assert "actPending(s.session_id)" in head and "taskAction(b.dataset.act)" in head
+    # Icon-only 2x2 cluster: the render order pause,resume / cancel maps the
+    # grid rows, and the download button grids inside the same .hactions
+    # role=group — the group element itself is the 2x2 grid. Buttons carry
+    # no visible text — the accessible name and the title tooltip carry the
+    # meaning instead.
+    assert '"pause","resume","cancel"' in head
+    hact = re.search(r"\.hact\{([^}]*)\}", PAGE).group(1)
+    assert "width:28px" in hact and "height:28px" in hact
+    hactions = re.search(r"\.hactions\{([^}]*)\}", PAGE).group(1)
+    assert "display:grid" in hactions and "repeat(2,auto)" in hactions
+    actbtn = re.search(r"function actBtn\(act,on,why\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert "aria-label" in actbtn and "title=" in actbtn and "<span>" not in actbtn
     # Every localized key the new UI resolves exists in all dictionaries.
     locales = _locales()
     for loc, d in locales.items():

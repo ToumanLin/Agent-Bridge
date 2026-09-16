@@ -1221,9 +1221,10 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
     "placeholder zh-CN keeps the session title verbatim");
   eq(elCache["#hwrap"].innerHTML.includes("3 回合"), true,
     "header turns zh-CN");
-  eq(elCache["#hwrap"].innerHTML.includes("工作儲存庫") ||
-     elCache["#hwrap"].innerHTML.includes("工作仓库"), true,
-    "header repo label localized zh-CN");
+  eq(elCache["#hwrap"].innerHTML.includes(">proj</span>"), true,
+    "header shows the bare repo name zh-CN");
+  eq(elCache["#hwrap"].innerHTML.includes("工作仓库"), false,
+    "header drops the working-repo label");
   eq(elCache["#chatinput"].focused > foc0, true,
     "composer focus restored after locale switch");
   eq(documentStub.activeElement === elCache["#chatinput"], true,
@@ -1288,7 +1289,8 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   // --- the right-pane title carries the displayed sub-agent's ids ---
   X._setSessions([
     { session_id: "s1", proc_state: "busy", title: "Researcher",
-      agent: "devin", cwd: "/r" },
+      agent: "devin", cwd: "/r",
+      last_active_at: new Date(Date.now() - 17 * 60000).toISOString() },
     { session_id: "s2", proc_state: "ready", title: "Writer",
       agent: "kimi", cwd: "/r" },
   ]);
@@ -1299,24 +1301,36 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   X._setSelected("s1");
   X.renderSessionHeader();
   let hdr = elCache["#hwrap"].innerHTML;
-  eq(hdr.includes("task task_1"), true,
-    "header title shows the selected agent's task_id");
-  eq(hdr.includes("session s1"), true,
-    "header title shows the selected session_id");
+  eq(hdr.includes("task_1 / s1"), true,
+    "header shows the raw task_id / session_id pair");
   eq(hdr.includes("task_2"), false,
-    "another agent's task_id stays out of the title");
+    "another agent's task_id stays out of the header");
   eq(hdr.includes('class="hids"'), true,
-    "ids render inside the title's .hids span");
+    "ids render in their own .hids row");
   eq(hdr.indexOf('class="htext"') < hdr.indexOf('class="hids"'), true,
     "the session title stays the leading title text");
-  eq(hdr.includes('title="task task_1 · session s1"'), true,
-    "the ids span tooltip carries the full untruncated pair");
+  eq(hdr.indexOf('class="hstatus"') < hdr.indexOf('class="hids"'), true,
+    "the ids row follows the status row");
+  eq(hdr.includes('class="hids" title="task_1 / s1"'), true,
+    "the ids row tooltip carries the full untruncated pair");
+  eq(/class="htitle"><span class="sgr glyph--/.test(hdr), true,
+    "the status glyph sits beside the title");
+  eq(hdr.includes('class="hturns"'), true,
+    "turns render in their own right-aligned element");
+  eq(hdr.includes('class="hage"') && hdr.includes("17m ago"), true,
+    "relative age renders in its own right-aligned element");
+  eq(hdr.indexOf('data-act="pause"') < hdr.indexOf('data-act="resume"') &&
+     hdr.indexOf('data-act="resume"') < hdr.indexOf('data-act="cancel"') &&
+     hdr.indexOf('data-act="cancel"') < hdr.indexOf('id="dlbtn"'), true,
+    "controls grid orders pause,resume over cancel,download");
+  eq(hdr.includes("</span></button>"), false,
+    "icon-only controls carry no visible label");
 
   // Selection changes re-render the pair for the newly displayed sub-agent.
   X.select("s2");
   hdr = elCache["#hwrap"].innerHTML;
-  eq(hdr.includes("task task_2") && hdr.includes("session s2"), true,
-    "select() swaps the title ids to the new sub-agent");
+  eq(hdr.includes("task_2 / s2"), true,
+    "select() swaps the header ids to the new sub-agent");
   eq(hdr.includes("task_1"), false,
     "the previous agent's task_id is gone");
 
@@ -1324,17 +1338,18 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   X._setTasks([]);
   X.renderSessionHeader();
   hdr = elCache["#hwrap"].innerHTML;
-  eq(hdr.includes("session s2"), true,
+  eq(hdr.includes('class="hids" title="s2"'), true,
     "session_id still renders without any task row");
   eq(hdr.includes("task_2"), false, "no stale task_id once tasks are gone");
   eq(hdr.includes('class="hids"'), true,
-    "the ids span still renders for the session-only pair");
+    "the ids row still renders for the session-only pair");
 
   // A task row without a task_id contributes nothing — never "null"/"undefined".
   X._setTasks([task({ task_id: null, session_id: "s2" })]);
   X.renderSessionHeader();
   hdr = elCache["#hwrap"].innerHTML;
-  eq(hdr.includes("session s2"), true, "session_id survives a null task_id");
+  eq(hdr.includes('class="hids" title="s2"'), true,
+    "session_id survives a null task_id");
   eq(/null|undefined/.test(hdr), false,
     "missing ids never render literal null/undefined");
 
@@ -1345,23 +1360,25 @@ const apiCalls = (frag) => fetchCalls.filter((u) => u.includes(frag)).length;
   X._setSelected("s<1>");
   X.renderSessionHeader();
   hdr = elCache["#hwrap"].innerHTML;
-  eq(hdr.includes("t&lt;b&gt;"), true, "task_id is HTML-escaped");
-  eq(hdr.includes("s&lt;1&gt;"), true, "session_id is HTML-escaped");
-  eq(hdr.includes("t<b>"), false, "raw id markup never reaches the title");
+  eq(hdr.includes("t&lt;b&gt; / s&lt;1&gt;"), true, "the id pair is HTML-escaped");
+  eq(hdr.includes("t<b>"), false, "raw id markup never reaches the header");
 
-  // Labels localize through the dictionaries; the ids stay verbatim data.
+  // The ids stay verbatim data under every locale — no localized labels.
   X._setSessions([{ session_id: "s1", proc_state: "busy", title: "Researcher",
     agent: "devin" }]);
   X._setTasks([task({ task_id: "task_1", session_id: "s1" })]);
   X._setSelected("s1");
   X.setLocalePref("zh-CN");
   hdr = elCache["#hwrap"].innerHTML;
-  eq(hdr.includes("任务 task_1") && hdr.includes("会话 s1"), true,
-    "zh-CN id labels with verbatim ids");
+  eq(hdr.includes("task_1 / s1"), true, "zh-CN keeps the raw id pair");
+  eq(hdr.includes("任务 task_1"), false, "zh-CN header drops the task label");
+  eq(hdr.includes("会话 s1"), false, "zh-CN header drops the session label");
   X.setLocalePref("zh-TW");
   hdr = elCache["#hwrap"].innerHTML;
-  eq(hdr.includes("任務 task_1") && hdr.includes("工作階段 s1"), true,
-    "zh-TW id labels with verbatim ids");
+  eq(hdr.includes("task_1 / s1"), true, "zh-TW keeps the raw id pair");
+  eq(hdr.includes("任務 task_1"), false, "zh-TW header drops the task label");
+  eq(hdr.includes("工作階段 s1"), false,
+    "zh-TW header drops the session label");
   X.setLocalePref("en");
 
   // No resolvable selection -> the placeholder owns the header, no id chrome.
@@ -2023,9 +2040,11 @@ X._setLiveAll({});
   eq(h.includes('data-act="download"'), true,
     "button carries data-act=download");
   eq(h.indexOf('class="hactions"') < h.indexOf('id="dlbtn"'), true,
-    "download sits right of the task controls");
-  eq(h.indexOf('class="hside"') < h.indexOf('id="dlbtn"'), true,
-    "download lives inside the right-aligned .hside");
+    "download renders after the task controls in the same group");
+  eq(h.indexOf('id="dlbtn"') < h.indexOf("</div>",
+    h.indexOf('class="hactions"')), true,
+    "download lives inside the .hactions grid");
+  eq(h.includes('class="hside"'), false, "no .hside wrapper remains");
   eq(/id="dlbtn"[^>]*disabled/.test(h), true,
     "disabled until the session has transcript events");
   eq(h.includes('title="no transcript yet"'), true,
