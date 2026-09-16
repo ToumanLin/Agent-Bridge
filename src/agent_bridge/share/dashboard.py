@@ -758,6 +758,7 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
    the actions never squeeze the title/id row. */
 .hside{flex:none;margin-left:auto;display:flex;flex-direction:column;
   align-items:flex-end;gap:6px;justify-content:center}
+.hrow{display:flex;align-items:center;gap:6px}
 .hactions{display:flex;gap:6px}
 .hact{display:inline-flex;align-items:center;gap:5px;font:inherit;
   font-size:11.5px;font-weight:600;color:var(--dim);background:var(--panel);
@@ -1118,6 +1119,8 @@ const LOCALES=Object.freeze({
 "act.pending":"request in flight…",
 "act.paused":"task paused",
 "act.cancelled":"task cancelled",
+"act.download":"Download",
+"act.download_hint":"Download transcript as Markdown",
 "act.resumed":"resumed · {task}",
 "act.failed":"action failed",
 "act.err_expired":"request expired in queue",
@@ -1125,6 +1128,8 @@ const LOCALES=Object.freeze({
 "act.err_wrong_session":"task belongs to another session",
 "act.no_active":"no active task",
 "act.no_resumable":"nothing to resume",
+"act.no_transcript":"no transcript yet",
+"dl.default_title":"Transcription",
 "transcript.user_message":"User Message",
 "transcript.dispatched_message":"Dispatched Message",
 "transcript.agent":"Agent",
@@ -1253,6 +1258,8 @@ const LOCALES=Object.freeze({
 "act.pending":"请求进行中…",
 "act.paused":"任务已暂停",
 "act.cancelled":"任务已取消",
+"act.download":"下载",
+"act.download_hint":"下载转录为 Markdown",
 "act.resumed":"已恢复 · {task}",
 "act.failed":"操作失败",
 "act.err_expired":"请求已在队列中过期",
@@ -1260,6 +1267,8 @@ const LOCALES=Object.freeze({
 "act.err_wrong_session":"任务属于其他会话",
 "act.no_active":"没有运行中的任务",
 "act.no_resumable":"没有可恢复的任务",
+"act.no_transcript":"暂无转录内容",
+"dl.default_title":"转录",
 "transcript.user_message":"用户消息",
 "transcript.dispatched_message":"已派发消息",
 "transcript.agent":"Agent 消息",
@@ -1388,6 +1397,8 @@ const LOCALES=Object.freeze({
 "act.pending":"請求進行中…",
 "act.paused":"任務已暫停",
 "act.cancelled":"任務已取消",
+"act.download":"下載",
+"act.download_hint":"下載轉錄為 Markdown",
 "act.resumed":"已恢復 · {task}",
 "act.failed":"操作失敗",
 "act.err_expired":"請求已在佇列中過期",
@@ -1395,6 +1406,8 @@ const LOCALES=Object.freeze({
 "act.err_wrong_session":"任務屬於其他工作階段",
 "act.no_active":"沒有執行中的任務",
 "act.no_resumable":"沒有可恢復的任務",
+"act.no_transcript":"暫無轉錄內容",
+"dl.default_title":"轉錄",
 "transcript.user_message":"使用者訊息",
 "transcript.dispatched_message":"已派發訊息",
 "transcript.agent":"Agent 訊息",
@@ -1542,6 +1555,7 @@ const ICONS={
   trash:['<path d="M3 6h18"/>','<path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>','<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>','<line x1="10" y1="11" x2="10" y2="17"/>','<line x1="14" y1="11" x2="14" y2="17"/>'],
   steer:['<polyline points="9 10 4 15 9 20"/>','<path d="M20 4v7a4 4 0 0 1-4 4H4"/>'],
   queueMsg:['<polyline points="15 10 20 15 15 20"/>','<path d="M4 4v7a4 4 0 0 0 4 4h12"/>'],
+  download:['<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>','<polyline points="7 10 12 15 17 10"/>','<line x1="12" y1="15" x2="12" y2="3"/>'],
 };
 const BRANDS={
   devin:{vb:"0 0 500 500",html:'<path fill="#2A6DCE" d="M59.29,209.39l48.87,28.21c1.75,1.01,3.71,1.51,5.67,1.51c1.95,0,3.92-0.52,5.67-1.51l48.87-28.21 c0,0,0.14-0.11,0.2-0.16c0.74-0.45,1.44-0.99,2.07-1.6c0.09-0.09,0.18-0.2,0.27-0.29c0.54-0.58,1.03-1.21,1.44-1.89 c0.06-0.11,0.16-0.2,0.2-0.32c0.43-0.74,0.74-1.53,0.99-2.37c0.05-0.18,0.09-0.36,0.14-0.54c0.2-0.86,0.36-1.74,0.36-2.66v-28.21 c0-10.89,5.87-21.03,15.3-26.48c9.42-5.45,21.15-5.44,30.59,0l24.43,14.11c0.79,0.45,1.62,0.77,2.47,1.01 c0.18,0.05,0.37,0.11,0.54,0.16c0.83,0.2,1.69,0.32,2.54,0.34c0.05,0,0.09,0,0.11,0c0.09,0,0.18-0.05,0.26-0.05 c0.79,0,1.58-0.11,2.34-0.32c0.14-0.03,0.27-0.05,0.4-0.09c0.83-0.23,1.64-0.57,2.41-0.99c0.06-0.05,0.16-0.05,0.23-0.09 l48.87-28.21c3.51-2.03,5.67-5.76,5.67-9.81V64.52c0-4.05-2.16-7.78-5.67-9.81l-48.91-28.19c-3.51-2.03-7.81-2.03-11.32,0 l-48.87,28.21c0,0-0.14,0.11-0.2,0.16c-0.74,0.45-1.44,0.99-2.07,1.6c0.09-0.09,0.18-0.2,0.27-0.29 c-0.54,0.58-1.03,1.21-1.44,1.89c-0.06,0.11-0.16,0.2-0.2,0.31c-0.43,0.74-0.74,1.53-0.99,2.37c-0.05,0.18-0.09,0.36-0.14,0.54 c-0.2,0.86-0.36,1.74-0.36,2.66v28.21c0,10.89-5.87,21.03-15.3,26.5c-9.42,5.44-21.15,5.44-30.59,0l-24.42-14.1 c-0.79-0.45-1.63-0.77-2.47-1.01c-0.18-0.05-0.36-0.11-0.54-0.16c-0.84-0.2-1.69-0.31-2.55-0.34c-0.14,0-0.25,0-0.38,0 c-0.81,0-1.6,0.11-2.37,0.31c-0.14,0.02-0.25,0.05-0.38,0.09c-0.82,0.23-1.63,0.57-2.4,1c-0.06,0.05-0.16,0.05-0.23,0.09 l-48.84,28.24c-3.51,2.03-5.67,5.76-5.67,9.81v56.42c0,4.05,2.16,7.78,5.67,9.81C59.29,209.41,59.29,209.39,59.29,209.39z"/><path fill="#1DC19C" d="M325.46,223.49c9.42-5.44,21.15-5.44,30.59,0l24.43,14.11c0.79,0.45,1.62,0.77,2.47,1.01 c0.18,0.05,0.36,0.11,0.54,0.16c0.83,0.2,1.69,0.31,2.54,0.34c0.05,0,0.09,0,0.11,0c0.09,0,0.18-0.03,0.26-0.05 c0.79,0,1.58-0.11,2.34-0.31c0.14-0.03,0.27-0.05,0.4-0.09c0.83-0.23,1.62-0.57,2.41-0.99c0.06-0.05,0.16-0.05,0.25-0.09 l48.87-28.21c3.51-2.03,5.67-5.76,5.67-9.81v-56.43c0-4.05-2.16-7.78-5.67-9.81l-48.84-28.22c-3.51-2.03-7.81-2.03-11.32,0 l-48.87,28.21c0,0-0.14,0.11-0.2,0.16c-0.74,0.45-1.44,0.99-2.07,1.6c0.09-0.09,0.18-0.2,0.26-0.29 c-0.54,0.58-1.03,1.21-1.44,1.89c-0.06,0.11-0.16,0.2-0.2,0.32c-0.43-0.74-0.74,1.53-0.99,2.37c-0.05,0.18-0.09,0.36-0.14,0.54 c-0.2,0.86-0.36,1.74-0.36,2.66v28.21c0,10.89-5.87,21.03-15.3,26.5c-9.42,5.44-21.15,5.44-30.59,0l-24.43-14.11 c-0.79-0.45-1.62-0.77-2.47-1.01c-0.18-0.05-0.36-0.11-0.54-0.16c-0.83-0.2-1.69-0.32-2.54-0.34c-0.14,0-0.25,0-0.38,0 c-0.81,0-1.6,0.11-2.37,0.32c-0.14,0.03-0.25,0.05-0.38,0.09c-0.83,0.23-1.64,0.57-2.41,0.99c-0.06,0.05-0.16,0.05-0.23,0.09 l-48.87,28.21c-3.51,2.03-5.67,5.76-5.67,9.81v56.43c0,4.05,2.16,7.78,5.67,9.81l48.87,28.21c0,0,0.16,0.05,0.23,0.09 c0.77,0.43,1.58,0.77,2.41,0.99c0.14,0.05,0.27,0.05,0.4,0.09c0.77,0.18,1.55,0.29,2.34,0.32c0.09,0,0.18,0.05,0.27,0.05 c0.05,0,0.09,0,0.11,0c0.86,0,1.69-0.14,2.54-0.34c0.18-0.05,0.36-0.09,0.54-0.16c0.86-0.25,1.69-0.57,2.47-1.01l24.43-14.11 c9.42-5.44,21.15-5.44,30.59,0c9.42,5.44,15.3,15.59,15.3,26.48v28.21c0,0.92,0.14,1.8,0.36,2.66c0.05,0.18,0.09,0.36,0.14,0.54 c0.25,0.83,0.56,1.62,0.99,2.37c0.06,0.11,0.14,0.2,0.2,0.31c0.4,0.68,0.9,1.31,1.44,1.89c0.09,0.09,0.18,0.2,0.26,0.29 c0.61,0.6,1.31,1.12,2.07,1.6c0.06,0.05,0.11,0.11,0.2,0.16l48.87,28.21c1.75,1.01,3.72,1.51,5.67,1.51s3.92-0.52,5.67-1.51 l48.87-28.21c3.51-2.03,5.67-5.76,5.67-9.81v-56.43c0-4.05-2.16-7.78-5.67-9.81l-48.87-28.21c0,0-0.16-0.05-0.23-0.09 c-0.77-0.43-1.58-0.77-2.41-0.99c-0.14-0.05-0.25-0.05-0.38-0.09c-0.79-0.18-1.57-0.29-2.38-0.32c-0.11,0-0.25,0-0.36,0 c-0.86,0-1.71,0.14-2.54,0.34c-0.18,0.05-0.34,0.09-0.52,0.16c-0.86,0.25-1.69,0.57-2.47,1.01l-24.43,14.11 c-9.42,5.44-21.15,5.44-30.58,0c-9.42-5.44-15.3-15.59-15.3-26.5c0-10.91,5.87-21.03,15.3-26.48 C325.55,223.49,325.46,223.49,325.46,223.49z"/><path fill="#1796E2" d="M304.5,369.22l-48.87-28.21c0,0-0.16-0.05-0.23-0.09c-0.77-0.43-1.57-0.77-2.41-0.99 c-0.14-0.05-0.27-0.05-0.4-0.09c-0.79-0.18-1.57-0.29-2.37-0.32c-0.14,0-0.25,0-0.38,0c-0.86,0-1.71,0.14-2.54,0.34 c-0.18,0.05-0.34,0.09-0.52,0.16c-0.86,0.25-1.69,0.57-2.47,1.01l-24.43,14.11c-9.42,5.44-21.15,5.44-30.58,0 c-9.42-5.44-15.3-15.59-15.3-26.5v-28.22c0-0.92-0.14-1.8-0.36-2.66c-0.05-0.18-0.09-0.36-0.14-0.54 c-0.25-0.83-0.57-1.62-0.99-2.37c-0.06-0.11-0.14-0.2-0.2-0.32c-0.4-0.68-0.9-1.31-1.44-1.89c-0.09-0.09-0.18-0.2-0.27-0.29 c-0.6-0.6-1.31-1.12-2.07-1.6c-0.06-0.05-0.11-0.11-0.2-0.16l-48.87-28.21c-3.51-2.03-7.81-2.03-11.32,0L59.28,290.6 c-3.51,2.03-5.67,5.76-5.67,9.81v56.43c0,4.05,2.16,7.78,5.67,9.81l48.87,28.21c0,0,0.16,0.06,0.23,0.09 c0.77,0.43,1.55,0.77,2.38,0.99c0.14,0.05,0.27,0.06,0.4,0.09c0.77,0.18,1.55,0.29,2.34,0.32c0.09,0,0.18,0.05,0.29,0.05 c0.05,0,0.09,0,0.14,0c0.86,0,1.69-0.14,2.52-0.34c0.18-0.05,0.36-0.09,0.54-0.16c0.86-0.25,1.69-0.57,2.47-1.01l24.43-14.11 c9.42-5.44,21.15-5.44,30.59,0c9.42,5.44,15.3,15.59,15.3,26.48v28.21c0,0.92,0.14,1.8,0.36,2.66c0.05,0.18,0.09,0.36,0.14,0.54 c0.25,0.83,0.57,1.62,0.99,2.37c0.06,0.11,0.14,0.2,0.2,0.32c0.4,0.68,0.9,1.31,1.44,1.89c0.09,0.09,0.18,0.2,0.27,0.29 c0.61,0.61,1.31,1.12,2.07,1.6c0.06,0.05,0.11,0.11,0.2,0.16l48.87,28.21c1.75,1.01,3.71,1.51,5.67,1.51 c1.96,0,3.92-0.52,5.67-1.51l48.87-28.21c3.51-2.03,5.67-5.76,5.67-9.81v-56.43c0-4.05-2.16-7.78-5.67-9.81L304.5,369.22z"/>'},
@@ -2021,6 +2035,10 @@ function renderSessionHeader(){
     return actBtn(a,on,on?t("act."+a)
       :busy?t("act.pending"):a==="resume"?t("act.no_resumable"):t("act.no_active"));
   }).join("");
+  /* The transcript download sits right of the task group in the same row —
+     gated on the session's cached events, not on any task state. */
+  const dlOn=hasTranscript(s.session_id);
+  const dlBtn=`<button type="button" class="hact" data-act="download" id="dlbtn"${dlOn?"":" disabled"} title="${esc(t(dlOn?"act.download_hint":"act.no_transcript"))}" aria-label="${esc(t("act.download"))}">${icon("download",13)}<span>${esc(t("act.download"))}</span></button>`;
   el.innerHTML=`<div class="avatar">${agentAvatar(s,26)}</div>
     <div class="hbody">
       <h2 class="htitle"><span class="htext">${esc(s.title||s.session_id)}</span>${ids?`<span class="hids" title="${esc(ids)}">${esc(ids)}</span>`:""}</h2>
@@ -2032,10 +2050,14 @@ function renderSessionHeader(){
       </div>
     </div>
     <div class="hside">
-      <div class="hactions" role="group" aria-label="${esc(t("a11y.task_actions"))}">${hbtns}</div>
+      <div class="hrow">
+        <div class="hactions" role="group" aria-label="${esc(t("a11y.task_actions"))}">${hbtns}</div>
+        ${dlBtn}
+      </div>
       <div class="hmeta">${esc(t("session.turns",{n:s.turns??0}))}${agoStr?" · "+esc(agoStr):""}</div>
     </div>`;
-  el.querySelectorAll(".hact").forEach(b=>b.onclick=()=>taskAction(b.dataset.act));
+  el.querySelectorAll(".hact").forEach(b=>b.onclick=()=>
+    b.dataset.act==="download"?downloadTranscript():taskAction(b.dataset.act));
 }
 
 /* ---------- conversation rendering ---------- */
@@ -2213,6 +2235,135 @@ function applyEvents(evs){
   for(const e of evs)(handlers[e.t]||(()=>{}))(e);
   flushBlocks();
   if(nearBottom)content.scrollTop=content.scrollHeight;
+}
+
+/* ---------- transcript download ----------
+   Exports the selected session's cached events as a Markdown file — the DOM
+   is never consulted and no network round-trip happens. msg/think chunks
+   coalesce into single blocks (the same merge the live pane applies),
+   tool_status records fold into their tool line, and usage snapshots stay
+   internal. Fences size dynamically so content can never break out of one,
+   and every interpolated value is flattened to one line so metadata cannot
+   inject fake headings or fences of its own. */
+function hasTranscript(id){
+  return !!id&&(eventsCache[id]||[]).some(e=>e&&handlers[e.t]);
+}
+function updateDlBtn(){
+  const b=$("#dlbtn");if(!b)return;
+  const on=hasTranscript(selected);
+  b.disabled=!on;
+  b.title=t(on?"act.download_hint":"act.no_transcript");
+}
+function sanitizeFilename(raw){
+  /* Windows-forbidden < > : " / \ | ? * plus ';' (explicit requirement) and
+     the C0/DEL control characters all become separators; separator runs
+     collapse, unsafe edge characters strip, and the result caps at 100
+     chars so the MM-DD-YYYY- prefix + .md stay well under MAX_PATH. */
+  const c=String(raw??"")
+    .replace(/[<>:"/\\|?*;\x00-\x1f\x7f]/g,"-")
+    .replace(/[-_ ]+/g,"-")
+    .replace(/^[-. ]+|[-. ]+$/g,"");
+  return (c.length>100?c.slice(0,100).replace(/[-. ]+$/,""):c)||"transcription";
+}
+function buildTranscriptFilename(s){
+  /* Session creation date in the browser's local timezone (the same zone
+     fmtTs renders in); a missing/unparseable stamp falls back to today. */
+  let d=s&&s.created_at?new Date(s.created_at):null;
+  if(!d||!Number.isFinite(+d))d=new Date();
+  const p=n=>String(n).padStart(2,"0");
+  return `${p(d.getMonth()+1)}-${p(d.getDate())}-${d.getFullYear()}-`+
+    sanitizeFilename(s&&(s.title||s.session_id))+".md";
+}
+const mdLine=v=>String(v??"").replace(/[\r\n]+/g," ").trim();
+const mdCode=v=>{const s=mdLine(v);return s.includes("`")?"`` "+s+" ``":"`"+s+"`"};
+/* A fence one char longer than the longest backtick run in the text can
+   never be closed early by the content itself. */
+function mdFence(text){
+  const m=String(text).match(/`{3,}/g);
+  return "`".repeat(m?Math.max(...m.map(r=>r.length))+1:3);
+}
+function sessionToMarkdown(s,evs){
+  const L=[];
+  const title=s?mdLine(s.title||s.session_id):"";
+  L.push("# "+(title||t("dl.default_title")),"");
+  if(s){
+    const tk=latestTask(s.session_id);
+    const repo=baseName(s.cwd);
+    const meta=[[s.agent,s.model].filter(Boolean).join(" · "),
+      [tk&&tk.task_id!=null?t("session.task_id",{id:String(tk.task_id)}):"",
+        s.session_id?t("session.session_id",{id:s.session_id}):""]
+        .filter(Boolean).join(" · "),
+      repo?t("session.working_repo",{repo}):"",s.created_at||""];
+    for(const line of meta){const v=mdLine(line);if(v)L.push("- "+v)}
+    L.push("","---","");
+  }
+  let msg="",think="";
+  const toolsMd={};   // tool_call_id -> {idx,kind,title,id,status}
+  const tstat=st=>TOOL_STATES[st]?t("tool.status."+st):mdLine(st);
+  const tline=r=>{
+    let x="**"+r.kind+"**";
+    const cap=mdLine(r.title||r.id||"");
+    if(cap)x+=" — "+mdCode(cap);
+    if(r.status)x+=" · "+tstat(r.status);
+    return x;
+  };
+  const flushMsg=()=>{const v=msg.trim();msg="";
+    if(v)L.push("## "+t("transcript.agent"),"",v,"")};
+  const flushThink=()=>{const v=think.trim();think="";
+    if(v)L.push("<details>","<summary>"+t("transcript.thinking")+"</summary>",
+      "",v,"","</details>","")};
+  const fence=text=>{const f=mdFence(text);L.push(f,String(text),f,"")};
+  for(const e of evs||[]){
+    if(!e||typeof e!=="object")continue;
+    if(e.t==="msg"){flushThink();msg+=String(e.text??"");continue}
+    if(e.t==="think"){flushMsg();think+=String(e.text??"");continue}
+    flushMsg();flushThink();
+    if(e.t==="prompt"){
+      const user=e.src==="dashboard";
+      L.push("## "+t(user?"transcript.user_message":"transcript.dispatched_message")+
+        (e.ts?" ("+mdLine(e.ts)+")":""),"");
+      fence(e.text??"");
+    }else if(e.t==="tool"){
+      const prev=e.id?toolsMd[e.id]:null;
+      if(prev){          // a second record for the same call folds in
+        if(e.title)prev.title=e.title;
+        if(e.status)prev.status=e.status;
+        L[prev.idx]=tline(prev);
+      }else{
+        const kind=String(e.kind||"tool").toLowerCase();
+        const rec={kind:TOOL_KINDS[kind]?t("tool.kind."+kind)
+            :mdLine(kind)||"tool",
+          title:e.title||"",id:e.id||"",status:e.status||"",idx:L.length};
+        L.push(tline(rec),"");
+        if(e.id)toolsMd[e.id]=rec;
+      }
+      if(e.input)fence(e.input);
+      if(e.output)fence(e.output);
+    }else if(e.t==="tool_status"){
+      const rec=e.id?toolsMd[e.id]:null;
+      if(rec&&e.status){rec.status=e.status;L[rec.idx]=tline(rec)}
+    }else if(e.t==="turn"){
+      let line=t("transcript.turn_ended");
+      if(e.stop_reason&&e.stop_reason!=="end_turn")
+        line+=" · "+mdLine(stopReasonLabel(e.stop_reason));
+      L.push("*"+line+"*","");
+    }else if(e.t==="error"){
+      L.push("> **"+t("transcript.error")+":** "+mdLine(e.text),"");
+    }
+  }
+  flushMsg();flushThink();
+  return L.join("\n").replace(/\n{3,}/g,"\n\n");
+}
+function downloadTranscript(){
+  const id=selected;if(!id||!hasTranscript(id))return;
+  const s=sessions.find(x=>x.session_id===id)||{session_id:id};
+  const blob=new Blob([sessionToMarkdown(s,eventsCache[id])],
+    {type:"text/markdown;charset=utf-8"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;a.download=buildTranscriptFilename(s);a.style.display="none";
+  document.body.appendChild(a);a.click();
+  setTimeout(()=>{a.remove();URL.revokeObjectURL(url)},0);
 }
 
 /* ---------- conversation nav rail ----------
@@ -2475,6 +2626,7 @@ async function pollEvents(){
     if(j.reset)eventsCache[id]=[];
     eventsCache[id]=(eventsCache[id]||[]).concat(j.events);
     offsets[id]=j.offset;
+    updateDlBtn();           // transcript readiness flips on any append/reset
     // "usage" events carry the live run-consumption snapshot; a prompt or
     // turn boundary clears it so a finished run never shows stale partials.
     let usageDirty=false;

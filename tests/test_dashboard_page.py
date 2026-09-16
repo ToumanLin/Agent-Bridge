@@ -505,6 +505,75 @@ def test_session_header_identifiers():
     assert "flex:none" in hids and "var(--font-mono)" in hids
 
 
+def test_transcript_download_contract():
+    """A title-bar button exports the selected session's cached transcript as
+    a Markdown file named MM-DD-YYYY-Title.md — entirely client-side.
+
+    The button sits right of the task controls in .hside, reuses .hact and
+    the inline-SVG icon registry, stays disabled until the session has
+    transcript events, and its enabled state refreshes from pollEvents so it
+    flips when event data arrives — not only on selection. Filenames are
+    sanitized for the Windows-forbidden set plus ';' and control chars.
+    Executable end-to-end coverage (sanitization cases, Markdown coalescing,
+    Blob/anchor/object-URL lifecycle) lives in
+    tests/dashboard_status_behavior.js.
+    """
+    body = re.search(r"function renderSessionHeader\(\)\{([\s\S]*?)\n\}", PAGE)
+    assert body, "renderSessionHeader missing"
+    body = body.group(1)
+    # Native accessible button, styled like the task controls.
+    assert 'type="button" class="hact" data-act="download" id="dlbtn"' in body
+    assert 'aria-label="${esc(t("act.download"))}"' in body
+    # Rendered inside the .hrow after the task-action group.
+    assert body.index("${hbtns}</div>") < body.index("${dlBtn}")
+    # Disabled state is driven by the session's own cached events.
+    assert "hasTranscript(s.session_id)" in body
+    assert 'act.no_transcript' in body and 'act.download_hint' in body
+    # The download path is real functions — the Node harness drives these
+    # exact helpers rather than reimplementing them.
+    for fn in (
+        "hasTranscript", "updateDlBtn", "sanitizeFilename",
+        "buildTranscriptFilename", "sessionToMarkdown", "downloadTranscript",
+    ):
+        assert f"function {fn}(" in PAGE
+    # Enablement refreshes when event data arrives, not only on selection.
+    poll = re.search(r"async function pollEvents\(\)\{([\s\S]*?)\n\}", PAGE)
+    assert poll and "updateDlBtn();" in poll.group(1)
+    # Client-side download machinery: Blob -> object URL -> anchor -> revoke.
+    dl = re.search(r"function downloadTranscript\(\)\{([\s\S]*?)\n\}", PAGE)
+    assert dl, "downloadTranscript missing"
+    dl = dl.group(1)
+    for api in (
+        "new Blob(", "URL.createObjectURL(", 'createElement("a")',
+        "a.download=", "URL.revokeObjectURL(", "text/markdown",
+    ):
+        assert api in dl
+    # Filename contract: MM-DD-YYYY-Title.md built from the local-timezone
+    # session date, padded to two digits.
+    fn = re.search(r"function buildTranscriptFilename\(s\)\{([\s\S]*?)\n\}", PAGE)
+    assert fn, "buildTranscriptFilename missing"
+    fn = fn.group(1)
+    for needle in ("getMonth()+1", "getDate()", "getFullYear()", "padStart(2"):
+        assert needle in fn
+    # Sanitizer covers the Windows-forbidden set, the explicit ';', and the
+    # C0/DEL control range; collapsed/empty results fall back.
+    san = re.search(r"function sanitizeFilename\(raw\)\{([\s\S]*?)\n\}", PAGE)
+    assert san, "sanitizeFilename missing"
+    san = san.group(1)
+    assert r'[<>:"/\\|?*;' in san
+    assert r"\x00-\x1f\x7f" in san
+    assert '"transcription"' in san
+    # Inline-SVG download glyph lives in the icon registry — no <img>/emoji.
+    icons = re.search(r"const ICONS=\{([\s\S]*?)\n\};", PAGE).group(1)
+    assert re.search(r'download:\[', icons)
+    # Localized strings exist in every bundled dictionary.
+    for loc in _locales().values():
+        for key in ("act.download", "act.download_hint", "act.no_transcript",
+                    "dl.default_title"):
+            assert key in loc, f"missing {key}"
+    assert _locales()["en"]["dl.default_title"] == "Transcription"
+
+
 def test_dark_theme_is_neutral_gray_black():
     dark = re.search(r'\[data-theme="dark"\]\{([^}]*)\}', PAGE).group(1)
     # The old GitHub-blue dark palette is gone.

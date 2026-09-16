@@ -99,6 +99,7 @@ const el = () => {
       walk(e); return out;
     },
     focus() { e.focused++; documentStub.activeElement = e; },
+    click() { e.clicks = (e.clicks || 0) + 1; },
     remove() {
       const p = e._parent;
       if (p) { p.children.splice(p.children.indexOf(e), 1); e._parent = null; }
@@ -138,6 +139,7 @@ elCache["#rail"] = railEl;
 const documentStub = {
   documentElement: Object.assign(el(), { lang: "" }),
   activeElement: null, title: "", visibilityState: "visible",
+  body: el(),
   querySelector: (s) => elCache[s] || (elCache[s] = el()),
   querySelectorAll: () => [],
   createElement(tag) {
@@ -152,6 +154,10 @@ const mediaStubs = {};       // media query -> shared matchMedia stub
 const moCalls = [], roCalls = [];   // observer registrations
 const rafQ = [];             // queued requestAnimationFrame callbacks
 const runRaf = () => { const q = rafQ.splice(0); q.forEach((f) => f()); };
+const timers = [];           // queued setTimeout callbacks (drained explicitly)
+const runTimers = () => { const q = timers.splice(0); q.forEach((f) => f()); };
+const blobs = [], revokedUrls = [];   // Blob/object-URL download capture
+let blobSeq = 0;
 const store = {};            // mutable localStorage backing
 const sandbox = {
   document: documentStub,
@@ -175,7 +181,22 @@ const sandbox = {
   addEventListener(ev, fn) { (listeners[ev] || (listeners[ev] = [])).push(fn); },
   removeEventListener() {},
   setInterval: () => 0, clearInterval() {},
-  setTimeout: () => 0, clearTimeout() {},
+  // Timeouts queue up like rAF callbacks; tests drain them via runTimers().
+  setTimeout: (fn) => { timers.push(fn); return timers.length; },
+  clearTimeout() {},
+  // File-download surface: the anchor click is observed through created[],
+  // the blob through this registry, and cleanup through revokedUrls.
+  Blob: class {
+    constructor(parts, opts) {
+      this.parts = parts || [];
+      this.type = (opts && opts.type) || "";
+      blobs.push(this);
+    }
+  },
+  URL: {
+    createObjectURL: () => "blob:mock-" + (blobSeq++),
+    revokeObjectURL: (u) => { revokedUrls.push(u); },
+  },
   // rAF callbacks queue up; tests drain them explicitly via runRaf().
   requestAnimationFrame: (fn) => { rafQ.push(fn); return rafQ.length; },
   performance: { now: () => 0 },
@@ -210,6 +231,8 @@ vm.runInContext(
     " select, pollEvents, sendState," +
     " taskActions, actPending, taskAction, renderQueue, dropQueueEntry," +
     " steerMsg, delMsg, ACT_DONE," +
+    " hasTranscript, updateDlBtn, sanitizeFilename, buildTranscriptFilename," +
+    " sessionToMarkdown, downloadTranscript," +
     " _setTasks: (v) => { tasks = v; }," +
     " _setSessions: (v) => { sessions = v; }," +
     " _setLiveAll: (v) => { liveAll = v; }," +
@@ -1854,6 +1877,227 @@ X._setLiveAll({});
       eq(X.t(key) !== key, true, `${loc} has ${key}`);
   }
   X.setLocalePref("en");
+
+  /* ================= transcript download =================
+     The header button exports the selected session's cached events as a
+     Markdown file — every helper below is the production code path, not a
+     reimplementation. */
+
+  // --- sanitizeFilename: every forbidden class collapses to one "-" ---
+  eq(X.sanitizeFilename('Researcher: Part 1; <v2> / test? * "pipe|"'),
+    "Researcher-Part-1-v2-test-pipe",
+    "Windows-forbidden chars collapse into single hyphens");
+  eq(X.sanitizeFilename("task;resume;step"), "task-resume-step",
+    "semicolons are replaced (explicit user requirement)");
+  eq(X.sanitizeFilename("My Title...   "), "My-Title",
+    "separator runs collapse; trailing dots/spaces strip");
+  eq(X.sanitizeFilename(":::;;;???***"), "transcription",
+    "all-invalid title falls back");
+  eq(X.sanitizeFilename("title\x00with\x1f\x7fcontrols"),
+    "title-with-controls", "C0/DEL control characters are replaced");
+  eq(X.sanitizeFilename(""), "transcription", "empty -> fallback");
+  eq(X.sanitizeFilename(null), "transcription", "null -> fallback");
+  eq(X.sanitizeFilename(undefined), "transcription", "undefined -> fallback");
+  eq(X.sanitizeFilename("...---..."), "transcription",
+    "edge-only separators collapse to nothing -> fallback");
+  eq(X.sanitizeFilename("  . leading"), "leading",
+    "leading unsafe chars strip");
+  eq(X.sanitizeFilename("a".repeat(150)).length, 100,
+    "title caps at 100 chars");
+  eq(X.sanitizeFilename("会话 标题: v2"), "会话-标题-v2",
+    "non-ASCII titles survive");
+  eq(X.sanitizeFilename("a/b\\c:d*e?f\"g<h>i|j;k"), "a-b-c-d-e-f-g-h-i-j-k",
+    "every forbidden char maps to a separator");
+  eq(X.sanitizeFilename("CON"), "CON",
+    "device names pass — the date prefix keeps the basename safe");
+
+  // --- buildTranscriptFilename: MM-DD-YYYY-Title.md, browser-local date ---
+  const dexp = (d) => String(d.getMonth() + 1).padStart(2, "0") + "-" +
+    String(d.getDate()).padStart(2, "0") + "-" + d.getFullYear();
+  const dCreated = new Date("2026-09-12T10:00:00Z");
+  eq(X.buildTranscriptFilename(
+    { title: "Researcher", created_at: "2026-09-12T10:00:00Z" }),
+    dexp(dCreated) + "-Researcher.md",
+    "MM-DD-YYYY-Title.md in the local timezone");
+  eq(X.buildTranscriptFilename(
+    { title: "a:b;c", created_at: "2026-09-12T10:00:00Z" }),
+    dexp(dCreated) + "-a-b-c.md", "filename title is sanitized");
+  eq(X.buildTranscriptFilename({ session_id: "sess_9" })
+    .endsWith("-sess-9.md"), true,
+    "missing title falls back to session_id (underscores collapse)");
+  eq(X.buildTranscriptFilename({ title: "x", created_at: "not-a-date" })
+    .startsWith(dexp(new Date()) + "-x.md"), true,
+    "invalid created_at falls back to the current date");
+  eq(X.buildTranscriptFilename(null).endsWith("-transcription.md"), true,
+    "missing session falls back entirely");
+  eq(X.buildTranscriptFilename({ title: "x", created_at: "" })
+    .startsWith(dexp(new Date()) + "-x.md"), true,
+    "empty created_at falls back to the current date");
+  eq(/^\d{2}-\d{2}-\d{4}-.+\.md$/.test(
+    X.buildTranscriptFilename({ title: "t",
+      created_at: "2026-09-12T10:00:00Z" })), true,
+    "filename matches the convention");
+
+  // --- sessionToMarkdown: coalesced chunks, folded tools, safe metadata ---
+  X._setTasks([task({ task_id: "t1", session_id: "s1" })]);
+  const sessMd = { session_id: "s1", title: "Demo", agent: "devin",
+    model: "swe-2", cwd: "/repo/proj", created_at: "2026-09-12T10:00:00Z" };
+  const md = X.sessionToMarkdown(sessMd, [
+    { t: "prompt", ts: "2026-09-12T10:00:01Z", text: "do it <now>",
+      src: "dashboard" },
+    { t: "msg", ts: "2026-09-12T10:00:02Z", text: "Hello " },
+    { t: "msg", ts: "2026-09-12T10:00:03Z", text: "**world**" },
+    { t: "think", ts: "2026-09-12T10:00:04Z", text: "hmm" },
+    { t: "tool", ts: "2026-09-12T10:00:05Z", id: "tc1", kind: "execute",
+      title: "Ran pwd", input: '{"command":"pwd"}' },
+    { t: "tool_status", ts: "2026-09-12T10:00:06Z", id: "tc1",
+      status: "completed" },
+    { t: "usage", ts: "2026-09-12T10:00:06Z", consumed: { total: 5 } },
+    { t: "turn", ts: "2026-09-12T10:00:07Z", stop_reason: "end_turn" },
+    { t: "error", ts: "2026-09-12T10:00:08Z", text: "stalled once" },
+    { t: "prompt", ts: "2026-09-12T10:00:09Z", text: "dispatched job",
+      src: "mcp" },
+  ]);
+  eq(md.startsWith("# Demo\n"), true,
+    "document opens with the title heading");
+  eq(md.includes("- devin · swe-2"), true, "agent/model metadata line");
+  eq(md.includes("task t1 · session s1"), true, "task/session id line");
+  eq(md.includes("Working repo · proj"), true, "repo metadata line");
+  eq(md.includes("## User Message (2026-09-12T10:00:01Z)"), true,
+    "dashboard prompt heading");
+  eq(md.includes("```\ndo it <now>\n```"), true,
+    "prompt text verbatim inside a fence");
+  eq(md.includes("## Agent\n\nHello **world**"), true,
+    "streamed message chunks coalesce into one agent block");
+  eq(md.includes("<details>\n<summary>Thinking</summary>\n\nhmm"), true,
+    "thinking chunks fold into a details block");
+  eq(md.includes("**Execute** — `Ran pwd` · completed"), true,
+    "tool_status folds into the tool line");
+  eq(md.includes('{"command":"pwd"}'), true, "tool input preserved");
+  eq(md.includes("*turn ended*"), true, "turn divider renders");
+  eq(md.includes("> **error:** stalled once"), true,
+    "error blockquote renders");
+  eq(md.includes("## Dispatched Message (2026-09-12T10:00:09Z)"), true,
+    "dispatched prompt heading");
+  eq(md.includes("consumed") || md.includes('"total"'), false,
+    "internal usage noise never leaks into the export");
+  // Folded twin record: a second full tool event for the same id updates the
+  // line instead of duplicating it.
+  const mdDup = X.sessionToMarkdown(sessMd, [
+    { t: "tool", ts: "1", id: "c:1", kind: "read", title: "view f" },
+    { t: "tool", ts: "2", id: "c:1", kind: "read", title: "view f",
+      status: "completed" },
+  ]);
+  eq((mdDup.match(/\*\*Read\*\*/g) || []).length, 1,
+    "same tool_call_id merges — no duplicate line");
+  eq(mdDup.includes("**Read** — `view f` · completed"), true,
+    "merged record carries the status");
+  // Dynamic metadata can never grow fake headings or break a fence.
+  const evil = X.sessionToMarkdown(
+    { session_id: "s2", title: "evil\n\n# injected" },
+    [{ t: "msg", ts: "1", text: "x" }]);
+  eq(evil.split("\n")[0], "# evil # injected",
+    "a newline-bearing title flattens into one heading line");
+  const fenced = X.sessionToMarkdown(sessMd, [
+    { t: "prompt", text: "a\n```\nb", src: "dashboard" }]);
+  eq(fenced.includes("````\na\n```\nb\n````"), true,
+    "content backticks force a longer fence — no breakout");
+  // Exported section labels localize with the rest of the chrome.
+  X.setLocalePref("zh-CN");
+  const mdZh = X.sessionToMarkdown(sessMd, [
+    { t: "prompt", text: "问", src: "dashboard" },
+    { t: "msg", text: "答" }]);
+  eq(mdZh.includes("## 用户消息"), true, "prompt heading zh-CN");
+  eq(mdZh.includes("## Agent 消息"), true, "agent heading zh-CN");
+  X.setLocalePref("en");
+
+  // --- header button: placement + state ---
+  X._setSessions([{ session_id: "s1", proc_state: "busy", title: "Demo",
+    agent: "devin", cwd: "/r", turns: 1 }]);
+  X._setTasks([actTk({})]);
+  X._setSelected("s1");
+  X._cache().s1 = [];
+  X.renderSessionHeader();
+  h = elCache["#hwrap"].innerHTML;
+  eq(h.includes('id="dlbtn"'), true, "download button renders in the header");
+  eq(h.includes('data-act="download"'), true,
+    "button carries data-act=download");
+  eq(h.indexOf('class="hactions"') < h.indexOf('id="dlbtn"'), true,
+    "download sits right of the task controls");
+  eq(h.indexOf('class="hside"') < h.indexOf('id="dlbtn"'), true,
+    "download lives inside the right-aligned .hside");
+  eq(/id="dlbtn"[^>]*disabled/.test(h), true,
+    "disabled until the session has transcript events");
+  eq(h.includes('title="no transcript yet"'), true,
+    "disabled state explains why in the tooltip");
+  eq(h.includes('aria-label="Download"'), true, "button is accessibly named");
+  X._cache().s1 = [{ t: "msg", ts: "2026-01-01T00:00:00Z", text: "hi" }];
+  X.renderSessionHeader();
+  h = elCache["#hwrap"].innerHTML;
+  eq(/id="dlbtn"[^>]*disabled/.test(h), false,
+    "enabled once transcript events exist");
+  eq(h.includes('title="Download transcript as Markdown"'), true,
+    "enabled tooltip describes the action");
+  eq(X.hasTranscript("s1"), true, "hasTranscript sees renderable events");
+  X._cache().s1 = [{ t: "usage", consumed: { total: 1 } }];
+  eq(X.hasTranscript("s1"), false, "usage-only cache is not a transcript");
+  X.renderSessionHeader();
+  eq(/id="dlbtn"[^>]*disabled/.test(elCache["#hwrap"].innerHTML), true,
+    "usage-only events keep the button disabled");
+  X._cache().s1 = [{ t: "msg", text: "back" }];
+
+  // --- enablement flips when event data arrives, not only on selection ---
+  const dlStub = documentStub.querySelector("#dlbtn");
+  dlStub.disabled = true; dlStub.title = "";
+  X._cache().s1 = [];
+  const realFetchDl = sandbox.fetch;
+  sandbox.fetch = () => Promise.resolve({ ok: true,
+    json: () => Promise.resolve({ offset: 10, reset: false,
+      events: [{ t: "prompt", ts: "2026-01-01T00:00:00Z", text: "hi",
+        src: "dashboard" }] }) });
+  await X.pollEvents();
+  sandbox.fetch = realFetchDl;
+  eq(X._cache().s1.length, 1, "events appended to the session cache");
+  eq(dlStub.disabled, false, "the button enabled on event arrival");
+  eq(dlStub.title, "Download transcript as Markdown",
+    "the arrival refresh also fixes the tooltip");
+  // A reset emptying the cache disables it again.
+  sandbox.fetch = () => Promise.resolve({ ok: true,
+    json: () => Promise.resolve({ offset: 0, reset: true, events: [] }) });
+  await X.pollEvents();
+  sandbox.fetch = realFetchDl;
+  eq(dlStub.disabled, true, "a transcript reset disables the button");
+  eq(dlStub.title, "no transcript yet",
+    "the disabled tooltip returns");
+
+  // --- downloadTranscript: Blob -> object URL -> anchor click -> cleanup ---
+  X._cache().s1 = [
+    { t: "prompt", ts: "2026-01-01T00:00:00Z", text: "hi", src: "dashboard" },
+    { t: "msg", ts: "2026-01-01T00:00:01Z", text: "ok" }];
+  const beforeA = created.length;
+  X.downloadTranscript();
+  const anchor = created.slice(beforeA).find((e) => e.tagName === "A");
+  eq(!!anchor, true, "a temporary anchor is created");
+  eq(anchor.clicks, 1, "the anchor is clicked once");
+  eq(/^blob:mock-/.test(anchor.href), true, "href is the blob object URL");
+  eq(/^\d{2}-\d{2}-\d{4}-Demo\.md$/.test(anchor.download), true,
+    "download name matches MM-DD-YYYY-Title.md");
+  eq(blobs.length, 1, "one blob was minted");
+  eq(blobs[0].type, "text/markdown;charset=utf-8", "blob is markdown");
+  eq(blobs[0].parts[0].includes("## User Message"), true,
+    "blob content is the generated transcript");
+  eq(documentStub.body.children.includes(anchor), true,
+    "anchor was attached for the click");
+  runTimers();
+  eq(documentStub.body.children.includes(anchor), false,
+    "anchor removed after the download starts");
+  eq(revokedUrls.length, 1, "the object URL is revoked");
+  // A stale click on a transcript-less session never mints anything.
+  const blobCount = blobs.length;
+  X._setSelected("s_none");
+  X.downloadTranscript();
+  eq(blobs.length, blobCount, "no download without transcript events");
+  X._setSelected("s1");
 
   console.log(failed ? `\n${failed} FAILED` : "\nall assertions passed");
   process.exit(failed ? 1 : 0);
