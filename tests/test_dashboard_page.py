@@ -1,6 +1,7 @@
 """Focused contract tests for the embedded dashboard UI and its HTTP surface.
 
 The dashboard page is a single inline ``PAGE`` string in
+``agent_bridge.share.dashboard_page``, re-exported by
 ``agent_bridge.share.dashboard``. These tests pin the behaviors the UI redesign
 must preserve (folds, endpoints, escaping hooks, DOM ids, icon policy) plus a
 small live-server smoke over the API — not a brittle markup snapshot.
@@ -21,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from agent_bridge import dashboard as dashboard_launcher
-from agent_bridge.share import dashboard
+from agent_bridge.share import dashboard, dashboard_page
 
 PAGE = dashboard.PAGE
 
@@ -165,6 +166,12 @@ def dash(tmp_path, monkeypatch):
 
 
 # ---------- PAGE contract ----------
+
+
+def test_page_is_single_sourced_in_dashboard_page():
+    """``dashboard.PAGE`` is the same object ``dashboard_page`` defines —
+    re-exported, not duplicated."""
+    assert dashboard.PAGE is dashboard_page.PAGE
 
 
 def test_page_dom_ids_and_endpoints():
@@ -1675,7 +1682,7 @@ def test_task_action_writes_request_record(dash):
 
 
 def test_task_action_validation(dash):
-    home, base = dash
+    _, base = dash
     for payload, code, err in (
         ({"action": "explode", "task_id": "t1"}, 400, "bad_action"),
         ({"action": "pause"}, 400, "bad_task"),

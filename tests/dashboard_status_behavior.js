@@ -1,7 +1,7 @@
 // Executable behavior tests for the dashboard page's status/duration helpers
 // and its conversation navigation rail.
 //
-// Extracts the real inline <script> from src/agent_bridge/share/dashboard.py's
+// Extracts the real inline <script> from src/agent_bridge/share/dashboard_page.py's
 // PAGE and runs it inside a vm context with a minimal DOM stub — no jsdom, no
 // npm packages. Covers the centralized proc_state map, latestTask chronology,
 // the taskDur/fmtDur/durText rules end to end, the bundled i18n layer
@@ -19,10 +19,10 @@ const path = require("path");
 const vm = require("vm");
 
 const src = fs.readFileSync(
-  path.join(__dirname, "..", "src", "agent_bridge", "share", "dashboard.py"),
+  path.join(__dirname, "..", "src", "agent_bridge", "share", "dashboard_page.py"),
   "utf8");
 const page = (src.match(/PAGE = r"""([\s\S]*?)"""/) || [])[1];
-if (!page) { console.error("PAGE not found in dashboard.py"); process.exit(2); }
+if (!page) { console.error("PAGE not found in dashboard_page.py"); process.exit(2); }
 const code = (page.match(/<script>([\s\S]*?)<\/script>/g) || [])
   .map((s) => s.slice("<script>".length, -"</script>".length))
   .join("\n;\n");

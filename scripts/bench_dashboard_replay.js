@@ -1,6 +1,6 @@
 // Deterministic benchmark for the dashboard's session-switch render path.
 //
-// Loads the real inline PAGE from src/agent_bridge/share/dashboard.py into
+// Loads the real inline PAGE from src/agent_bridge/share/dashboard_page.py into
 // jsdom, stubs fetch/matchMedia, replays event streams through the actual
 // page script, and reports the numbers the performance work targets:
 //
@@ -33,14 +33,15 @@ try {
 }
 
 const ROOT = path.resolve(__dirname, "..");
-// DASH_PAGE may point at a standalone .html (raw page) or a dashboard.py source.
+// DASH_PAGE may point at a standalone .html (raw page) or a .py source
+// embedding PAGE as a raw string.
 const html = (() => {
   const custom = process.env.DASH_PAGE;
   if (custom && custom.endsWith(".html")) return fs.readFileSync(custom, "utf8");
   const src = fs.readFileSync(
-    custom || path.join(ROOT, "src", "agent_bridge", "share", "dashboard.py"), "utf8");
+    custom || path.join(ROOT, "src", "agent_bridge", "share", "dashboard_page.py"), "utf8");
   const m = src.match(/PAGE = r"""([\s\S]*?)"""/);
-  if (!m) throw new Error("PAGE not found in dashboard.py");
+  if (!m) throw new Error("PAGE not found in dashboard_page.py");
   return m[1];
 })();
 
@@ -387,7 +388,10 @@ async function waitStable() {
   };
   const doneDur0 = durOf(streams[0].id);
   const runDur0 = durOf(streams[1].id);
-  await sleep(1100);
+  // The dashboard refreshes durations on a one-second interval whose phase
+  // is independent of this sample. Wait through two ticks so the assertion
+  // checks the live clock rather than depending on test timing.
+  await sleep(2200);
   const doneDur1 = durOf(streams[0].id);
   const runDur1 = durOf(streams[1].id);
   results.push({
