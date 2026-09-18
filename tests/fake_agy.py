@@ -3,8 +3,32 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
+from pathlib import Path
 
 CONVERSATION_ID = "conv-fake-agy"
+
+
+def _brain_write(obj) -> None:
+    """Append one record to the fake conversation's brain transcript.
+
+    FAKE_AGY_BRAIN points at the directory that stands in for
+    ~/.gemini/antigravity-cli/brain in tests.
+    """
+    root = os.environ.get("FAKE_AGY_BRAIN")
+    if not root:
+        return
+    path = (
+        Path(root)
+        / CONVERSATION_ID
+        / ".system_generated"
+        / "logs"
+        / "transcript_full.jsonl"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(obj if isinstance(obj, str) else json.dumps(obj))
+        fh.write("\n")
 
 
 def _fail(reason: str) -> int:
@@ -51,7 +75,71 @@ def main(argv: list[str]) -> int:
             handle.write(str(len(content)))
 
     echo = "echo:" + content[:16]
-    print(json.dumps({"event": "init", "conversation_id": CONVERSATION_ID}))
+    if os.environ.get("FAKE_AGY_MODE") == "thinking":
+        # Real agy appends thinking to the brain log as it reasons; a record
+        # can land before the stdout init that reveals the conversation id.
+        _brain_write({"type": "PLANNER_RESPONSE", "thinking": "first thought"})
+    print(json.dumps({"event": "init", "conversation_id": CONVERSATION_ID}), flush=True)
+    if os.environ.get("FAKE_AGY_MODE") == "hang":
+        # Holds the turn open so tests can exercise the cancellation path.
+        while True:
+            time.sleep(60)
+    if os.environ.get("FAKE_AGY_MODE") == "thinking":
+        delay = float(os.environ.get("FAKE_AGY_BRAIN_DELAY", "0"))
+        if delay:
+            time.sleep(delay)
+        # Forward-compatible stdout thought shape; the adapter must neither
+        # emit it twice (the brain log already carried the same text) nor let
+        # its text_delta leak into the assistant answer.
+        print(
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": CONVERSATION_ID,
+                        "step_index": 1,
+                        "state": "DONE",
+                        "step_type": "thought",
+                        "text_delta": "first thought",
+                    },
+                }
+            ),
+            flush=True,
+        )
+        _brain_write({"type": "PLANNER_RESPONSE", "thinking": "second thought"})
+        print(
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": CONVERSATION_ID,
+                        "step_index": 2,
+                        "state": "DONE",
+                        "step_type": "agent_response",
+                        "text_delta": echo,
+                    },
+                }
+            ),
+            flush=True,
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "conversation_id": CONVERSATION_ID,
+                        "status": "SUCCESS",
+                        "response": echo,
+                        "usage": {"total_tokens": 5},
+                    },
+                }
+            ),
+            flush=True,
+        )
+        # Written after the last stdout record; only the post-exit drain is
+        # guaranteed to observe it.
+        _brain_write({"type": "PLANNER_RESPONSE", "thinking": "late thought"})
+        return 0
     if os.environ.get("FAKE_AGY_MODE") == "rich":
         # The observed agy stream shape: a tool step pair (ACTIVE then DONE
         # with tool_info.output), a usage-only agent_response DONE carrying no

@@ -1,3 +1,5 @@
+import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -5,9 +7,11 @@ import pytest
 
 from agent_bridge.adapters.antigravity import (
     AgyAdapter,
+    _BrainThoughtTail,
     _scoped_usage,
     agy_model_effort,
     check_agy_model_effort,
+    classify_event,
     collect_tool_paths,
     conversation_id_of,
     is_agy_tool_schema_error,
@@ -19,6 +23,7 @@ from agent_bridge.adapters.antigravity import (
 )
 from agent_bridge.config import AgentConfig
 from agent_bridge.models import Session, Task
+from agent_bridge.transcript import read_events
 
 FAKE_AGY = Path(__file__).resolve().parent / "fake_agy.py"
 
@@ -363,6 +368,248 @@ async def test_run_turn_resumed_with_baseline_reports_delta(tmp_path, monkeypatc
 
 def test_scoped_usage_leaves_empty_dict_alone():
     assert _scoped_usage({}, True) == {}
+
+
+# --- brain-transcript thought tail --------------------------------------------
+
+BRAIN_SESSION = "sess_bt"
+
+
+def _brain_path(root: Path, cid: str) -> Path:
+    return root / cid / ".system_generated" / "logs" / "transcript_full.jsonl"
+
+
+def _append_brain(path: Path, *records) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        for rec in records:
+            fh.write(rec if isinstance(rec, str) else json.dumps(rec))
+            fh.write("\n")
+
+
+def _tail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _BrainThoughtTail:
+    monkeypatch.setattr(
+        "agent_bridge.adapters.antigravity.agy_brain_root", lambda: tmp_path / "brain"
+    )
+    return _BrainThoughtTail(BRAIN_SESSION, tmp_path)
+
+
+def _thought_texts(home: Path, session_id: str = BRAIN_SESSION) -> list[str]:
+    return [
+        e["data"]["text"]
+        for e in read_events(session_id, home)
+        if e["type"] == "thought_chunk"
+    ]
+
+
+def test_classify_event_thought_shapes():
+    step = {"step_type": "thought", "thinking": "hmm"}
+    et, data = classify_event({"step_update": step}, step, "thought", "step_update", "", None)
+    assert et == "thought_chunk" and data == {"text": "hmm"}
+
+    obj = {"event": "reasoning", "reasoning": "top level"}
+    et, data = classify_event(obj, {}, "", "reasoning", "", None)
+    assert et == "thought_chunk" and data == {"text": "top level"}
+
+    # Checkpoints without text stay raw.
+    step = {"step_type": "checkpoint", "step_index": 4, "state": "DONE"}
+    et, _ = classify_event({"step_update": step}, step, "checkpoint", "step_update", "", None)
+    assert et == "raw"
+
+
+def test_classify_event_thought_with_text_delta_is_not_answer_text():
+    """A thought/reasoning record carrying text_delta must classify as a
+    thought — the generic `or chunk` branch used to swallow it and leak the
+    reasoning into the assistant's answer text."""
+    step = {"step_type": "thought", "text_delta": "streamed reasoning"}
+    et, data = classify_event(
+        {"event": "step_update", "step_update": step},
+        step,
+        "thought",
+        "step_update",
+        "streamed reasoning",
+        None,
+    )
+    assert et == "thought_chunk" and data == {"text": "streamed reasoning"}
+
+    step = {"step_type": "reasoning", "text_delta": "delta thinking"}
+    et, data = classify_event(
+        {"step_update": step}, step, "reasoning", "step_update", "delta thinking", None
+    )
+    assert et == "thought_chunk" and data == {"text": "delta thinking"}
+
+    obj = {"event": "thought", "text_delta": "top-level delta"}
+    et, data = classify_event(obj, {}, "", "thought", "top-level delta", None)
+    assert et == "thought_chunk" and data == {"text": "top-level delta"}
+
+
+def test_brain_tail_new_conversation_reads_existing_and_appends(tmp_path, monkeypatch):
+    tail = _tail(tmp_path, monkeypatch)
+    path = _brain_path(tmp_path / "brain", "conv-new")
+    _append_brain(
+        path,
+        {"type": "PLANNER_RESPONSE", "thinking": "thought one"},
+        {"type": "PLANNER_RESPONSE", "thinking": "thought two"},
+    )
+    # Bound after the file already has content: a fresh conversation owns it.
+    tail.bind("conv-new", resumed=False)
+    tail.drain()
+    assert _thought_texts(tmp_path) == ["thought one", "thought two"]
+
+    _append_brain(path, {"type": "PLANNER_RESPONSE", "thinking": "thought three"})
+    tail.drain()
+    assert _thought_texts(tmp_path) == ["thought one", "thought two", "thought three"]
+
+    tail.drain()  # no new bytes -> nothing re-emitted
+    assert _thought_texts(tmp_path) == ["thought one", "thought two", "thought three"]
+
+
+def test_brain_tail_resumed_starts_at_pre_turn_boundary(tmp_path, monkeypatch):
+    tail = _tail(tmp_path, monkeypatch)
+    path = _brain_path(tmp_path / "brain", "conv-old")
+    _append_brain(path, {"type": "PLANNER_RESPONSE", "thinking": "prior turn thought"})
+    tail.bind("conv-old", resumed=True)
+    tail.drain()
+    assert _thought_texts(tmp_path) == []
+
+    _append_brain(path, {"type": "PLANNER_RESPONSE", "thinking": "this turn thought"})
+    tail.drain()
+    assert _thought_texts(tmp_path) == ["this turn thought"]
+
+
+def test_brain_tail_resumed_missing_log_snaps_first_available_eof(tmp_path, monkeypatch):
+    """A resumed bind that finds no readable log must not replay from byte 0
+    when the file appears later. The boundary is deferred: the first drain
+    that can stat the file snaps to its EOF — records already on disk are
+    skipped, only subsequent appends belong to this turn."""
+    tail = _tail(tmp_path, monkeypatch)
+    tail.bind("conv-missing", resumed=True)  # brain dir never created
+    tail.drain()
+    assert _thought_texts(tmp_path) == []
+
+    # The log appears already populated (archived history, delayed mount):
+    # none of it is this turn's thinking.
+    path = _brain_path(tmp_path / "brain", "conv-missing")
+    _append_brain(path, {"type": "PLANNER_RESPONSE", "thinking": "prior turn thought"})
+    tail.drain()
+    assert _thought_texts(tmp_path) == []
+
+    tail.bind("conv-other", resumed=False)  # second bind is ignored
+    _append_brain(path, {"type": "PLANNER_RESPONSE", "thinking": "appeared mid-turn"})
+    tail.drain()
+    assert _thought_texts(tmp_path) == ["appeared mid-turn"]
+
+
+def test_brain_tail_skips_malformed_and_non_thinking_records(tmp_path, monkeypatch):
+    tail = _tail(tmp_path, monkeypatch)
+    path = _brain_path(tmp_path / "brain", "conv-m")
+    _append_brain(
+        path,
+        "not json at all",
+        "[1, 2, 3]",
+        '"just a string"',
+        {"type": "TOOL_CALL", "thinking": "wrong record type"},
+        {"type": "PLANNER_RESPONSE"},
+        {"type": "PLANNER_RESPONSE", "thinking": 42},
+        {"type": "PLANNER_RESPONSE", "thinking": ""},
+        {"type": "PLANNER_RESPONSE", "thinking": "   "},
+        {"type": "PLANNER_RESPONSE", "thinking": "real", "tool_calls": [{"name": "x"}]},
+    )
+    tail.bind("conv-m", resumed=False)
+    tail.drain()
+    assert _thought_texts(tmp_path) == ["real"]
+
+
+def test_brain_tail_partial_line_waits_for_completion(tmp_path, monkeypatch):
+    tail = _tail(tmp_path, monkeypatch)
+    path = _brain_path(tmp_path / "brain", "conv-p")
+    rec = json.dumps({"type": "PLANNER_RESPONSE", "thinking": "completed later"})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(rec[: len(rec) // 2], encoding="utf-8")  # half a line, no \n
+    tail.bind("conv-p", resumed=False)
+    tail.drain()
+    assert _thought_texts(tmp_path) == []
+
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(rec[len(rec) // 2 :] + "\n")
+    tail.drain()
+    assert _thought_texts(tmp_path) == ["completed later"]
+
+
+def test_brain_tail_dedup_is_source_and_count_aware(tmp_path, monkeypatch):
+    """Offset progression already gives exactly-once within the log, so text
+    dedup must only pair occurrences ACROSS sources: two distinct brain
+    records with identical text both survive, while one logical thought
+    seen on stdout and in the log emits once."""
+    tail = _tail(tmp_path, monkeypatch)
+    path = _brain_path(tmp_path / "brain", "conv-d")
+    _append_brain(
+        path,
+        {"type": "PLANNER_RESPONSE", "thinking": "same"},
+        {"type": "PLANNER_RESPONSE", "thinking": "same"},
+    )
+    tail.bind("conv-d", resumed=False)
+    tail.drain()
+    assert _thought_texts(tmp_path) == ["same", "same"]
+
+    # stdout-first pairing: the stdout occurrence stands, the brain twin
+    # arriving later is the duplicate.
+    assert tail.note_stdout("from stdout") is True
+    _append_brain(path, {"type": "PLANNER_RESPONSE", "thinking": "from stdout"})
+    tail.drain()
+    assert _thought_texts(tmp_path) == ["same", "same"]
+
+    # brain-first pairing: a stdout report of an already-emitted brain text
+    # is suppressed the other direction.
+    _append_brain(path, {"type": "PLANNER_RESPONSE", "thinking": "brain first"})
+    tail.drain()
+    assert _thought_texts(tmp_path) == ["same", "same", "brain first"]
+    assert tail.note_stdout("brain first") is False
+
+    # A further distinct brain record repeating that text still emits —
+    # counts, not membership, decide duplication.
+    _append_brain(path, {"type": "PLANNER_RESPONSE", "thinking": "brain first"})
+    tail.drain()
+    assert _thought_texts(tmp_path) == ["same", "same", "brain first", "brain first"]
+
+
+def test_brain_tail_never_writes_under_brain_root(tmp_path, monkeypatch):
+    tail = _tail(tmp_path, monkeypatch)
+    path = _brain_path(tmp_path / "brain", "conv-ro")
+    _append_brain(path, {"type": "PLANNER_RESPONSE", "thinking": "read me"})
+    before = path.read_bytes()
+    tail.bind("conv-ro", resumed=False)
+    tail.drain()
+    tail.drain()
+    assert path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_brain_watcher_drains_until_cancelled(tmp_path, monkeypatch):
+    brain = tmp_path / "brain"
+    monkeypatch.setattr("agent_bridge.adapters.antigravity.agy_brain_root", lambda: brain)
+    monkeypatch.setattr("agent_bridge.adapters.antigravity.BRAIN_POLL_SEC", 0.02)
+    adapter = AgyAdapter(
+        AgentConfig(name="antigravity", protocol="agy", command=["agy"]),
+        tmp_path,
+    )
+    tail = _BrainThoughtTail("sess_bw", tmp_path)
+    tail.bind("conv-w", resumed=False)
+    watcher = asyncio.create_task(adapter._watch_brain(tail))
+    try:
+        _append_brain(
+            _brain_path(brain, "conv-w"),
+            {"type": "PLANNER_RESPONSE", "thinking": "live thought"},
+        )
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if _thought_texts(tmp_path, "sess_bw"):
+                break
+        assert _thought_texts(tmp_path, "sess_bw") == ["live thought"]
+    finally:
+        watcher.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await watcher
 
 
 @pytest.mark.asyncio

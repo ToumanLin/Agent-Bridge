@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -196,11 +197,15 @@ def test_maybe_open_dashboard_attempt_debounce(tmp_path, threads):
 # Bridge instance launched it. On Windows that requires escaping the Job
 # Object the agent host put this Bridge into — DETACHED_PROCESS and
 # CREATE_NEW_PROCESS_GROUP cannot do that — so CREATE_BREAKAWAY_FROM_JOB is
-# attempted first and the old flags remain a retry. Popen is stubbed; no
-# real process is ever spawned.
+# attempted first. A job without JOB_OBJECT_LIMIT_BREAKAWAY_OK refuses it
+# with ERROR_ACCESS_DENIED, and an ordinary in-job Popen would still die
+# with Bridge, so the refused path is brokered through WMI
+# (Win32_Process.Create runs the new process under the WMI service, outside
+# the job). Popen and subprocess.run are stubbed; nothing is ever spawned.
 
 _WIN32_BASE_FLAGS = 0x200 | 0x8  # CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
 _WIN32_BREAKAWAY = 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
+_WIN32_NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
 
 
 def _as_platform(monkeypatch, platform):
@@ -211,6 +216,7 @@ def _as_platform(monkeypatch, platform):
         monkeypatch.setattr(dl.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
         monkeypatch.setattr(dl.subprocess, "DETACHED_PROCESS", 0x8, raising=False)
         monkeypatch.setattr(dl.subprocess, "CREATE_BREAKAWAY_FROM_JOB", _WIN32_BREAKAWAY, raising=False)
+        monkeypatch.setattr(dl.subprocess, "CREATE_NO_WINDOW", _WIN32_NO_WINDOW, raising=False)
 
 
 def _stub_spawn(tmp_path, monkeypatch, fail_times=0):
@@ -236,6 +242,20 @@ def _stub_spawn(tmp_path, monkeypatch, fail_times=0):
     return calls
 
 
+def _stub_broker(monkeypatch, returncode=0, stdout="4321\r\n", stderr="", raises=None):
+    """Record ``subprocess.run`` calls — the WMI broker invocation."""
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kw):
+        calls.append({"argv": list(cmd), **kw})
+        if raises is not None:
+            raise raises
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(dl.subprocess, "run", fake_run)
+    return calls
+
+
 def test_launch_windows_breaks_out_of_host_job(tmp_path, monkeypatch):
     """Detached flags alone keep the dashboard inside the host's Job Object,
     so it dies when the launching Bridge exits; breakaway leaves the job."""
@@ -247,26 +267,150 @@ def test_launch_windows_breaks_out_of_host_job(tmp_path, monkeypatch):
     assert call["creationflags"] == _WIN32_BASE_FLAGS | _WIN32_BREAKAWAY
     assert "start_new_session" not in call
     assert call["stdin"] is dl.subprocess.DEVNULL
-    assert call["argv"] == [dl.sys.executable, str(tmp_path / "dashboard.py"), "--port", "8787", "--dir", str(tmp_path)]
+    assert call["argv"] == [
+        dl.sys.executable,
+        str(tmp_path / "dashboard.py"),
+        "--port",
+        "8787",
+        "--dir",
+        str(tmp_path.resolve()),
+    ]
 
 
-def test_launch_windows_retries_inside_job_when_breakaway_refused(tmp_path, monkeypatch):
+def test_launch_windows_brokers_when_breakaway_refused(tmp_path, monkeypatch):
     """A job without JOB_OBJECT_LIMIT_BREAKAWAY_OK fails CreateProcess with
-    ERROR_ACCESS_DENIED; relaunch with the previous flags, not an error."""
+    ERROR_ACCESS_DENIED. An in-job retry would still die with Bridge, so the
+    launch is brokered through WMI instead — never a second plain Popen."""
     _as_platform(monkeypatch, "win32")
     calls = _stub_spawn(tmp_path, monkeypatch, fail_times=1)
+    broker = _stub_broker(monkeypatch)
     assert dl._launch(tmp_path, "127.0.0.1", 8787) is True
-    assert [c["creationflags"] for c in calls] == [
-        _WIN32_BASE_FLAGS | _WIN32_BREAKAWAY,
-        _WIN32_BASE_FLAGS,
-    ]
+    assert [c["creationflags"] for c in calls] == [_WIN32_BASE_FLAGS | _WIN32_BREAKAWAY]
+    assert len(broker) == 1
+    ps = broker[0]
+    assert ps["argv"][0].lower().endswith("powershell.exe")
+    assert ps["argv"][-2] == "-Command"
+    assert ps["argv"][-1] == dl._BROKER_PS
+
+
+def test_launch_windows_broker_quotes_paths_safely(tmp_path, monkeypatch):
+    """The WMI command line is a single Win32 string: list2cmdline quoting
+    must carry spaces and shell metacharacters verbatim, and it reaches
+    PowerShell through the environment block — never interpolated into the
+    -Command script — so no path can inject into the broker."""
+    _as_platform(monkeypatch, "win32")
+    home = tmp_path / "home dir & 'quotes'"
+    home.mkdir()
+    _stub_spawn(home, monkeypatch, fail_times=1)
+    broker = _stub_broker(monkeypatch)
+    assert dl._launch(home, "127.0.0.1", 8787) is True
+    ps = broker[0]
+    log_path = home.resolve() / "logs" / "dashboard.log"
+    argv = [dl.sys.executable, str(home / "dashboard.py"), "--port", "8787", "--dir", str(home.resolve())]
+    expected = dl.subprocess.list2cmdline([dl.sys.executable, "-c", dl._BROKER_STUB, str(log_path), *argv[1:]])
+    assert ps["env"][dl._BROKER_CMD_ENV] == expected
+    assert ps["env"][dl._BROKER_CWD_ENV] == str(log_path.parent)
+    assert os.path.isabs(ps["env"][dl._BROKER_CWD_ENV])
+    assert f'"{home.resolve()}"' in expected
+
+
+def test_launch_windows_broker_runs_hidden(tmp_path, monkeypatch):
+    """The PowerShell broker must not flash a window or prompt: it runs with
+    CREATE_NO_WINDOW, -NonInteractive, and -WindowStyle Hidden."""
+    _as_platform(monkeypatch, "win32")
+    _stub_spawn(tmp_path, monkeypatch, fail_times=1)
+    broker = _stub_broker(monkeypatch)
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is True
+    ps = broker[0]
+    assert ps["creationflags"] == _WIN32_NO_WINDOW
+    assert "-NonInteractive" in ps["argv"]
+    assert "-NoProfile" in ps["argv"]
+    assert ps["argv"][ps["argv"].index("-WindowStyle") + 1] == "Hidden"
+    assert ps["stdin"] is dl.subprocess.DEVNULL
+
+
+def test_launch_windows_broker_failure_returns_false(tmp_path, monkeypatch):
+    """A brokered launch WMI refused (nonzero exit) is a launch failure:
+    report it, never claim success — and never fall back to an in-job Popen."""
+    _as_platform(monkeypatch, "win32")
+    calls = _stub_spawn(tmp_path, monkeypatch, fail_times=1)
+    _stub_broker(monkeypatch, returncode=8, stderr="Unknown failure")
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is False
+    assert [c["creationflags"] for c in calls] == [_WIN32_BASE_FLAGS | _WIN32_BREAKAWAY]
+
+
+def test_launch_windows_broker_exception_returns_false(tmp_path, monkeypatch):
+    """A broker that cannot even answer (missing powershell.exe, WMI down,
+    timeout) is likewise a reported launch failure, not a silent retry."""
+    _as_platform(monkeypatch, "win32")
+    calls = _stub_spawn(tmp_path, monkeypatch, fail_times=1)
+    _stub_broker(monkeypatch, raises=dl.subprocess.TimeoutExpired("powershell.exe", 30))
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is False
+    assert [c["creationflags"] for c in calls] == [_WIN32_BASE_FLAGS | _WIN32_BREAKAWAY]
+
+
+def test_launch_windows_broker_zero_exit_no_pid_returns_false(tmp_path, monkeypatch):
+    """A broker that exits 0 without printing a PID — e.g. a CIM exception
+    reported only on stderr — is a reported launch failure, never a claimed
+    success (and never an in-job Popen retry)."""
+    _as_platform(monkeypatch, "win32")
+    calls = _stub_spawn(tmp_path, monkeypatch, fail_times=1)
+    _stub_broker(monkeypatch, returncode=0, stdout="", stderr="Invoke-CimMethod : CimException: winmgmt stopped")
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is False
+    assert [c["creationflags"] for c in calls] == [_WIN32_BASE_FLAGS | _WIN32_BREAKAWAY]
+
+
+@pytest.mark.parametrize("stdout", ["garbage", "1234 5678", "ProcessId=4321", "0", " \r\n "])
+def test_launch_windows_broker_invalid_pid_returns_false(tmp_path, monkeypatch, stdout):
+    """Exit-0 output that is not exactly one positive decimal PID —
+    nonnumeric text, multiple tokens, a nonpositive number, or whitespace —
+    cannot confirm the WMI create and must fail the launch."""
+    _as_platform(monkeypatch, "win32")
+    calls = _stub_spawn(tmp_path, monkeypatch, fail_times=1)
+    _stub_broker(monkeypatch, returncode=0, stdout=stdout, stderr="broker diagnostics")
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is False
+    assert [c["creationflags"] for c in calls] == [_WIN32_BASE_FLAGS | _WIN32_BREAKAWAY]
+
+
+@pytest.mark.parametrize("stdout", ["4321\r\n", "  9876 \n", "42"])
+def test_launch_windows_broker_valid_pid_succeeds(tmp_path, monkeypatch, stdout):
+    """A single positive decimal PID on stdout confirms the WMI-created
+    process; surrounding whitespace is harmless."""
+    _as_platform(monkeypatch, "win32")
+    _stub_spawn(tmp_path, monkeypatch, fail_times=1)
+    _stub_broker(monkeypatch, returncode=0, stdout=stdout)
+    assert dl._launch(tmp_path, "127.0.0.1", 8787) is True
+
+
+def test_launch_windows_broker_relative_home_gets_absolute_cwd(tmp_path, monkeypatch):
+    """Win32_Process.Create rejects a relative CurrentDirectory (WMI
+    ReturnValue 8). A relative ``home`` must still broker with an absolute
+    CWD, and the log/--dir paths inside the brokered command line must be
+    absolute too — the session-0 child resolves relative paths against its
+    own working directory, not this Bridge's."""
+    _as_platform(monkeypatch, "win32")
+    monkeypatch.chdir(tmp_path)
+    home = Path("rel home & stuff")
+    calls = _stub_spawn(tmp_path, monkeypatch, fail_times=1)
+    broker = _stub_broker(monkeypatch)
+    assert dl._launch(home, "127.0.0.1", 8787) is True
+    assert [c["creationflags"] for c in calls] == [_WIN32_BASE_FLAGS | _WIN32_BREAKAWAY]
+    ps = broker[0]
+    cwd = ps["env"][dl._BROKER_CWD_ENV]
+    assert os.path.isabs(cwd)
+    log_path = (home / "logs" / "dashboard.log").resolve()
+    assert cwd == str(log_path.parent)
+    argv = [str(tmp_path / "dashboard.py"), "--port", "8787", "--dir", str(home.resolve())]
+    expected = dl.subprocess.list2cmdline([dl.sys.executable, "-c", dl._BROKER_STUB, str(log_path), *argv])
+    assert ps["env"][dl._BROKER_CMD_ENV] == expected
 
 
 def test_launch_windows_failure_returns_false(tmp_path, monkeypatch):
     _as_platform(monkeypatch, "win32")
     calls = _stub_spawn(tmp_path, monkeypatch, fail_times=99)
+    _stub_broker(monkeypatch, raises=OSError("powershell.exe missing"))
     assert dl._launch(tmp_path, "127.0.0.1", 8787) is False
-    assert len(calls) == 2  # breakaway attempt + one fallback, never a third
+    assert len(calls) == 1  # the refused breakaway attempt; never an in-job retry
 
 
 def test_launch_windows_without_breakaway_constant(tmp_path, monkeypatch):

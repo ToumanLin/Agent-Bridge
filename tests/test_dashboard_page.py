@@ -2093,7 +2093,7 @@ def test_presence_and_client_state(dash):
 def test_presence_survives_throttled_heartbeat(monkeypatch):
     """A hidden tab's ~60s intensive-throttle cadence must never expire the
     lease between beats; a genuinely gone client still expires past the TTL."""
-    assert dashboard.PRESENCE_TTL >= 120.0  # spans a fully missed 60s wake-up
+    assert dashboard.PRESENCE_TTL == 180.0  # spans a fully missed 60s wake-up
     clock = [1000.0]
     monkeypatch.setattr(dashboard.time, "monotonic", lambda: clock[0])
     dashboard.PRESENCE.clear()
@@ -2103,6 +2103,8 @@ def test_presence_survives_throttled_heartbeat(monkeypatch):
         assert dashboard.presence_count() == 1  # throttled beat still alive
         clock[0] += 60
         assert dashboard.presence_count() == 1  # one missed wake-up tolerated
+        clock[0] += 60
+        assert dashboard.presence_count() == 1  # second missed wake-up still in lease
         clock[0] += dashboard.PRESENCE_TTL
         assert dashboard.presence_count() == 0  # stale presence expires
         dashboard.presence_update("tab", False)
@@ -2137,8 +2139,10 @@ def test_presence_heartbeat_lifecycle():
     for ev in ('"pageshow"', '"focus"', '"online"', '"visibilitychange"', '"pagehide"'):
         assert f"addEventListener({ev}" in js
     assert "sendBeacon" in js
-    # The lease must comfortably outlive the throttled cadence: TTL >= 2x the
-    # ~60s Chrome intensive-throttle bucket, beat interval far under the TTL.
-    assert dashboard.PRESENCE_TTL >= 120.0
+    # The lease must comfortably outlive the throttled cadence: TTL spans 3x
+    # the ~60s Chrome intensive-throttle bucket, beat interval far under it.
+    assert dashboard.PRESENCE_TTL == 180.0
     ms = int(re.search(r"setInterval\(\(\)=>ping\(0\),(\d+)\)", js).group(1))
+    assert ms == 15000
+    # Safety invariant: >= 10 heartbeat opportunities per lease at cadence.
     assert ms * 10 <= dashboard.PRESENCE_TTL * 1000
