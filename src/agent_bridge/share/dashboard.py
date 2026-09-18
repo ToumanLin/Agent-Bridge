@@ -50,9 +50,10 @@ PRESENCE_LOCK = threading.Lock()
 # Chrome/Edge intensively throttle hidden-tab timers to ~one wake-up per
 # minute (and sleeping/frozen tabs can miss one entirely), so the lease must
 # span well over 60s or a backgrounded tab expires between beats and the
-# bridge opens a duplicate. 150s covers a fully missed wake-up plus jitter;
-# a genuinely closed tab still leaves promptly via the pagehide beacon.
-PRESENCE_TTL = 150.0
+# bridge opens a duplicate. 180s spans two fully missed 60s wake-ups plus
+# jitter; a genuinely closed tab still leaves promptly via the pagehide
+# beacon.
+PRESENCE_TTL = 180.0
 
 
 def presence_update(client_id, bye):

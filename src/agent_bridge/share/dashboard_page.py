@@ -478,7 +478,7 @@ function ping(bye){
   if(bye){try{navigator.sendBeacon(`/api/presence?id=${clientId}&bye=1`)}catch(e){}}
   else fetch(`/api/presence?id=${clientId}`).catch(()=>{});
 }
-ping(0);setInterval(()=>ping(0),4000);
+ping(0);setInterval(()=>ping(0),15000);
 addEventListener("pagehide",()=>ping(1));
 // A throttled/frozen interval can lag ~60s; re-register as soon as the tab
 // runs again (bfcache restore or reload, resurfacing, network recovery).

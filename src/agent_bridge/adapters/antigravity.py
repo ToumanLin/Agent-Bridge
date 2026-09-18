@@ -6,6 +6,7 @@ import json
 import logging
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -366,6 +367,17 @@ def classify_event(
     """
     if event == "init":
         return "raw", {}
+    # Explicit thought/reasoning shapes classify before the generic chunk
+    # rule: a thinking record may carry text_delta, and letting `or chunk`
+    # win would leak reasoning into the assistant's answer text.
+    if step_type in {"checkpoint", "thought", "reasoning"} or event in {"thought", "reasoning"}:
+        text = _first_text(
+            step, obj, keys=("text", "text_delta", "thought", "thinking", "reasoning", "summary")
+        )
+        if text:
+            return "thought_chunk", {"text": text}
+        if step_type == "checkpoint":
+            return "raw", {}
     if step_type == "agent_response" or chunk:
         if chunk:
             return "message_chunk", {"text": chunk}
@@ -375,10 +387,160 @@ def classify_event(
     if step_type == "error_message":
         text = _first_text(step, obj, keys=("error", "text", "message", "text_delta", "detail"))
         return ("error", {"error": text}) if text else ("raw", {})
-    if step_type == "checkpoint" or event in {"thought", "reasoning"}:
-        text = _first_text(step, obj, keys=("text", "text_delta", "thought", "reasoning", "summary"))
-        return ("thought_chunk", {"text": text}) if text else ("raw", {})
     return "raw", {}
+
+
+# --- brain-transcript thought collection --------------------------------------
+#
+# agy's stdout stream-json never carries thinking text — only the
+# usage.thinking_tokens counter. The full strings land in the conversation's
+# private brain log at
+#   ~/.gemini/antigravity-cli/brain/<cid>/.system_generated/logs/transcript_full.jsonl
+# on type="PLANNER_RESPONSE" records in the string field "thinking". The tail
+# below reads that file for the span of one turn and re-emits each new string
+# as an ordinary thought_chunk so the existing dashboard pipeline renders it.
+# It is strictly observational: nothing under ~/.gemini is created, written,
+# truncated, or locked, and no failure here may fail the turn.
+
+BRAIN_POLL_SEC = 0.4
+BRAIN_DRAIN_GRACE_SEC = 0.3
+
+
+def agy_brain_root() -> Path:
+    return Path.home() / ".gemini" / "antigravity-cli" / "brain"
+
+
+def agy_brain_log(conversation_id: str) -> Path:
+    return (
+        agy_brain_root()
+        / conversation_id
+        / ".system_generated"
+        / "logs"
+        / "transcript_full.jsonl"
+    )
+
+
+class _BrainThoughtTail:
+    """Read-only, turn-scoped tail of one conversation's brain log.
+
+    ``bind`` fixes the file and the pre-turn boundary: a resumed conversation
+    snapshots the current end of file (called before agy launches) so earlier
+    turns are never replayed; a new conversation owns the whole file, even
+    the part written before the stdout init revealed the id.
+    """
+
+    def __init__(self, session_id: str, home: Path) -> None:
+        self.session_id = session_id
+        self._home = home
+        self._path: Path | None = None
+        self._offset = 0
+        self._partial = b""
+        # A resumed turn whose log is not yet readable keeps a pending
+        # boundary: the first drain that can stat the file snaps to its EOF
+        # instead of replaying earlier turns from byte 0.
+        self._resumed_pending = False
+        # Occurrence counts per thought text, per source. A logical thought
+        # can surface both on stdout and in the brain log, so dedup pairs
+        # occurrences across sources rather than collapsing identical text:
+        # the nth record from one source is a duplicate only while it does
+        # not outnumber the other source's count. Two distinct brain records
+        # with identical text each emit; a stdout/brain pair emits once.
+        self._from_stdout: Counter[str] = Counter()
+        self._from_brain: Counter[str] = Counter()
+
+    @property
+    def bound(self) -> bool:
+        return self._path is not None
+
+    def bind(self, conversation_id: str, *, resumed: bool) -> None:
+        if self._path is not None:
+            return
+        self._path = agy_brain_log(conversation_id)
+        if resumed:
+            try:
+                self._offset = self._path.stat().st_size
+            except OSError:
+                self._resumed_pending = True
+
+    def note_stdout(self, text: Any) -> bool:
+        """Register a stdout-side thought text for cross-source dedup.
+
+        True when this occurrence is new and should be emitted; False when
+        the brain tail already delivered that logical thought.
+        """
+        if not isinstance(text, str) or not text:
+            return True
+        self._from_stdout[text] += 1
+        return self._from_stdout[text] > self._from_brain[text]
+
+    def drain(self) -> None:
+        """Emit thinking strings flushed since the last pass, in file order.
+
+        Missing files, partial tail lines, malformed records, and IO errors
+        are skipped — nothing here may raise into the turn.
+        """
+        path = self._path
+        if path is None:
+            return
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        if self._resumed_pending:
+            # First readable observation of a resumed log: bytes already on
+            # disk predate this turn, so the boundary lands at EOF and only
+            # later appends are read.
+            self._resumed_pending = False
+            self._offset = size
+            self._partial = b""
+            return
+        if size < self._offset:
+            # Rotated or truncated mid-turn. Skipping to the new EOF avoids
+            # replaying earlier turns' thinking from a rewritten file.
+            self._offset = size
+            self._partial = b""
+            return
+        if size == self._offset:
+            return
+        try:
+            with path.open("rb") as fh:
+                fh.seek(self._offset)
+                blob = fh.read()
+        except OSError:
+            return
+        self._offset += len(blob)
+        lines = (self._partial + blob).split(b"\n")
+        self._partial = lines.pop()
+        for raw in lines:
+            self._record(raw)
+
+    def _record(self, raw: bytes) -> None:
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(rec, dict) or rec.get("type") != "PLANNER_RESPONSE":
+            return
+        thinking = rec.get("thinking")
+        if not isinstance(thinking, str) or not thinking.strip():
+            return
+        self._from_brain[thinking] += 1
+        if self._from_brain[thinking] <= self._from_stdout[thinking]:
+            # stdout already delivered this logical thought.
+            return
+        try:
+            append_event(self.session_id, "thought_chunk", {"text": thinking}, self._home)
+        except Exception:
+            log.debug("thought_chunk persist failed for %s", self.session_id, exc_info=True)
+
+    async def finish(self) -> None:
+        """Post-exit passes so a flush landing as agy dies is still caught."""
+        if self._path is None:
+            return
+        self.drain()
+        if BRAIN_DRAIN_GRACE_SEC > 0:
+            await asyncio.sleep(BRAIN_DRAIN_GRACE_SEC)
+            self.drain()
 
 
 class AgyAdapter(Adapter):
@@ -427,6 +589,54 @@ class AgyAdapter(Adapter):
             self.agent.print_timeout or "120m",
         ]
         return cmd
+
+    async def _watch_brain(self, thoughts: _BrainThoughtTail) -> None:
+        """Poll the brain log so thoughts interleave with tool/answer events
+        instead of collapsing to the end of the turn."""
+        while True:
+            try:
+                thoughts.drain()
+            except Exception:
+                log.debug("agy brain drain failed for %s", thoughts.session_id, exc_info=True)
+            await asyncio.sleep(BRAIN_POLL_SEC)
+
+    async def _spawn(
+        self, cmd: list[str], env: dict[str, str], cwd: str | None, kwargs: dict[str, Any]
+    ) -> asyncio.subprocess.Process:
+        """Create the agy subprocess under cancellation-safe ownership.
+
+        ``create_subprocess_exec`` is itself a coroutine: a cancel delivered
+        mid-spawn can leave a live child whose ``Process`` handle was never
+        returned. Running the spawn inside a shielded task keeps the handle
+        recoverable so the child is reaped instead of orphaned.
+        """
+        spawn = asyncio.ensure_future(
+            asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=cwd,
+                limit=STDIO_LIMIT,
+                **kwargs,
+            )
+        )
+        try:
+            return await asyncio.shield(spawn)
+        except asyncio.CancelledError:
+            proc: asyncio.subprocess.Process | None = None
+            try:
+                # The shielded spawn keeps running; wait briefly for the OS
+                # to hand over the handle so the child can be reaped.
+                proc = await asyncio.wait_for(asyncio.shield(spawn), timeout=10)
+            except BaseException:
+                if not spawn.done():
+                    spawn.cancel()
+                elif not spawn.cancelled() and spawn.exception() is None:
+                    proc = spawn.result()
+            await reap_subprocess(proc)
+            raise
 
     async def _drain_stderr(self, proc: asyncio.subprocess.Process, session_id: str) -> str:
         if proc.stderr is None:
@@ -489,28 +699,14 @@ class AgyAdapter(Adapter):
             {"text": task.message, "cmd": cmd[:6], "task_id": task.task_id, "source": task.source},
             self.home,
         )
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            cwd=task.cwd or session.cwd,
-            limit=STDIO_LIMIT,
-            **kwargs,
-        )
-        self._procs[session.session_id] = proc
-        self._cancelled.discard(session.session_id)
-        if proc.pid:
-            record_pid(
-                self.home,
-                session.session_id,
-                proc.pid,
-                process_create_time(proc.pid),
-                process_image_name(proc.pid),
-            )
-        stderr_task = asyncio.create_task(self._drain_stderr(proc, session.session_id))
-        await self._write_prompt(proc, task.message)
+        # A resumed conversation's pre-turn boundary must be fixed before
+        # agy starts appending; a new conversation binds once its id arrives.
+        thoughts = _BrainThoughtTail(session.session_id, self.home)
+        if session.native_session_id:
+            thoughts.bind(session.native_session_id, resumed=True)
+        proc: asyncio.subprocess.Process | None = None
+        stderr_task: asyncio.Task[str] | None = None
+        brain_task: asyncio.Task[None] | None = None
         text_parts: list[str] = []
         conversation_id = session.native_session_id
         resumed = bool(session.native_session_id)
@@ -535,6 +731,23 @@ class AgyAdapter(Adapter):
             return [f"agy reported {mid_error_steps} mid-turn error step(s) before the turn ended"]
 
         try:
+            # The spawn itself is inside the ownership block: a cancel or
+            # error anywhere from here on still reaps the child and unwinds
+            # the watcher/stderr tasks in the finally below.
+            proc = await self._spawn(cmd, env, task.cwd or session.cwd, kwargs)
+            self._procs[session.session_id] = proc
+            self._cancelled.discard(session.session_id)
+            if proc.pid:
+                record_pid(
+                    self.home,
+                    session.session_id,
+                    proc.pid,
+                    process_create_time(proc.pid),
+                    process_image_name(proc.pid),
+                )
+            stderr_task = asyncio.create_task(self._drain_stderr(proc, session.session_id))
+            brain_task = asyncio.create_task(self._watch_brain(thoughts))
+            await self._write_prompt(proc, task.message)
             assert proc.stdout is not None
             while True:
                 line = await proc.stdout.readline()
@@ -555,6 +768,10 @@ class AgyAdapter(Adapter):
                 cid = conversation_id_of(obj)
                 if cid:
                     conversation_id = cid
+                    if not thoughts.bound:
+                        # New conversation: the whole brain file belongs to
+                        # this turn, even bytes flushed before this line.
+                        thoughts.bind(cid, resumed=False)
                 event = str(obj.get("event") or obj.get("type") or "")
                 raw_step = obj.get("step_update")
                 step: dict[str, Any] = raw_step if isinstance(raw_step, dict) else {}
@@ -563,6 +780,9 @@ class AgyAdapter(Adapter):
                     mid_error_steps += 1
                 chunk = text_delta_of(obj)
                 event_type, data = classify_event(obj, step, step_type, event, chunk, conversation_id)
+                if event_type == "thought_chunk" and not thoughts.note_stdout(data.get("text")):
+                    # The brain tail already delivered this logical thought.
+                    event_type, data = "raw", {}
                 if event_type == "message_chunk":
                     text_parts.append(chunk)
                 elif event_type in {"tool_call", "tool_call_update"}:
@@ -600,6 +820,7 @@ class AgyAdapter(Adapter):
                 log.warning("agy stdout closed but process lingered; killing %s", proc.pid)
                 await reap_subprocess(proc)
             stderr_tail = await stderr_task
+            await thoughts.finish()
             for note in mid_error_warnings():
                 append_event(session.session_id, "warning", {"error": note}, self.home)
             if session.session_id in self._cancelled:
@@ -709,6 +930,7 @@ class AgyAdapter(Adapter):
             )
         except asyncio.CancelledError:
             await reap_subprocess(proc)
+            thoughts.drain()
             for note in mid_error_warnings():
                 append_event(session.session_id, "warning", {"error": note}, self.home)
             append_event(
@@ -732,10 +954,16 @@ class AgyAdapter(Adapter):
             await reap_subprocess(proc)
             raise
         finally:
-            if not stderr_task.done():
-                stderr_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await stderr_task
+            if brain_task is not None:
+                if not brain_task.done():
+                    brain_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await brain_task
+            if stderr_task is not None:
+                if not stderr_task.done():
+                    stderr_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stderr_task
             self._procs.pop(session.session_id, None)
             self._cancelled.discard(session.session_id)
             drop_pid(self.home, session.session_id)
