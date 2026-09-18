@@ -243,18 +243,34 @@ body{margin:0;font:14px/1.5 var(--font-sans);background:var(--panel);color:var(-
 .chead .ctime{margin-left:auto;font-weight:400;color:var(--dimmer);font-size:11px}
 .card.prompt .chead{color:var(--accent)}
 .card.prompt.user{background:var(--accent-tint);border-left:3px solid var(--accent)}
-.card pre.ptext{white-space:pre-wrap;word-break:break-word;margin:0;
-  font:inherit;font-size:14px}
+.card .ptext{font-size:14px;word-break:break-word}
 .card:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .msg-body{font-size:14px}
-.msg-body pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;
-  padding:10px;overflow-x:auto;font:12.5px/1.5 var(--font-mono)}
-.msg-body code{font-family:var(--font-mono);background:var(--panel3);border-radius:4px;
+/* Shared markdown typography — .md sits on .ptext, .msg-body and the
+   thinking .body so all four timeline text kinds render identically. */
+.md{line-height:1.55;word-break:break-word}
+.md p{margin:6px 0}
+.md pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;
+  padding:10px;overflow-x:auto;font:12.5px/1.5 var(--font-mono);margin:8px 0}
+.md code{font-family:var(--font-mono);background:var(--panel3);border-radius:4px;
   padding:1px 5px;font-size:12.5px}
-.msg-body pre code{background:none;padding:0}
-.msg-body h1,.msg-body h2,.msg-body h3,.msg-body h4{margin:12px 0 6px;font-size:15px}
-.msg-body ul,.msg-body ol{margin:6px 0;padding-left:22px}
-.msg-body p{margin:6px 0}
+.md pre code{background:none;padding:0}
+.md h1,.md h2,.md h3,.md h4,.md h5,.md h6{margin:12px 0 6px;font-size:15px}
+.md ul,.md ol{margin:6px 0;padding-left:22px}
+.md ul ul,.md ul ol,.md ol ul,.md ol ol{margin:2px 0}
+.md li{margin:2px 0}
+.md li.task{list-style:none}
+.md li.task input{margin:0 6px 0 0}
+.md blockquote{border-left:3px solid var(--border);margin:8px 0;
+  padding:2px 0 2px 12px;color:var(--dim)}
+.md hr{border:none;border-top:1px solid var(--border);margin:12px 0}
+.md a{color:var(--accent);text-decoration:underline;text-underline-offset:2px}
+.md .table-wrap{overflow-x:auto;margin:8px 0}
+.md table{width:100%;border-collapse:collapse;font-size:13px}
+.md th,.md td{border:1px solid var(--border);padding:6px 9px;text-align:left;vertical-align:top}
+.md th{background:var(--panel2);font-weight:600}
+.md tr:nth-child(even) td{background:color-mix(in srgb,var(--panel2) 55%,transparent)}
+.md .al-c{text-align:center}.md .al-r{text-align:right}
 details.think{background:var(--panel);border:1px solid var(--border);border-radius:12px}
 details.think summary{list-style:none;display:flex;align-items:center;gap:8px;
   padding:11px 14px;cursor:pointer;font-size:12px;font-weight:600;color:var(--dim)}
@@ -265,7 +281,7 @@ details.think summary .chev .ic{color:var(--dimmer)}
 details.think[open] summary{border-bottom:1px solid var(--panel3)}
 details.think[open] summary .chev{transform:rotate(180deg)}
 details.think .body{padding:10px 14px 13px;color:var(--dim);font-size:13px;
-  white-space:pre-wrap;word-break:break-word}
+  word-break:break-word}
 summary:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;border-radius:12px}
 .toolgroup{background:var(--panel);border:1px solid var(--border);border-radius:12px;
   padding:4px 0}
@@ -1039,39 +1055,118 @@ function agentAvatar(s,size){
   return `<span class="subav-wrap${pulse}"><img class="subav subav-l" src="${v.l}"${a}<img class="subav subav-d" src="${v.d}"${a}</span>`;
 }
 
-/* ---------- minimal markdown ---------- */
+/* ---------- markdown ----------
+   Shared escape-first renderer for all four timeline text kinds (dispatched
+   prompt, user prompt, agent message, thinking). The entire source passes
+   through esc() before any structure is parsed, so model/user text can never
+   inject markup — the only tags emitted come from the templates below.
+   Generated code/link fragments are stashed behind \x00 placeholders so the
+   inline passes can't re-process them. Links are limited to
+   http(s)/mailto/local-file/root-relative/hash and always open in a new tab
+   without an opener. */
+const MD_URL=/^(?:https?:\/\/|mailto:|file:\/\/\/|\/(?!\/)|#)/i;
 function md(src){
-  const parts=String(src).split(/(```[\s\S]*?(?:```|$))/);
-  let out="";
-  for(let i=0;i<parts.length;i++){
-    let p=parts[i];
-    if(i%2===1){ // fenced code
-      const m=p.match(/^```(\w*)\n?([\s\S]*?)(?:```)?$/);
-      out+="<pre><code>"+esc(m?m[2]:p)+"</code></pre>";
-      continue;
+  const stash=[];
+  const keep=h=>{stash.push(h);return "\x00"+(stash.length-1)+"\x00"};
+  const unstash=s=>{let p;do{p=s;s=s.replace(/\x00(\d+)\x00/g,(m,i)=>stash[+i])}while(s!==p);return s};
+  const em=s=>s
+    .replace(/\*\*\*([^*\n]+)\*\*\*/g,"<b><i>$1</i></b>")
+    .replace(/\*\*([^*\n]+)\*\*/g,"<b>$1</b>")
+    .replace(/\*([^*\n]+)\*/g,"<i>$1</i>")
+    .replace(/(^|[^\w])__([^_\n]+)__/g,"$1<b>$2</b>")
+    .replace(/(^|[^\w])_([^_\n]+)_(?!\w)/g,"$1<i>$2</i>")
+    .replace(/~~([^~\n]+)~~/g,"<del>$1</del>");
+  const inline=s=>{
+    // Agent reports commonly emit `label` (`file:///path#L1-L2`) rather than
+    // bracket-link syntax. Collapse that citation into one clickable label.
+    s=s.replace(/`([^`\n]+)`\s+\(`(file:\/\/\/[^`\n]+)`\)/gi,(m,label,url)=>
+      keep(`<a class="file-link" href="${url}" target="_blank" rel="noopener noreferrer"><code>${label}</code></a>`));
+    s=s.replace(/`(file:\/\/\/[^`\n]+)`/gi,(m,url)=>
+      keep(`<a class="file-link" href="${url}" target="_blank" rel="noopener noreferrer"><code>${url}</code></a>`));
+    s=s.replace(/`([^`\n]+)`/g,(m,c)=>keep("<code>"+c+"</code>"));
+    s=s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g,(m,txt,url)=>MD_URL.test(url)
+      ?keep(`<a href="${url}" target="_blank" rel="noopener noreferrer">${em(txt)}</a>`)
+      :em(txt)+" (<code>"+url+"</code>)");
+    return unstash(em(s));
+  };
+  const tableRow=raw=>{
+    let s=raw.trim().replace(/^\\\|/,"|").replace(/\|\\$/,"|");
+    if(!s.includes("|"))return null;
+    const cells=[];let cell="";
+    for(let j=0;j<s.length;j++){
+      if(s[j]==="\\"&&s[j+1]==="|"){cell+="|";j++;continue}
+      if(s[j]==="|"){cells.push(cell.trim());cell=""}else cell+=s[j]
     }
-    p=esc(p);
-    p=p.replace(/`([^`\n]+)`/g,"<code>$1</code>");
-    const lines=p.split("\n"), buf=[];
-    let list=null;
-    const flushList=()=>{if(list){buf.push(`<${list}>`+listItems.join("")+`</${list}>`);list=null;listItems=[]}};
-    let listItems=[];
-    for(const ln of lines){
-      const h=ln.match(/^(#{1,4})\s+(.*)/);
-      const ul=ln.match(/^\s*[-*•]\s+(.*)/);
-      const ol=ln.match(/^\s*\d+[.)]\s+(.*)/);
-      if(h){flushList();buf.push(`<h${h[1].length}>${h[2]}</h${h[1].length}>`)}
-      else if(ul){if(list!=="ul"){flushList();list="ul"}listItems.push("<li>"+ul[1]+"</li>")}
-      else if(ol){if(list!=="ol"){flushList();list="ol"}listItems.push("<li>"+ol[1]+"</li>")}
-      else{flushList();buf.push(ln)}
+    cells.push(cell.trim());
+    if(s.startsWith("|"))cells.shift();
+    if(s.endsWith("|"))cells.pop();
+    return cells.length>1?cells:null;
+  };
+  const tableRule=c=>/^:?-{3,}:?$/.test(c.trim());
+  const tableAlign=c=>c.startsWith(":")&&c.endsWith(":")?"c":c.endsWith(":")?"r":"";
+  const blocks=arr=>{
+    const out=[];let para=[],stack=[],i=0;
+    const flushPara=()=>{if(para.length){
+      out.push("<p>"+inline(para.join("\n")).replace(/\n/g,"<br>")+"</p>");para=[]}};
+    const closeLists=()=>{while(stack.length)out.push("</li></"+stack.pop().t+">")};
+    while(i<arr.length){
+      const ln=arr[i++];let m;
+      if(m=ln.match(/^\s{0,3}```(.*)$/)){
+        flushPara();closeLists();
+        const lang=(m[1]||"").trim(),body=[];
+        while(i<arr.length&&!/^\s{0,3}```\s*$/.test(arr[i]))body.push(arr[i++]);
+        i++;
+        const safe=/^[A-Za-z0-9_+.#-]{1,30}$/.test(lang)?` class="language-${lang}"`:"";
+        out.push(`<pre><code${safe}>`+body.join("\n")+"</code></pre>");
+      }else if(/^\s*$/.test(ln)){flushPara();
+      }else if((m=tableRow(ln))&&i<arr.length){
+        const rule=tableRow(arr[i]);
+        if(rule&&rule.length===m.length&&rule.every(tableRule)){
+          flushPara();closeLists();i++;
+          const aligns=rule.map(tableAlign);
+          const cell=(tag,v,k)=>`<${tag}${aligns[k]?` class="al-${aligns[k]}"`:""}>${inline(v)}</${tag}>`;
+          let html="<div class=\"table-wrap\"><table><thead><tr>"+
+            m.map((v,k)=>cell("th",v,k)).join("")+"</tr></thead><tbody>";
+          while(i<arr.length){
+            const row=tableRow(arr[i]);if(!row)break;i++;
+            while(row.length<m.length)row.push("");
+            html+="<tr>"+row.slice(0,m.length).map((v,k)=>cell("td",v,k)).join("")+"</tr>";
+          }
+          out.push(html+"</tbody></table></div>");
+        }else para.push(ln);
+      }else if(m=ln.match(/^(#{1,6})\s+(.+?)\s*$/)){
+        flushPara();closeLists();
+        out.push(`<h${m[1].length}>`+inline(m[2].replace(/\s+#+$/,""))+`</h${m[1].length}>`);
+      }else if(/^\s*([-*_])(\s*\1){2,}\s*$/.test(ln)){
+        flushPara();closeLists();out.push("<hr>");
+      }else if(/^&gt;\s?/.test(ln)){
+        flushPara();closeLists();
+        const inner=[ln.replace(/^&gt;\s?/,"")];
+        while(i<arr.length){const q=arr[i].match(/^&gt;\s?([\s\S]*)$/);if(!q)break;inner.push(q[1]);i++}
+        out.push("<blockquote>"+blocks(inner)+"</blockquote>");
+      }else if(m=ln.match(/^(\s*)([-*+•]|\d+[.)])\s+([\s\S]+)$/)){
+        flushPara();
+        const indent=m[1].replace(/\t/g,"    ").length;
+        const tag=/^\d/.test(m[2])?"ol":"ul";
+        while(stack.length&&stack[stack.length-1].i>indent)out.push("</li></"+stack.pop().t+">");
+        if(!stack.length||stack[stack.length-1].i<indent){
+          const n=m[2].match(/^\d+/);
+          const st=tag==="ol"&&n&&n[0]!=="1"?` start="${n[0]}"`:"";
+          stack.push({i:indent,t:tag});out.push(`<${tag}${st}>`);
+        }else{
+          out.push("</li>");
+          if(stack[stack.length-1].t!==tag){out.push("</"+stack.pop().t+">");
+            stack.push({i:indent,t:tag});out.push(`<${tag}>`)}
+        }
+        const tk=m[3].match(/^\[( |x|X)\]\s+([\s\S]*)$/);
+        out.push(tk?`<li class="task"><input type="checkbox" disabled${tk[1]===" "?"":" checked"}> `+inline(tk[2])
+          :"<li>"+inline(m[3]));
+      }else{closeLists();para.push(ln)}
     }
-    flushList();
-    p=buf.join("\n");
-    p=p.replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>");
-    p=p.replace(/(^|\n)\s*\n/g,"\n").split(/\n{2,}/).map(x=>x.trim()?(/^<h|^<pre|^<ul|^<ol/.test(x)?x:"<p>"+x.replace(/\n/g,"<br>")+"</p>"):"").join("");
-    out+=p;
-  }
-  return out;
+    flushPara();closeLists();
+    return out.join("");
+  };
+  return blocks(esc(String(src).replace(/\x00/g,"").replace(/\r\n?/g,"\n")).split("\n"));
 }
 
 /* ---------- status / session helpers ---------- */
@@ -1520,7 +1615,7 @@ function thinkLabel(s){
 function flushBlocks(){
   for(const b of dirty){
     if(b.tagName==="DETAILS"){
-      b.querySelector(".body").textContent=b._text;
+      b.querySelector(".body").innerHTML=md(b._text);
       b.querySelector(".tlabel").textContent=thinkLabel(b._text);
     }else b.querySelector(".msg-body").innerHTML=md(b._text);
   }
@@ -1539,14 +1634,14 @@ function addPrompt(e){
   const d=document.createElement("div");d.className="block card prompt"+(user?" user":"");
   const long=e.text.length>900;
   d.innerHTML=`<div class="chead">${icon(user?"msg":"doc",15)}<span>${esc(t(user?"transcript.user_message":"transcript.dispatched_message"))}</span><span class="ctime">${esc(fmtTs(e.ts))}</span></div>
-    <pre class="ptext ${long?"clamp":""}">${esc(e.text)}</pre>`;
+    <div class="ptext md${long?" clamp":""}">${md(e.text)}</div>`;
   if(long){const x=document.createElement("button");x.type="button";x.className="expand";x.textContent=t("transcript.show_more");
-    x.onclick=()=>{d.querySelector("pre").classList.remove("clamp");x.remove()};d.appendChild(x)}
+    x.onclick=()=>{d.querySelector(".ptext").classList.remove("clamp");x.remove()};d.appendChild(x)}
   content.appendChild(d);
 }
 function msgBlock(ts){
   if(!curMsg){curMsg=document.createElement("div");curMsg.className="block card msg";
-    curMsg.innerHTML=`<div class="chead">${icon("msg",15)}<span>${esc(t("transcript.agent"))}</span><span class="ctime">${esc(fmtTs(ts))}</span></div><div class="msg-body"></div>`;
+    curMsg.innerHTML=`<div class="chead">${icon("msg",15)}<span>${esc(t("transcript.agent"))}</span><span class="ctime">${esc(fmtTs(ts))}</span></div><div class="msg-body md"></div>`;
     content.appendChild(curMsg);curMsg._text=""}
   curThink=null;curToolGroup=null;
   return curMsg;
@@ -1556,7 +1651,7 @@ function addMsg(e){
 }
 function addThink(e){
   if(!curThink){curThink=document.createElement("details");curThink.className="block think";
-    curThink.innerHTML=`<summary>${icon("sparkle",14)}<span class="tlabel">${esc(t("transcript.thinking"))}</span><span class="chev">${icon("chevron",13)}</span></summary><div class="body"></div>`;
+    curThink.innerHTML=`<summary>${icon("sparkle",14)}<span class="tlabel">${esc(t("transcript.thinking"))}</span><span class="chev">${icon("chevron",13)}</span></summary><div class="body md"></div>`;
     content.appendChild(curThink);curThink._text=""}
   curMsg=null;curToolGroup=null;
   curThink._text+=e.text;dirty.add(curThink);

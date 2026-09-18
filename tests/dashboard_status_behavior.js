@@ -10,7 +10,10 @@
 // rail bounds), the measured --railin scrollbar gutter, updateCurMark's 0.45
 // reference, the updateRulerWave focus crest, jumpToMark, wheel forwarding,
 // roving tabindex, and the MutationObserver/ResizeObserver + rAF-coalesced
-// update loop.
+// update loop. The tail covers the shared escape-first markdown renderer:
+// md() block/inline parsing, fenced-code language classes, the safe-link
+// allowlist and anchor hardening, all four timeline kinds routing through
+// it, and the prompt clamp/show-more control it feeds.
 //
 // Usage: node tests/dashboard_status_behavior.js   (exit 0 = all pass)
 "use strict";
@@ -225,7 +228,7 @@ vm.runInContext(
     " setLocalePref, applyLocale, rerenderLocale, ago, fmtTs, fmtNum," +
     " sendKey, sendErrState, SEND_ERR, setSendState, renderSendStatus," +
     " refreshComposer, toolKindLabel, stopReasonLabel, renderLive," +
-    " thinkLabel," +
+    " thinkLabel, md," +
     " weekStartMs, weekContrib, weekStats, renderWeek, livePartial," +
     " renderSidebar, renderSessionHeader," +
     " select, pollEvents, sendState," +
@@ -2117,6 +2120,151 @@ X._setLiveAll({});
   X.downloadTranscript();
   eq(blobs.length, blobCount, "no download without transcript events");
   X._setSelected("s1");
+
+  /* ================= markdown: one escape-first renderer for all kinds ====
+     md() emits the only tags the DOM ever sees; the dispatched prompt, user
+     prompt, agent body and thinking body all route through it. */
+  const mdx = X.md;
+  // Block structure
+  eq(mdx("plain"), "<p>plain</p>", "md: plain text wraps in <p>");
+  eq(mdx("a\nb"), "<p>a<br>b</p>", "md: single newline -> <br>");
+  eq(mdx("a\n\nb"), "<p>a</p><p>b</p>", "md: blank line splits paragraphs");
+  eq(mdx("# T\n#### S"), "<h1>T</h1><h4>S</h4>", "md: headings");
+  eq(mdx("text\n---\nmore"), "<p>text</p><hr><p>more</p>",
+    "md: horizontal rule");
+  eq(mdx("> q1\n> q2"), "<blockquote><p>q1<br>q2</p></blockquote>",
+    "md: blockquote");
+  eq(mdx("> q\n>> deep"),
+    "<blockquote><p>q</p><blockquote><p>deep</p></blockquote></blockquote>",
+    "md: nested blockquote");
+  eq(mdx("- a\n- b"), "<ul><li>a</li><li>b</li></ul>", "md: unordered list");
+  eq(mdx("1. a\n2. b"), "<ol><li>a</li><li>b</li></ol>", "md: ordered list");
+  eq(mdx("3. a"), '<ol start="3"><li>a</li></ol>',
+    "md: ordered list keeps start number");
+  eq(mdx("- a\n  - b\n- c"),
+    "<ul><li>a<ul><li>b</li></ul></li><li>c</li></ul>",
+    "md: nested list folds inside the parent item");
+  eq(mdx("- [ ] todo\n- [x] done"),
+    '<ul><li class="task"><input type="checkbox" disabled> todo</li>' +
+    '<li class="task"><input type="checkbox" disabled checked> done</li></ul>',
+    "md: task list checkboxes");
+  eq(mdx("| Name | Status |\n|---|:---:|\n| **camera** | CONFIRMED |"),
+    '<div class="table-wrap"><table><thead><tr><th>Name</th><th class="al-c">Status</th></tr></thead>' +
+    '<tbody><tr><td><b>camera</b></td><td class="al-c">CONFIRMED</td></tr></tbody></table></div>',
+    "md: GFM table with inline formatting and alignment");
+  const slash=String.fromCharCode(92);
+  const escapedTable=[slash+"| A | B |"+slash,slash+"|---|---|"+slash,
+    slash+"| one | two |"+slash].join("\n");
+  eq(mdx(escapedTable).includes("<table>"), true,
+    "md: report-style escaped boundary pipes still form a table");
+  // Inline formatting
+  eq(mdx("**b** *i* ~~s~~ `c<d>`"),
+    "<p><b>b</b> <i>i</i> <del>s</del> <code>c&lt;d&gt;</code></p>",
+    "md: bold/italic/strike/inline code");
+  eq(mdx("snake_case_name"), "<p>snake_case_name</p>",
+    "md: intraword underscores stay literal");
+  eq(mdx("***bi***"), "<p><b><i>bi</i></b></p>", "md: bold-italic");
+  eq(mdx("`**raw**`"), "<p><code>**raw**</code></p>",
+    "md: code contents skip emphasis");
+  // Fenced code
+  eq(mdx("```py\nprint(1)\n```"),
+    '<pre><code class="language-py">print(1)</code></pre>',
+    "md: fenced code keeps the language class");
+  eq(mdx("```c++\nx\n```"), '<pre><code class="language-c++">x</code></pre>',
+    "md: + survives in the language tag");
+  eq(mdx("```bad lang\nx\n```"), "<pre><code>x</code></pre>",
+    "md: unsanitary language tag dropped");
+  eq(mdx("```js\nx"), '<pre><code class="language-js">x</code></pre>',
+    "md: unclosed fence still renders mid-stream");
+  // Links: allowlisted targets harden, anything else renders inert text.
+  eq(mdx("[t](https://x.y)"),
+    '<p><a href="https://x.y" target="_blank" rel="noopener noreferrer">t</a></p>',
+    "md: https link is hardened");
+  for (const ok of ["http://x.y", "mailto:a@b.c", "file:///C:/repo/a.py#L9", "/rel", "#frag"])
+    eq(mdx("[t](" + ok + ")").includes('href="' + ok + '"'), true,
+      "md: allowed target " + ok);
+  for (const bad of ["javascript:alert(1)", "data:text/html;base64,x",
+                     "vbscript:x"])
+    eq(mdx("[t](" + bad + ")").includes("<a "), false,
+      "md: inert target " + bad.split(":")[0]);
+  eq(mdx("[**b**](https://x)"),
+    '<p><a href="https://x" target="_blank" rel="noopener noreferrer"><b>b</b></a></p>',
+    "md: formatted link label");
+  const fileUrl="file:///C:/Users/Touma/Documents/repo/check.py#L919-L929";
+  eq(mdx("`check.py:919-929` (`"+fileUrl+"`)"),
+    '<p><a class="file-link" href="'+fileUrl+'" target="_blank" rel="noopener noreferrer"><code>check.py:919-929</code></a></p>',
+    "md: agent-style local file citation becomes a hyperlink");
+  eq(mdx("[`check.py:919`]("+fileUrl+")").includes('href="'+fileUrl+'"'), true,
+    "md: bracketed code label accepts a local file URL");
+  // Escape-first: raw HTML is always text.
+  eq(mdx("<script>alert(1)</script>"),
+    "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>", "md: <script> escaped");
+  eq(mdx("<img src=x onerror=alert(1)>"),
+    "<p>&lt;img src=x onerror=alert(1)&gt;</p>", "md: img onerror escaped");
+  eq(mdx('<iframe src="//x"></iframe>').includes("<iframe"), false,
+    "md: iframe never becomes an element");
+  eq(mdx("```html\n<b>x</b>\n```"),
+    '<pre><code class="language-html">&lt;b&gt;x&lt;/b&gt;</code></pre>',
+    "md: markup inside fences stays text");
+
+  // --- all four timeline kinds route through md() ---
+  X.setLocalePref("en");
+  contentEl.children = [];
+  X.applyEvents([
+    { t: "prompt", ts: "2026-01-01T00:00:00Z", text: "**bold** `code`",
+      src: "mcp" },
+    { t: "prompt", ts: "2026-01-01T00:00:01Z", text: "- a\n- b",
+      src: "dashboard" },
+    { t: "msg", ts: "2026-01-01T00:00:02Z", text: "# Hi\n\n**x**" },
+    { t: "think", ts: "2026-01-01T00:00:03Z", text: "1. plan\n2. act" },
+  ]);
+  const kinds = contentEl.children.slice(-4);
+  eq(kinds[0].innerHTML.includes("<b>bold</b> <code>code</code>"), true,
+    "dispatched prompt renders markdown");
+  eq(kinds[1].innerHTML.includes("<ul><li>a</li><li>b</li></ul>"), true,
+    "user prompt renders markdown");
+  eq(kinds[1].classList.contains("user"), true, "user card keeps .user tint");
+  eq(kinds[2]._q[".msg-body"].innerHTML, "<h1>Hi</h1><p><b>x</b></p>",
+    "agent body renders markdown");
+  eq(kinds[3]._q[".body"].innerHTML, "<ol><li>plan</li><li>act</li></ol>",
+    "thinking body renders markdown");
+  eq(kinds[3].tagName, "DETAILS", "thinking stays a details fold");
+  eq(kinds[3].open, false, "thinking fold stays closed by default");
+  eq(kinds[3]._q[".tlabel"].textContent, "Thinking · 4 words",
+    "thinking label count preserved");
+
+  // --- prompt clamp/show-more: stable .ptext selector survives markdown ---
+  contentEl.children = [];
+  X.addPrompt({ t: "prompt", ts: "2026-01-01T00:00:00Z",
+    text: "short **note**", src: "dashboard" });
+  const sc = contentEl.children[contentEl.children.length - 1];
+  eq(sc.innerHTML.includes('class="ptext md"'), true,
+    "short prompt renders unclamped markdown");
+  eq(sc.children.length, 0, "short prompt gets no expand button");
+  X.addPrompt({ t: "prompt", ts: "2026-01-01T00:00:01Z",
+    text: "x".repeat(950), src: "mcp" });
+  const lc = contentEl.children[contentEl.children.length - 1];
+  eq(lc.innerHTML.includes('class="ptext md clamp"'), true,
+    "long prompt stays clamped");
+  const xp = lc.children[0];
+  eq(xp.className, "expand", "long prompt gets the show-more button");
+  xp.onclick();
+  eq(lc._q[".ptext"].classList.contains("clamp"), false,
+    "show-more removes the clamp via .ptext");
+  eq(lc.children.includes(xp), false, "show-more button removes itself");
+
+  // --- streaming batch contract: chunks mark dirty, flush renders once ---
+  contentEl.children = [];
+  X.applyEvents([
+    { t: "msg", ts: "1", text: "part " },
+    { t: "msg", ts: "2", text: "**one**" },
+    { t: "msg", ts: "3", text: " more" },
+  ]);
+  const mb = contentEl.children[contentEl.children.length - 1];
+  eq(mb._q[".msg-body"].innerHTML, "<p>part <b>one</b> more</p>",
+    "streamed chunks coalesce then render");
+  eq(mb._q[".msg-body"]._htmlSets, 1,
+    "one .msg-body write per flush, never per chunk");
 
   console.log(failed ? `\n${failed} FAILED` : "\nall assertions passed");
   process.exit(failed ? 1 : 0);

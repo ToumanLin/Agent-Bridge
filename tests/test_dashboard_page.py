@@ -642,6 +642,79 @@ def test_user_message_card_and_send_status():
     assert "sendState" in PAGE and "pollSendStatus" in PAGE
 
 
+def test_markdown_rendering_all_four_kinds():
+    """Dispatched prompts, user prompts, agent messages and thinking bodies
+    all render through the same escape-first md() pipeline.
+
+    The renderer exists once; every timeline text kind routes through it, and
+    the shared .md class carries one typography block so the kinds look
+    identical. Behavioral coverage (block/inline parsing, XSS escaping, the
+    link allowlist, clamp/show-more and streaming batching) lives in
+    tests/dashboard_status_behavior.js.
+    """
+    # addPrompt renders markdown into the clampable .ptext container for both
+    # prompt sources (dashboard -> user card, anything else -> dispatched).
+    ap = re.search(r"function addPrompt\(e\)\{([\s\S]*?)\n\}", PAGE)
+    assert ap, "addPrompt missing"
+    ap = ap.group(1)
+    assert "${md(e.text)}" in ap
+    assert 'class="ptext md${long?" clamp":""}"' in ap
+    assert 'querySelector(".ptext")' in ap  # stable show-more selector
+    # Agent stream + thinking body render through md() at flush time; the
+    # thinking fold keeps its word/char count label.
+    fb = re.search(r"function flushBlocks\(\)\{([\s\S]*?)\n\}", PAGE)
+    assert fb, "flushBlocks missing"
+    fb = fb.group(1)
+    assert 'querySelector(".body").innerHTML=md(b._text)' in fb
+    assert 'querySelector(".msg-body").innerHTML=md(b._text)' in fb
+    assert "thinkLabel(b._text)" in fb
+    assert ".textContent=b._text" not in fb
+    # All three markdown containers carry the shared typography class.
+    assert 'class="msg-body md"' in PAGE
+    assert 'class="body md"' in PAGE
+
+
+def test_markdown_safety_contract():
+    """md() is escape-first: the only markup emitted comes from its own
+    templates, and anchors are limited to safe targets with opener/link
+    hardening — no raw HTML path, no executable schemes."""
+    body = re.search(r"function md\(src\)\{([\s\S]*?)\n\}", PAGE)
+    assert body, "md() missing"
+    body = body.group(1)
+    # Everything the block parser sees is esc() output.
+    assert "esc(String(src)" in body
+    # Link allowlist (http/https/mailto/local-file/root-relative/hash) + anchor hardening.
+    assert "const MD_URL=/^(?:https?:\\/\\/|mailto:|file:\\/\\/\\/|\\/(?!\\/)|#)/i" in PAGE
+    assert "MD_URL.test(url)" in body
+    assert 'target="_blank"' in body
+    assert 'rel="noopener noreferrer"' in body
+    # Feature surface required by the dashboard timeline.
+    for needle in ('class="language-', "<blockquote>", "<hr>",
+                   'class="task"', 'type="checkbox"', "</li></", "<del>"):
+        assert needle in body
+
+
+def test_markdown_typography_covers_all_kinds():
+    # One shared .md ruleset styles prompts, agent messages and thinking.
+    for sel in (".md p", ".md pre", ".md code", ".md a", ".md blockquote",
+                ".md hr", ".md ul", ".md ol", ".md li.task"):
+        assert re.search(re.escape(sel) + r"\s*[{,]", PAGE), f"missing {sel}"
+    # The thinking body no longer relies on plaintext pre-wrap layout.
+    think = re.search(r"details\.think \.body\{([^}]*)\}", PAGE).group(1)
+    assert "pre-wrap" not in think
+
+
+def test_markdown_tables_and_local_file_citations():
+    """Agent reports rely on GFM tables and file:/// source citations."""
+    body = re.search(r"function md\(src\)\{([\s\S]*?)\n\}", PAGE).group(1)
+    assert "tableRow" in body and 'class=\\"table-wrap\\"' in body
+    assert '<table><thead><tr>' in body and "<tbody>" in body
+    assert "file:\\/\\/\\/" in PAGE
+    assert 'class="file-link"' in body
+    for sel in (".md table", ".md th", ".md td", ".md .table-wrap"):
+        assert sel in PAGE
+
+
 def test_queue_cards_and_task_controls_contract():
     """Queued-message cards sit directly above the composer; pause/cancel/
     resume live in the session header and gate on the latest applicable task.
