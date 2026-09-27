@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from importlib.metadata import version as package_version
 from typing import Any
 
 from mcp.server.mcpserver import Context, MCPServer
@@ -74,7 +75,12 @@ INSTRUCTIONS = (
     "routing the request to that owner through the shared queue."
 )
 
-mcp = MCPServer[Registry]("agent-bridge", instructions=INSTRUCTIONS, lifespan=lifespan)
+mcp = MCPServer[Registry](
+    "agent-bridge",
+    version=package_version("agent-bridge"),
+    instructions=INSTRUCTIONS,
+    lifespan=lifespan,
+)
 
 
 def _registry(ctx: Context) -> Registry:
