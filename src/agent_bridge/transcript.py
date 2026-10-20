@@ -255,6 +255,25 @@ def page_events(
     }
 
 
+def _codex_activity(kind: str, data: dict[str, Any]) -> tuple[str, Any] | None:
+    """Label and text for a Codex record kept as ``{"payload": <exec JSONL>}``.
+
+    Returns None for lifecycle noise (thread/turn start and end, a finished
+    command whose start was already listed), so it never shows as a bare kind.
+    """
+    payload = data.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+    if item.get("type") == "command_execution":
+        if payload.get("type") != "item.started":
+            return None
+        return "command", item.get("command")
+    if item.get("text"):
+        return kind, item["text"]
+    return None
+
+
 def recent_activity(events: list[dict[str, Any]], limit: int = 5) -> list[str]:
     summaries: list[str] = []
     for event in reversed(events):
@@ -263,6 +282,11 @@ def recent_activity(events: list[dict[str, Any]], limit: int = 5) -> list[str]:
             continue  # token telemetry is not user-facing activity
         data = event.get("data") or {}
         text = data.get("text") or data.get("title") or data.get("path") or data.get("summary")
+        if not text and "payload" in data:
+            found = _codex_activity(kind, data)
+            if found is None:
+                continue
+            kind, text = found
         if text:
             summaries.append(f"{kind}: {str(text)[:160]}")
         else:

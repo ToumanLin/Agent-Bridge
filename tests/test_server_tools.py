@@ -240,6 +240,7 @@ async def test_cancel_is_graceful_and_continue_task_resumes(bridge, monkeypatch)
 
     rows = {row["task_id"]: row for row in (await list_tasks(ctx))["tasks"]}
     assert rows[sent["task_id"]]["resumed_by"] == resumed["task_id"]
+    assert "resumable" not in rows[sent["task_id"]]
     assert rows[resumed["task_id"]]["resume_of"] == sent["task_id"]
     _no_empty_values(rows)
 

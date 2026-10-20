@@ -116,6 +116,29 @@ def _files(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     return compact({"files_changed": files, "files_more": max(0, total - len(files)) or None})
 
 
+# Bookkeeping keys of a run_usage record; the rest are token counters.
+USAGE_META = {"scope", "v"}
+
+
+def usage_view(usage: Any) -> dict[str, Any] | None:
+    """run_usage without its bookkeeping keys, or None when it counted nothing.
+
+    A turn cancelled before the worker reported usage leaves only the
+    bookkeeping keys behind; that block says nothing and is dropped.
+    """
+    if not isinstance(usage, Mapping):
+        return None
+    view = {key: value for key, value in usage.items() if key not in USAGE_META}
+    if not any(isinstance(value, (int, float)) and not isinstance(value, bool) for value in view.values()):
+        return None
+    return view
+
+
+def _resumable(row: Mapping[str, Any]) -> bool:
+    """A row already continued by another task is not offered for resuming again."""
+    return bool(row.get("resumable")) and not row.get("resumed_by")
+
+
 def _warnings(snapshot: Mapping[str, Any]) -> list[str]:
     warnings = list(snapshot.get("warnings") or [])
     if snapshot.get("files_changed_truncated"):
@@ -128,7 +151,6 @@ def task_view(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     status = snapshot.get("status")
     owner = _owner(snapshot)
     if status in RUNNING:
-        usage = snapshot.get("run_usage") or None
         return compact(
             {
                 "task_id": snapshot.get("task_id"),
@@ -138,7 +160,7 @@ def task_view(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                 "elapsed_sec": snapshot.get("elapsed_sec"),
                 "silent_for_sec": snapshot.get("silent_for_sec"),
                 "activity": snapshot.get("recent_activity"),
-                "run_usage": usage,
+                "run_usage": usage_view(snapshot.get("run_usage")),
                 # A queued/running row whose owner died can never finish.
                 "resumable": bool(snapshot.get("resumable")) if owner == "lost" else None,
             }
@@ -153,12 +175,12 @@ def task_view(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             "owner": owner,
             "error": snapshot.get("error") if failed else None,
             "error_kind": snapshot.get("error_kind") if failed else None,
-            "resumable": bool(snapshot.get("resumable")),
+            "resumable": _resumable(snapshot),
             "model": snapshot.get("observed_model") or snapshot.get("model"),
             "effort": snapshot.get("observed_effort") or snapshot.get("effort"),
             "elapsed_sec": snapshot.get("elapsed_sec"),
             **_files(snapshot),
-            "run_usage": snapshot.get("run_usage") or None,
+            "run_usage": usage_view(snapshot.get("run_usage")),
             "warnings": _warnings(snapshot),
         }
     )
@@ -201,7 +223,7 @@ def task_row(row: Mapping[str, Any], session_titles: Mapping[str, str | None]) -
             "status": row.get("status"),
             "stop_reason": _stop(row.get("stop_reason")),
             "owner": owner,
-            "resumable": bool(row.get("resumable")),
+            "resumable": _resumable(row),
             "resume_of": row.get("resume_of"),
             "resumed_by": row.get("resumed_by"),
             "created_at": row.get("created_at"),
