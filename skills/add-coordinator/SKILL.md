@@ -23,8 +23,8 @@ Answer every item below from the host's current official docs and, when possible
 5. **MCP startup timeout and tool-call timeout, with units.** Recommend a value that leaves room for `wait_task` default 180 s (Bridge recommends 600 s / 600000 ms). Document the host default and the short-poll fallback when the default is too short or unknown.
 6. **MCP tool permission / approval.** How to pre-allow only Agent Bridge tools without turning the whole host into always-approve. Note which keys are user-scoped and must not go in a project example.
 7. **Environment inheritance and executable PATH.** Does the host clear the MCP child env (Codex does)? Can it resolve a PowerShell function, or must `command` be a real executable absolute path?
-8. **Can this product also be a Worker?** If yes, a Worker that inherits the user's Agent Bridge MCP config will start a nested Bridge. Prove the server-side gate: nested `list_agents` shows `runtime_context=worker` and `dispatch_enabled=false`; nested `dispatch_task` (even `user_requested=true`) returns `nested dispatch is disabled`.
-9. **Real closed loop on the live host:** `list_agents` → `dispatch_task` → `wait_task` → `get_result` → same `session_id` continue → `end_session`. Verify the file on disk yourself. A timeout is not failure.
+8. **Can this product also be a Worker?** If yes, a Worker that inherits the user's Agent Bridge MCP config will start a nested Bridge. Prove the server-side gate: nested `list_agents` shows `dispatch_enabled: false`; nested `dispatch_task` (even `user_requested=true`) returns `nested dispatch is disabled`.
+9. **Real closed loop on the live host:** `list_agents` → `dispatch_task` → `wait_task` → same `session_id` continue → `cancel_task` on a running turn, then `dispatch_task(continue_task=...)`. Verify the file on disk yourself. A timeout is not failure.
 10. **Separate automation from human steps.** Unit tests and a project-level config fixture are automation. Opening a GUI host and sending one prompt is human. Never call the latter "E2E passed".
 
 ## Current hosts (verified against their public docs)
@@ -38,7 +38,7 @@ Answer every item below from the host's current official docs and, when possible
 | Grok Build | user `~/.grok/config.toml`; project `<repo>/.grok/config.toml` | `~/.grok/skills`, `./.grok/skills`, and `~/.agents/skills` | `startup_timeout_sec` / `tool_timeout_sec` (seconds; tool default 6000) | Also a Worker. MCP stdio inherits the process env (no `env_clear`). Official permission form is `[[permission.rules]]` with `tool = "mcp"` and `{server}__{tool}` names. `[ui] permission_mode` is user-scoped only. |
 | Claude Code | user `~/.claude.json` top-level `mcpServers`; project `<repo>/.mcp.json`; local scope nests under the project path in `~/.claude.json` | `~/.claude/skills` (does not read `~/.agents/skills`) | per-server `timeout` (ms); `MCP_TOOL_TIMEOUT` env; CLI default ~28 h | Also a Worker (`claude-agent-acp`, not product `claude`). Do not put `mcpServers` in `settings.json`. Pre-allow with `permissions.allow = ["mcp__agent-bridge__*"]`. Native rules file is `CLAUDE.md`. |
 
-Bridge already installs the coordinator skill into `.agents`, `.cursor`, `.codex`, `.kimi-code`, `.zcode`, and `.claude`. Grok reads `~/.agents/skills`; do not add a `.grok` copy unless a future host stops reading `.agents`.
+Bridge installs no coordinator skill: the MCP handshake instructions and tool descriptions are the whole contract, so a new host needs no skill directory entry.
 
 ## Implementation checklist (coordinator only)
 
@@ -52,7 +52,7 @@ Bridge already installs the coordinator skill into `.agents`, `.cursor`, `.codex
 
 Automation:
 
-- Unit tests cover worker-context refusal (`dispatch_task` / `set_preferences` / `cancel_task` / `end_session`), nested `AGENT_BRIDGE_HOME`, skill destinations, and docs that distinguish config shapes.
+- Unit tests cover worker-context refusal (`dispatch_task` / `set_preferences` / `cancel_task`), nested `AGENT_BRIDGE_HOME`, and docs that distinguish config shapes.
 - `uv run pytest` and `uv build` pass.
 
 Human or live-host:
@@ -60,7 +60,7 @@ Human or live-host:
 - A local `lab/` workspace from `scripts/setup_lab.py` (its own git repo, project-scoped host config; not committed). Do not edit the user's global Codex/Cursor/Kimi/ZCode/Grok/Claude files for the test, and do not use `tests/` or a Temp folder.
 - `list_agents` shows `dispatch_enabled=true` at the top-level host.
 - Two worker turns on one `session_id`; the file on disk has both lines.
-- If the host is also a Worker: nested `dispatch_task` is rejected with `nested dispatch is disabled`; nested `cancel_task` / `end_session` are also rejected; nested state lives under `AGENT_BRIDGE_HOME/nested`. Top-level `end_session` still tears down the worker tree and its nested Bridge. Top-level `env_status` does not count that nested Bridge as a sibling.
+- If the host is also a Worker: nested `dispatch_task` is rejected with `nested dispatch is disabled`; nested `cancel_task` is also rejected; nested state lives under `AGENT_BRIDGE_HOME/nested`. Shutting down the top-level Bridge still tears down the worker tree and its nested Bridge. Top-level `env_status` does not count that nested Bridge as a sibling.
 - If the host has no stable headless CLI, say "config and unit tests done; UI E2E waiting on one human prompt". Do not claim full verification.
 
 ## Common failures

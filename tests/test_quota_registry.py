@@ -13,7 +13,7 @@ from agent_bridge.cli import main
 from agent_bridge.models import TurnResult
 from agent_bridge.quota import QuotaProvider, QuotaStatus, QuotaWindow
 from agent_bridge.registry import Registry
-from agent_bridge.server import INSTRUCTIONS, list_agents
+from agent_bridge.server import list_agents
 
 
 def _only_fake(registry: Registry) -> None:
@@ -204,10 +204,10 @@ async def test_unrelated_failure_keeps_the_cache(bridge_home, tmp_path, monkeypa
 
 def test_mcp_surface_documents_quota():
     doc = list_agents.__doc__ or ""
-    for token in ("quota", "ok | exhausted | unknown", "remaining_percent", "resets_at", "never affects available"):
+    # Quota semantics live in list_agents' own description now; the
+    # handshake carries only the hard rules.
+    for token in ("quota", "ok/exhausted/unknown", "unknown means unreadable, not empty"):
         assert token in doc
-    for token in ("quota", "exhausted", "unknown means Bridge could not read it", "not a routing rule"):
-        assert token in INSTRUCTIONS
 
 
 def test_cli_quota_prints_json_for_every_agent(bridge_home, capsys):

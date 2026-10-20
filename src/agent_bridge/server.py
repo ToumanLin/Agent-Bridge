@@ -8,6 +8,7 @@ from typing import Any
 from mcp.server.mcpserver import Context, MCPServer
 from mcp_types import ToolAnnotations
 
+from agent_bridge import public
 from agent_bridge.dashboard import maybe_open_dashboard
 from agent_bridge.logging_setup import setup_logging
 from agent_bridge.models import DEFAULT_WAIT_SEC
@@ -34,46 +35,22 @@ async def lifespan(_server: MCPServer[Registry]) -> AsyncIterator[Registry]:
         await registry.stop()
 
 
-# Injected into the coordinator's context at the MCP handshake — the one
-# channel that needs no copied rules file and no skill install.
+# Injected into the coordinator's context at the MCP handshake. Together with
+# the tool descriptions it is the whole contract: no skill file is installed.
 INSTRUCTIONS = (
-    "Agent Bridge dispatches tasks to local worker CLIs (Grok, Kimi Code, "
-    "Antigravity, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI) and keeps their "
-    "sessions resumable.\n"
-    "Hard rules: workers are reached only through these tools — never drive the "
-    "worker CLIs or GUIs directly. dispatch_task.cwd is this conversation's "
-    "project folder (absolute), not the Agent Bridge install path. A wait_task "
-    "timeout is not failure; call it again. Verify results with get_result plus "
-    "your own git diff — do not trust a worker's self-report. An empty Kimi "
-    "result with non-empty warnings is a failed turn, not a no-op.\n"
-    "Call list_agents first. Read coordinator.mode, coordinator.instructions, "
-    "coordinator.runtime_context, and coordinator.dispatch_enabled. User "
-    "preferences in instructions override default worker routing. Each "
-    "agents[] row carries quota: status ok/exhausted/unknown, rolling windows "
-    "with remaining_percent and resets_at, and optional provider-reported balance for "
-    "workers. Custom API/auth endpoints are unsupported; cached readings expire at window reset. unknown means Bridge could not read it, not that it is empty; "
-    "an exhausted worker will most likely fail its turn. Quota is information "
-    "for you and the user, not a routing rule — instructions still decide. "
-    "Claude quota.status covers only shared 5h/weekly limits. Before dispatch, "
-    "check the requested model's weekly:opus or weekly:sonnet window even when "
-    "status is ok. A zero remaining_percent means that model is exhausted: "
-    "report its reset time or use an alternative allowed by the user's routing "
-    "instructions. Missing or null readings mean unknown; model-specific windows "
-    "alone cannot establish the shared status. If "
-    "dispatch_enabled is false, this Bridge was inherited inside a worker "
-    "process — do not call dispatch_task, set_preferences, cancel_task, "
-    "end_session, pause_task, or resume_task. When "
-    "dispatch_enabled is true and the user states a lasting preference, "
-    "persist it with set_preferences. A task another live Bridge instance "
-    "owns shows remote: true in list_tasks / check_task / wait_task — it is "
-    "read-only here; keep polling it, never cancel or re-dispatch it. "
-    "pause_task(task_id) ends a turn gracefully and keeps it resumable "
-    "(partial result and transcript are preserved); resume_task(task_id) "
-    "continues it later on the same conversation — including after a "
-    "coordinator restart, where a dead owner's session is adopted, and "
-    "across instances, where a live sibling's resumable task is resumed by "
-    "routing the request to that owner through the shared queue."
+    "Agent Bridge runs local worker CLIs (Grok, Kimi Code, Antigravity, OpenCode, "
+    "Claude Code, Codex CLI, Devin CLI, DeepSeek Harness) as your subagents. "
+    "Reach workers only through these tools, never by running their CLIs. "
+    "Call list_agents first; if dispatch_enabled is false you are inside a "
+    "worker: do not dispatch, cancel, or set preferences. dispatch_task.cwd is "
+    "this project's absolute path. A running wait_task answer is not a failure; "
+    "wait again. Verify a worker's work with your own git diff and tests. "
+    "Tasks with owner sibling belong to another Bridge: only wait on them."
 )
+
+# How much result text a finished wait_task / cancel_task carries inline, so
+# most turns need no get_result call.
+FIRST_PAGE_CHARS = 20_000
 
 mcp = MCPServer[Registry](
     "agent-bridge",
@@ -92,25 +69,31 @@ def _registry(ctx: Context) -> Registry:
     raise RuntimeError("Agent Bridge registry is not available")
 
 
-def _error(exc: Exception) -> dict[str, Any]:
-    return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "error_type": type(exc).__name__}
+def _failure(exc: Exception) -> RuntimeError:
+    """A plain message for the MCP error result (a KeyError would add quotes)."""
+    text = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
+    return RuntimeError(str(text) or type(exc).__name__)
+
+
+def _with_first_page(registry: Registry, view: dict[str, Any]) -> dict[str, Any]:
+    if view.get("status") in public.RUNNING:
+        return view
+    page = registry.get_result(view["task_id"], cursor=0, max_chars=FIRST_PAGE_CHARS)
+    return public.with_result(view, page)
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def list_agents(ctx: Context) -> dict[str, Any]:
-    """List configured workers, the reconstructed host/proxy environment, the coordinator policy (mode, instructions, runtime_context, dispatch_enabled), and the server lifecycle policy (shutdown_policy cancel | linger, linger_max_sec, remote_tasks, idle_exit_sec). Call this first. Each agents[] row also carries quota: status ok | exhausted | unknown, windows[] with remaining_percent / resets_at / resets_in_sec, optional balance when reported by the provider, cached / stale flags, and detail. unknown means the quota could not be read (unsupported CLI, API-key login, timeout) — not that it is empty. Custom API/auth endpoints are unsupported; cached readings expire at window reset. Quota never affects available; treat it as information, routing still follows coordinator.instructions. Claude status covers shared 5h/weekly limits only: before dispatch, check the requested model's weekly:opus or weekly:sonnet remaining_percent even if status is ok. Zero means that model is exhausted; report its reset time or use an alternative allowed by coordinator.instructions. Missing or null readings mean unknown; model-specific windows alone cannot establish shared status. If dispatch_enabled is false, this is a nested worker-inherited instance — do not dispatch or set_preferences."""
+    """Workers with availability, remaining quota (status ok/exhausted/unknown; unknown means unreadable, not empty) and fixed per-worker notes, plus the user's routing mode/instructions and warnings. Call first."""
     try:
         registry = _registry(ctx)
-        agents = await registry.list_agents()
-        return {
-            "ok": True,
-            "agents": agents,
-            "env": await registry.env_status(),
-            "coordinator": registry.coordinator_status(),
-            "server": registry.server_status(),
-        }
+        return public.agents_view(
+            await registry.list_agents(),
+            await registry.env_status(),
+            registry.coordinator_status(),
+        )
     except Exception as exc:
-        return _error(exc)
+        raise _failure(exc) from exc
 
 
 @mcp.tool()
@@ -119,62 +102,79 @@ async def set_preferences(
     mode: str | None = None,
     instructions: str | None = None,
 ) -> dict[str, Any]:
-    """Persist the coordinator policy when the user states a lasting preference (e.g. "from now on, research goes to antigravity"). mode is manual/auto/eager; instructions is free routing-preference text that REPLACES the stored text — read coordinator.instructions from list_agents first and write the merged result. Applies to this instance immediately and to others at their next start. Do not call for one-off, this-task-only wishes. Rejected when coordinator.dispatch_enabled is false (nested worker-inherited Bridge)."""
+    """Persist a lasting user preference. mode: manual (dispatch only on request) / auto / eager. instructions replaces the stored routing text: merge with list_agents.instructions first. Not for one-off wishes."""
     try:
         result = _registry(ctx).set_preferences(mode=mode, instructions=instructions)
-        return {"ok": True, **result}
+        coordinator = result.get("coordinator") or {}
+        return public.compact({"mode": coordinator.get("mode"), "instructions": coordinator.get("instructions")})
     except Exception as exc:
-        return _error(exc)
+        raise _failure(exc) from exc
 
 
 @mcp.tool()
 async def dispatch_task(
     ctx: Context,
-    agent: str,
-    message: str,
-    cwd: str,
+    message: str | None = None,
+    agent: str | None = None,
+    cwd: str | None = None,
     session_id: str | None = None,
+    continue_task: str | None = None,
     model: str | None = None,
     effort: str | None = None,
     title: str | None = None,
     user_requested: bool = False,
     request_id: str | None = None,
 ) -> dict[str, Any]:
-    """Start a worker turn. cwd is this coordinator conversation's project (absolute). model/effort are optional coordinator choices (agy: --model/--effort/--new-project — agy model slugs ending in -low/-medium/-high already pin effort, so omit effort or pass the matching level; a mismatch fails dispatch; grok: session/setModel after /new; kimi/cursor/opencode/claude/devin: session/set_config_option after new/resume, devin has no effort; dsh: legacy demo spawn env + respawn on change, native --profile acp session/set_config_option; codex: exec -m / -c model_reasoning_effort, off->none). Pass session_id to continue — a session whose owning Bridge died is adopted first, its orphaned worker reaped before a replacement spawns. Set user_requested=true only when the user explicitly asked for a worker (required in manual mode). Rejected when coordinator.dispatch_enabled is false, even with user_requested=true. For optional retry deduplication, supply a UUID request_id on the first call and replay the same ID and original arguments on retries; keep session_id omitted if it was originally omitted. Adding an ID only on retry cannot deduplicate the first call. Identical retries reuse the task in this Bridge instance while it is retained; different arguments are rejected. Normal dispatch validation still applies. Bindings are lost on restart and are not shared with other instances — after a coordinator restart, rediscover a still-running task through list_tasks / check_task (remote: true) instead of re-dispatching it. Returns immediately."""
+    """Start a worker turn; returns at once. New: agent, cwd, message. Follow-up: add session_id. Resume an unfinished (cancelled/failed) task: continue_task=task_id, message optional. user_requested: user explicitly asked (manual mode). request_id: UUID for retry dedup."""
     try:
-        result = await _registry(ctx).dispatch_task(
-            agent=agent,
-            message=message,
-            cwd=cwd,
-            session_id=session_id,
-            model=model,
-            effort=effort,
-            title=title,
-            user_requested=user_requested,
-            request_id=request_id,
-        )
-        return {"ok": True, **result}
+        registry = _registry(ctx)
+        if continue_task:
+            extra = [
+                name
+                for name, value in (
+                    ("agent", agent),
+                    ("cwd", cwd),
+                    ("session_id", session_id),
+                    ("model", model),
+                    ("effort", effort),
+                )
+                if value
+            ]
+            if extra:
+                raise ValueError(f"continue_task takes only message and request_id, not {', '.join(extra)}")
+            result = await registry.resume_task(continue_task, message=message, request_id=request_id)
+        else:
+            if not agent or not cwd or not (message or "").strip():
+                raise ValueError("agent, cwd and message are required unless continue_task is given")
+            result = await registry.dispatch_task(
+                agent=agent,
+                message=message,
+                cwd=cwd,
+                session_id=session_id,
+                model=model,
+                effort=effort,
+                title=title,
+                user_requested=user_requested,
+                request_id=request_id,
+            )
+        warnings = registry.quota_warnings(str(result.get("agent") or agent or ""), result.get("model") or model)
+        return public.dispatch_view(result, warnings)
     except Exception as exc:
-        return _error(exc)
+        raise _failure(exc) from exc
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def wait_task(ctx: Context, task_id: str, timeout_sec: float = DEFAULT_WAIT_SEC) -> dict[str, Any]:
-    """Wait until a task finishes or timeout_sec elapses (default 180). Timeout is not failure; call wait_task again. Stay under the host MCP tool timeout (Codex tool_timeout_sec, typically 600). Payloads carry silent_for_sec / stall_timeout_sec. A task owned by a sibling Bridge instance (remote: true) is polled read-only from disk until it turns terminal, its owner dies (owner_lost: true), its result artifact lands, or the timeout elapses."""
+    """Wait up to timeout_sec (0 = just check) for a task. Running: progress only; call again. Finished: status, files_changed, usage and the first page of result; next_cursor means get_result has more. Keep timeout_sec under the host's tool timeout."""
     try:
-        result = await _registry(ctx).wait_task(task_id, timeout_sec=timeout_sec)
-        return {"ok": True, **result}
+        registry = _registry(ctx)
+        if timeout_sec <= 0:
+            snapshot = registry.check_task(task_id)
+        else:
+            snapshot = await registry.wait_task(task_id, timeout_sec=timeout_sec)
+        return _with_first_page(registry, public.task_view(snapshot))
     except Exception as exc:
-        return _error(exc)
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def check_task(ctx: Context, task_id: str) -> dict[str, Any]:
-    """Non-blocking status, elapsed time, and recent activity for a task. files_changed is capped at 200 paths; files_changed_total carries the real count. silent_for_sec is the time since the worker's last output; Bridge fails the task with stop_reason "stalled" once it passes stall_timeout_sec. With server.remote_tasks on (default), a task owned by another live Bridge instance sharing this data directory resolves as remote: true with owner {pid, create_time, alive} instead of "unknown task"; owner_lost: true means its owner died mid-run. Remote tasks are read-only — only the owning instance runs, pauses, or cancels them. Payloads also carry paused / resumable / resume_hint: resumable means the turn ended unfinished and resume_task can continue it on the same conversation — adopted first when the owner died, or routed to the owning instance through the shared queue when a live sibling owns it. Failed tasks also carry error_kind (transient_provider | quota | config | unknown) and retryable: transient_provider is provider-side capacity/overload — resume_task continues the same conversation, or retry later."""
-    try:
-        return {"ok": True, **_registry(ctx).check_task(task_id)}
-    except Exception as exc:
-        return _error(exc)
+        raise _failure(exc) from exc
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -184,90 +184,32 @@ async def get_result(
     cursor: int = 0,
     max_chars: int = RESULT_PAGE_MAX_CHARS,
 ) -> dict[str, Any]:
-    """Return a page of the complete worker result plus changed files, usage, run_usage (accumulated tokens for this run), and requested/observed model. Continue with next_cursor while has_more is true. max_chars is capped at 60000. files_changed is capped at 200 paths; files_changed_total carries the real count. For Grok, observed_model is the live sampler; the worker saying it is Grok 4.6 is not. Sibling-owned (remote) tasks resolve through the same results/<task_id>.txt artifact and state.json row with identical paging."""
+    """A page of a finished task's result text from cursor (max_chars up to 60000). Continue with next_cursor until it is absent."""
     try:
-        return {
-            "ok": True,
-            **_registry(ctx).get_result(task_id, cursor=cursor, max_chars=max_chars),
-        }
+        return public.result_view(_registry(ctx).get_result(task_id, cursor=cursor, max_chars=max_chars))
     except Exception as exc:
-        return _error(exc)
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def get_transcript(
-    ctx: Context,
-    session_id: str,
-    offset: int = 0,
-    limit: int = 50,
-    kinds: str | None = None,
-) -> dict[str, Any]:
-    """Paged session transcript. kinds is an optional comma-separated event type list."""
-    try:
-        kind_list = [item.strip() for item in kinds.split(",") if item.strip()] if kinds else None
-        return {
-            "ok": True,
-            **_registry(ctx).get_transcript(session_id, offset=offset, limit=limit, kinds=kind_list),
-        }
-    except Exception as exc:
-        return _error(exc)
+        raise _failure(exc) from exc
 
 
 @mcp.tool()
 async def cancel_task(ctx: Context, task_id: str) -> dict[str, Any]:
-    """Cancel an in-flight worker turn. ACP sessions are cancelled; agy processes are killed. A remote (sibling-owned) task cannot be cancelled while its owner lives — but a dead owner's task is adopted, its orphaned worker reaped, and the row finalized as failed/bridge_restarted. Prefer pause_task when the work should stay resumable. Rejected when coordinator.dispatch_enabled is false."""
+    """End a running task gracefully: partial result and conversation are kept, and dispatch_task(continue_task=task_id) can resume it. A finished task is returned unchanged."""
     try:
-        return {"ok": True, **await _registry(ctx).cancel_task(task_id)}
+        registry = _registry(ctx)
+        return _with_first_page(registry, public.task_view(await registry.stop_task(task_id)))
     except Exception as exc:
-        return _error(exc)
-
-
-@mcp.tool()
-async def pause_task(ctx: Context, task_id: str) -> dict[str, Any]:
-    """Pause a queued/running task: the worker turn is cancelled gracefully — partial output, usage, transcript, and the native session are preserved — and the task ends terminal with status "cancelled", stop_reason "paused", paused=true, resumable=true. This is NOT frozen execution: the turn ends for real and cannot restart mid-flight. resume_task(task_id) continues the work later as a new task on the same conversation. Pausing an already-paused task is a no-op. A remote (sibling-owned) task cannot be paused here — only its owner can. Rejected when coordinator.dispatch_enabled is false."""
-    try:
-        return {"ok": True, **await _registry(ctx).pause_task(task_id)}
-    except Exception as exc:
-        return _error(exc)
-
-
-@mcp.tool()
-async def resume_task(ctx: Context, task_id: str, message: str | None = None, request_id: str | None = None) -> dict[str, Any]:
-    """Continue an unfinished task's work as a NEW task on the same session/native conversation. Accepts paused, cancelled, and failed tasks — including a dead owner's row after a coordinator restart or a sibling's death: the session is adopted and its orphaned worker is reaped before a replacement spawns. A task owned by a live sibling Bridge is not executed here — the resume is routed to that owning instance through the shared queue and its dispatch result (the real new task_id/session_id) is relayed back within a bounded wait; the new task may stay remote-owned — poll it with wait_task/check_task as usual. If the recorded owner dies mid-delegation, the row is adopted locally and resumed here. The original task row stays final and auditable — never rewritten — gaining resumed_by, while the new task carries resume_of and source="resume"; a task that already has a continuation returns it instead of dispatching again. message is optional; when omitted a safe explicit "pick up the paused work" continuation prompt is sent. request_id is an optional UUID for retry deduplication, same semantics as dispatch_task. Running tasks are rejected (pause_task or wait first), completed tasks too (dispatch_task with session_id sends a follow-up). Rejected when coordinator.dispatch_enabled is false."""
-    try:
-        return {
-            "ok": True,
-            **await _registry(ctx).resume_task(task_id, message=message, request_id=request_id),
-        }
-    except Exception as exc:
-        return _error(exc)
+        raise _failure(exc) from exc
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def list_tasks(ctx: Context, active_only: bool = False) -> dict[str, Any]:
-    """List tasks known to this Bridge instance plus — with server.remote_tasks on (default) — task rows other live Bridge instances still own on this shared data directory. Remote rows carry remote: true and owner {pid, create_time, alive} (owner_lost: true when the owner died mid-run); they are read-only — only the owning instance runs, pauses, or cancels them, while resume_task on a remote resumable row is routed to that owner. Use this after a coordinator restart to rediscover task_ids, then keep polling with wait_task. active_only=true keeps only queued/running."""
+    """Known tasks, oldest first, to find task_ids again after a restart. active_only keeps queued/running ones."""
     try:
-        return {"ok": True, "tasks": _registry(ctx).list_tasks(active_only=active_only)}
+        registry = _registry(ctx)
+        titles = registry.session_titles()
+        return {"tasks": [public.task_row(row, titles) for row in registry.list_tasks(active_only=active_only)]}
     except Exception as exc:
-        return _error(exc)
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def list_sessions(ctx: Context, active_only: bool = False) -> dict[str, Any]:
-    """List known worker sessions. Sessions stay bound to their owning Bridge instance — use list_tasks to rediscover a sibling-owned task."""
-    try:
-        return {"ok": True, "sessions": _registry(ctx).list_sessions(active_only=active_only)}
-    except Exception as exc:
-        return _error(exc)
-
-
-@mcp.tool()
-async def end_session(ctx: Context, session_id: str) -> dict[str, Any]:
-    """Shut down a worker session process and mark it dead. A session whose owning Bridge died is adopted first — its orphaned worker is reaped; a live sibling's session is rejected. Rejected when coordinator.dispatch_enabled is false."""
-    try:
-        return {"ok": True, **await _registry(ctx).end_session(session_id)}
-    except Exception as exc:
-        return _error(exc)
+        raise _failure(exc) from exc
 
 
 def main() -> None:

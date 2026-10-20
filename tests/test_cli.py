@@ -7,21 +7,25 @@ import pytest
 from agent_bridge.cli import (
     checkout_root,
     detect_install,
-    ensure_coordinator_skill,
-    install_skill,
     main,
+    retire_coordinator_skill,
+    retire_skill_on_start,
     skill_destinations,
     skill_stamp_path,
     upgrade,
 )
-from agent_bridge.paths import bundled_skill
+
+OLD_SKILL = "---\nname: agent-bridge\ndescription: old coordinator skill\n---\n\n# Dispatching workers\n"
 
 
-def test_bundled_skill_is_present_in_checkout():
-    path = bundled_skill()
-    assert path.is_file()
-    assert path.name == "SKILL.md"
-    assert "dispatch_task" in path.read_text(encoding="utf-8")
+def _plant_old_skill(home, *, stamp: bool = True):
+    for dest in skill_destinations(home):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(OLD_SKILL, encoding="utf-8")
+    if stamp:
+        path = skill_stamp_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("abc\n", encoding="utf-8")
 
 
 def test_detect_uv_tool_install(tmp_path):
@@ -37,33 +41,48 @@ def test_detect_checkout():
     assert (checkout_root() / "pyproject.toml").is_file()
 
 
-def test_skill_destinations_include_zcode_and_claude(tmp_path):
+def test_retire_removes_old_copies_and_stamp(tmp_path):
+    _plant_old_skill(tmp_path)
+    removed = retire_coordinator_skill(home=tmp_path)
+    assert removed == skill_destinations(tmp_path)
+    for dest in removed:
+        assert not dest.exists()
+        assert not dest.parent.exists()
+    assert not skill_stamp_path(tmp_path).exists()
+
+
+def test_retire_keeps_foreign_skill_and_other_files(tmp_path):
     dests = skill_destinations(tmp_path)
-    assert any(part == ".zcode" for dest in dests for part in dest.parts)
-    assert any(part == ".claude" for dest in dests for part in dest.parts)
-    assert dests[-1] == tmp_path / ".claude" / "skills" / "agent-bridge" / "SKILL.md"
+    foreign = dests[0]
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("---\nname: my-own-skill\n---\n", encoding="utf-8")
+    ours = dests[1]
+    ours.parent.mkdir(parents=True)
+    ours.write_text(OLD_SKILL, encoding="utf-8")
+    (ours.parent / "notes.md").write_text("mine", encoding="utf-8")
+    assert retire_coordinator_skill(home=tmp_path) == [ours]
+    assert foreign.is_file()
+    assert not ours.exists()
+    assert (ours.parent / "notes.md").is_file()
 
 
-def test_install_skill_writes_host_dirs(tmp_path):
-    written = install_skill(home=tmp_path)
-    expected = skill_destinations(tmp_path)
-    assert written == expected
-    assert any(path.parts[-4:-3] == (".zcode",) or ".zcode" in path.parts for path in written)
-    zcode = tmp_path / ".zcode" / "skills" / "agent-bridge" / "SKILL.md"
-    assert zcode.is_file()
-    for dest in expected:
-        assert dest.is_file()
-        assert dest.read_bytes() == bundled_skill().read_bytes()
+def test_retire_on_start_needs_install_stamp(tmp_path):
+    _plant_old_skill(tmp_path, stamp=False)
+    assert retire_skill_on_start(home=tmp_path) == []
+    assert all(dest.is_file() for dest in skill_destinations(tmp_path))
+    skill_stamp_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    skill_stamp_path(tmp_path).write_text("abc\n", encoding="utf-8")
+    assert len(retire_skill_on_start(home=tmp_path)) == 6
+    assert retire_skill_on_start(home=tmp_path) == []
 
 
-def test_install_skill_only_existing(tmp_path):
-    dest = tmp_path / ".cursor" / "skills" / "agent-bridge" / "SKILL.md"
-    dest.parent.mkdir(parents=True)
-    dest.write_text("old", encoding="utf-8")
-    written = install_skill(home=tmp_path, only_existing=True)
-    assert written == [dest]
-    assert dest.read_bytes() == bundled_skill().read_bytes()
-    assert not (tmp_path / ".codex" / "skills" / "agent-bridge" / "SKILL.md").exists()
+def test_retire_on_start_skips_worker_context_and_pytest(tmp_path, monkeypatch):
+    _plant_old_skill(tmp_path)
+    monkeypatch.setattr("agent_bridge.cli.Path.home", lambda: tmp_path)
+    assert retire_skill_on_start() == []  # PYTEST_CURRENT_TEST without an explicit home
+    monkeypatch.setenv("AGENT_BRIDGE_PARENT_CONTEXT", "worker")
+    assert retire_skill_on_start(home=tmp_path) == []
+    assert all(dest.is_file() for dest in skill_destinations(tmp_path))
 
 
 def test_upgrade_refuses_while_siblings_live():
@@ -72,9 +91,7 @@ def test_upgrade_refuses_while_siblings_live():
 
 
 def test_upgrade_uv_tool(monkeypatch, tmp_path):
-    dest = tmp_path / ".agents" / "skills" / "agent-bridge" / "SKILL.md"
-    dest.parent.mkdir(parents=True)
-    dest.write_text("old", encoding="utf-8")
+    _plant_old_skill(tmp_path)
     monkeypatch.setattr("agent_bridge.cli.Path.home", lambda: tmp_path)
     monkeypatch.setattr("agent_bridge.cli.shutil.which", lambda name: f"/bin/{name}")
     calls: list[list[str]] = []
@@ -85,7 +102,8 @@ def test_upgrade_uv_tool(monkeypatch, tmp_path):
 
     notes = upgrade(kind="uv-tool", siblings=0, run=fake_run)
     assert calls == [["/bin/uv", "tool", "upgrade", "agent-bridge"]]
-    assert dest.read_bytes() == bundled_skill().read_bytes()
+    assert not any(dest.exists() for dest in skill_destinations(tmp_path))
+    assert any("removed old coordinator skill" in note for note in notes)
     assert any("uv tool upgrade" in note for note in notes)
 
 
@@ -99,64 +117,6 @@ def test_help_and_version(capsys):
     out = capsys.readouterr().out
     assert "uv tool install" in out
     assert "Claude Code" in out
-    assert "install-skill" not in out.split("Install:")[1].split("Update:")[0]
+    assert "install-skill" not in out
     main(["--version"])
     assert capsys.readouterr().out.strip()
-
-
-def test_ensure_coordinator_skill_skips_under_pytest(tmp_path, monkeypatch):
-    monkeypatch.setattr("agent_bridge.cli.Path.home", lambda: tmp_path)
-    assert ensure_coordinator_skill() == []
-    assert not any(path.exists() for path in skill_destinations(tmp_path))
-    written = ensure_coordinator_skill(home=tmp_path)
-    assert written
-    assert all(path.is_file() for path in written)
-
-
-def test_ensure_coordinator_skill_skips_worker_context(tmp_path, monkeypatch):
-    monkeypatch.setenv("AGENT_BRIDGE_PARENT_CONTEXT", "worker")
-    assert ensure_coordinator_skill(home=tmp_path) == []
-    assert not any(path.exists() for path in skill_destinations(tmp_path))
-
-
-def test_install_skill_works_in_worker_context(tmp_path, monkeypatch):
-    monkeypatch.setenv("AGENT_BRIDGE_PARENT_CONTEXT", "worker")
-    written = install_skill(home=tmp_path)
-    assert written
-    assert (tmp_path / ".zcode" / "skills" / "agent-bridge" / "SKILL.md").is_file()
-
-
-def test_ensure_coordinator_skill_keeps_local_edits_until_bundle_changes(tmp_path, monkeypatch):
-    written = ensure_coordinator_skill(home=tmp_path)
-    assert len(written) == 6
-    stamp = skill_stamp_path(tmp_path)
-    assert stamp.is_file()
-    local = tmp_path / ".codex" / "skills" / "agent-bridge" / "SKILL.md"
-    local.write_text("mine", encoding="utf-8")
-    old_digest = stamp.read_text(encoding="utf-8").strip()
-    assert ensure_coordinator_skill(home=tmp_path) == []
-    assert local.read_text(encoding="utf-8") == "mine"
-    new_skill = tmp_path / "new_SKILL.md"
-    new_skill.write_text("# changed coordinator skill\n", encoding="utf-8")
-    monkeypatch.setattr("agent_bridge.cli.bundled_skill", lambda: new_skill)
-    rewritten = ensure_coordinator_skill(home=tmp_path)
-    assert len(rewritten) == 6
-    for dest in rewritten:
-        assert dest.read_text(encoding="utf-8") == "# changed coordinator skill\n"
-    assert stamp.read_text(encoding="utf-8").strip() != old_digest
-
-
-def test_install_skill_ignores_stamp(tmp_path):
-    ensure_coordinator_skill(home=tmp_path)
-    local = tmp_path / ".codex" / "skills" / "agent-bridge" / "SKILL.md"
-    local.write_text("mine", encoding="utf-8")
-    written = install_skill(home=tmp_path)
-    assert written
-    assert local.read_text(encoding="utf-8") == bundled_skill().read_text(encoding="utf-8")
-
-
-def test_ensure_coordinator_skill_survives_unreadable_stamp(tmp_path):
-    stamp = skill_stamp_path(tmp_path)
-    stamp.mkdir(parents=True)
-    result = ensure_coordinator_skill(home=tmp_path)
-    assert result == [] or all(path.is_file() for path in result)

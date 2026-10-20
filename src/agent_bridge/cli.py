@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib
+import contextlib
 import json
 import logging
 import os
@@ -12,8 +12,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-from agent_bridge.paths import bridge_home, bundled_skill, ensure_home
-from agent_bridge.persist import atomic_write_text
+from agent_bridge.paths import bridge_home, ensure_home
 from agent_bridge.processes import count_sibling_servers
 from agent_bridge.worker_env import is_worker_context
 
@@ -22,6 +21,9 @@ log = logging.getLogger(__name__)
 GIT_SOURCE = "git+https://github.com/FeiZhuLulu/Agent-Bridge.git"
 PACKAGE = "agent-bridge"
 
+# Where releases before the skill was retired installed the coordinator
+# skill. Nothing writes these any more; retire_coordinator_skill removes
+# the copies those releases left behind.
 SKILL_RELATIVE = (
     Path(".agents") / "skills" / "agent-bridge" / "SKILL.md",
     Path(".cursor") / "skills" / "agent-bridge" / "SKILL.md",
@@ -39,16 +41,14 @@ Usage:
   agent-bridge --quota         print each worker's remaining quota (fresh, no cache)
   agent-bridge --version       print the installed version
   agent-bridge upgrade         one-command update (close coordinators first)
-  agent-bridge install-skill   copy the coordinator skill into host skill dirs
   agent-bridge help            this text
 
 Install:
   uv tool install {GIT_SOURCE}
 
 Then register the MCP server in Codex, Cursor, Kimi Code, ZCode, Grok
-Build, or Claude Code (Devin reads the Cursor entry). Skill files are written when a top-level
-coordinator first starts the server and refreshed after each upgrade;
-ordinary restarts leave your local edits alone.
+Build, or Claude Code (Devin reads the Cursor entry). The MCP handshake
+carries the coordinator rules; no skill file is installed.
 
 Update:
   agent-bridge upgrade
@@ -113,50 +113,59 @@ def skill_stamp_path(home: Path | None = None) -> Path:
     return root / "skill.sha256"
 
 
-def ensure_coordinator_skill(*, home: Path | None = None) -> list[Path]:
-    """Drop the skill into host skill dirs. Fail-open; skip under pytest.
+def _is_bridge_skill(path: Path) -> bool:
+    """True when ``path`` is a coordinator skill an older Bridge installed."""
+    try:
+        head = path.read_text(encoding="utf-8", errors="replace")[:2000]
+    except OSError:
+        return False
+    if not head.startswith("---"):
+        return False
+    front = head.split("---", 2)[1] if head.count("---") >= 2 else ""
+    return any(line.strip() == "name: agent-bridge" for line in front.splitlines())
 
-    Nested Bridge processes inherited by a worker must not overwrite host
-    skills. ``agent-bridge install-skill`` still writes them on purpose.
+
+def retire_coordinator_skill(*, home: Path | None = None) -> list[Path]:
+    """Delete the coordinator skill copies older releases installed.
+
+    Only a ``SKILL.md`` whose front matter names ``agent-bridge`` is removed,
+    then its folder if that leaves it empty, then the install stamp.
+    Fail-open: a file that cannot be removed is logged and skipped.
+    """
+    removed: list[Path] = []
+    for dest in skill_destinations(home or Path.home()):
+        if not dest.is_file() or not _is_bridge_skill(dest):
+            continue
+        try:
+            dest.unlink()
+        except OSError:
+            log.warning("could not remove old coordinator skill %s", dest, exc_info=True)
+            continue
+        removed.append(dest)
+        # Not empty: the user keeps other files there.
+        with contextlib.suppress(OSError):
+            dest.parent.rmdir()
+    try:
+        skill_stamp_path(home).unlink(missing_ok=True)
+    except OSError:
+        log.warning("could not remove the skill install stamp", exc_info=True)
+    return removed
+
+
+def retire_skill_on_start(*, home: Path | None = None) -> list[Path]:
+    """Run the cleanup once at a top-level start, while an install stamp remains.
+
+    The first ``upgrade`` from an older release runs that release's code, which
+    does not clean up, so the new server finishes the job on its first start.
+    Nested worker-inherited Bridges and pytest runs never touch host files.
     """
     if is_worker_context():
         return []
     if home is None and os.environ.get("PYTEST_CURRENT_TEST"):
         return []
-    if os.environ.get("AGENT_BRIDGE_SKIP_SKILL") == "1":
+    if not skill_stamp_path(home).exists():
         return []
-    try:
-        text = bundled_skill().read_text(encoding="utf-8")
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        stamp = skill_stamp_path(home)
-        try:
-            current = stamp.read_text(encoding="utf-8").strip()
-        except OSError:
-            current = ""
-        if current == digest:
-            return []
-        written = install_skill(home=home)
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(stamp, digest + "\n")
-        return written
-    except OSError:
-        log.warning("could not install coordinator skill", exc_info=True)
-        return []
-
-
-def install_skill(*, home: Path | None = None, only_existing: bool = False) -> list[Path]:
-    source = bundled_skill()
-    if not source.is_file():
-        raise FileNotFoundError(f"bundled skill not found at {source}")
-    content = source.read_bytes()
-    written: list[Path] = []
-    for dest in skill_destinations(home or Path.home()):
-        if only_existing and not dest.is_file():
-            continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(content)
-        written.append(dest)
-    return written
+    return retire_coordinator_skill(home=home)
 
 
 def upgrade(
@@ -197,12 +206,11 @@ def upgrade(
         notes.append(f"git pull && uv sync --extra dev in {root}")
     else:
         raise RuntimeError(
-            "this copy is neither a uv tool install nor a git checkout. "
-            f"Install with: uv tool install {GIT_SOURCE}"
+            f"this copy is neither a uv tool install nor a git checkout. Install with: uv tool install {GIT_SOURCE}"
         )
-    refreshed = install_skill(only_existing=True)
-    if refreshed:
-        notes.append("refreshed " + ", ".join(str(path) for path in refreshed))
+    removed = retire_coordinator_skill()
+    if removed:
+        notes.append("removed old coordinator skill " + ", ".join(str(path) for path in removed))
     return notes
 
 
@@ -213,7 +221,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         from agent_bridge.server import mcp
 
         setup_logging(ensure_home())
-        ensure_coordinator_skill()
+        retire_skill_on_start()
         mcp.run(transport="stdio")
         return
 
@@ -237,11 +245,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         from agent_bridge.quota import describe_quotas
 
         print(json.dumps(asyncio.run(describe_quotas(load_config())), indent=2, ensure_ascii=False))
-        return
-    if command in {"install-skill", "--install-skill"}:
-        written = install_skill()
-        for path in written:
-            print(path)
         return
     if command in {"upgrade", "--upgrade"}:
         for note in upgrade():

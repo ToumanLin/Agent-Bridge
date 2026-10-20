@@ -41,9 +41,8 @@ def test_setup_grok_uses_official_toml_and_permission_rules():
     assert "[compat.cursor]" in setup
     assert "docs.x.ai/build/features/mcp-servers" in setup
     assert "docs.x.ai/build/features/permissions" in setup
-    assert "docs.x.ai/build/features/skills-plugins-marketplaces" in setup
     assert "cancel_task" in setup
-    assert "end_session" in setup
+    assert "end_session" not in setup
     assert "nested/" in setup
     assert "read-only" not in setup
 
@@ -112,9 +111,8 @@ def test_orchestration_keeps_worker_loop_rules_in_both_languages():
             "wait_task",
             "get_result",
             "session_id",
-            "end_session",
+            "continue_task",
             "dispatch_enabled",
-            "runtime_context",
             "git diff",
             "stall_timeout_sec",
             "silent_for_sec",
@@ -135,11 +133,22 @@ def test_orchestration_keeps_worker_loop_rules_in_both_languages():
     assert "nested/" in zh
 
 
-def test_skill_mentions_stall_watchdog():
-    skill = _read("skills/agent-bridge/SKILL.md")
-    assert "stall_timeout_sec" in skill
-    assert "silent_for_sec" in skill
+def test_stall_watchdog_documented_and_retired_tools_gone():
     assert _read("README.md").count("stall_timeout_sec") >= 2
+    assert not (ROOT / "skills" / "agent-bridge").exists()
+    retired = (
+        "check_task",
+        "pause_task",
+        "resume_task",
+        "end_session",
+        "get_transcript",
+        "list_sessions",
+        "install-skill",
+    )
+    for name in ("ORCHESTRATION.md", "ORCHESTRATION.zh-CN.md", "README.md"):
+        text = _read(name)
+        for tool in retired:
+            assert tool not in text, f"{tool} still in {name}"
 
 
 def test_docs_cover_long_wait_and_token_efficient_patterns():

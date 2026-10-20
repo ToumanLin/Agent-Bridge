@@ -2385,6 +2385,52 @@ class Registry:
         log.info("task_paused task_id=%s session_id=%s", task_id, task.session_id)
         return self._task_snapshot(self.tasks.get(task_id, task), include_result=True)
 
+    async def stop_task(self, task_id: str) -> dict:
+        """The MCP cancel: end a turn gracefully and keep it resumable.
+
+        An in-flight task of this instance takes the pause path (partial
+        result kept, force-cancelled only after PAUSE_GRACE_SEC); a terminal
+        one is reported as it is. Anything else — a dead owner's row to adopt,
+        a live sibling's row to refuse, an unknown id — goes through
+        cancel_task, which already handles those.
+        """
+        task = self.tasks.get(task_id)
+        if task is None:
+            return await self.cancel_task(task_id)
+        if not self.dispatch_enabled:
+            raise RuntimeError(NESTED_CANCEL_ERROR)
+        if task.status in TERMINAL_STATUSES:
+            return self._task_snapshot(task)
+        return await self.pause_task(task_id)
+
+    def quota_warnings(self, agent: str, model: str | None) -> list[str]:
+        """Warnings from the cached quota reading for a dispatch; never fetches.
+
+        A model-specific window (``weekly:opus``) at 0% matters even when the
+        shared status is ok, so it is checked against the requested model.
+        """
+        status = self._quota_cache.get(agent) or self._quota_cache.last_good(agent)
+        if status is None:
+            return []
+        warnings: list[str] = []
+        if status.status == "exhausted":
+            resets = sorted(w.resets_at for w in status.windows if w.resets_at)
+            when = f"; earliest reset {resets[0]}" if resets else ""
+            warnings.append(f"{agent} quota is exhausted; the turn will most likely fail{when}")
+        lowered = (model or "").lower()
+        for window in status.windows:
+            name = window.name or ""
+            family = name.split(":", 1)[1] if ":" in name else ""
+            if not family or family not in lowered:
+                continue
+            if window.remaining_percent is not None and window.remaining_percent <= 0:
+                when = f"; resets {window.resets_at}" if window.resets_at else ""
+                warnings.append(f"{agent} {name} quota is at 0% for {model}{when}")
+        return warnings
+
+    def session_titles(self) -> dict[str, str | None]:
+        return {session_id: session.title for session_id, session in self.sessions.items()}
+
     async def resume_task(
         self,
         task_id: str,

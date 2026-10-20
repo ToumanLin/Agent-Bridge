@@ -43,7 +43,7 @@ uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git
 codex mcp add agent_bridge -- %USERPROFILE%\.local\bin\agent-bridge.exe
 ```
 
-Restart Codex. The coordinator skill is written the first time the server starts. More hosts and proxy notes: [SETUP.md](SETUP.md).
+Restart Codex. The rules a coordinator needs arrive with the MCP handshake; nothing else is installed. More hosts and proxy notes: [SETUP.md](SETUP.md).
 
 ### Connect Cursor
 
@@ -101,35 +101,31 @@ Close coordinators that are holding Bridge, then `agent-bridge upgrade`, then re
 
 | Tool | Role |
 | --- | --- |
-| `list_agents` | Probe workers, report remaining quota, proxy/env + coordinator policy |
+| `list_agents` | Workers, availability, remaining quota, per-worker notes, routing mode / instructions |
 | `set_preferences` | Persist coordinator mode / routing preferences |
-| `dispatch_task` | Start or resume a turn in the project `cwd` |
-| `wait_task` | Block up to `timeout_sec` (default 180); a timeout ends the call, never the worker |
-| `check_task` | Non-blocking status |
-| `get_result` | Complete final result in pages + changed files |
-| `get_transcript` | Paged session log |
-| `cancel_task` | Cancel the in-flight turn |
-| `pause_task` | End the turn gracefully; keep it resumable |
-| `resume_task` | Continue a paused/cancelled/failed task on the same session |
-| `list_sessions` | Known sessions |
-| `list_tasks` | This instance's tasks plus sibling-owned ones (`remote` / `owner` metadata) |
-| `end_session` | Shut down a worker process |
+| `dispatch_task` | Start a turn in the project `cwd`, follow up on a `session_id`, or resume an unfinished task with `continue_task` |
+| `wait_task` | Wait up to `timeout_sec` (default 180; `0` just checks); a finished task comes back with the first page of its result |
+| `get_result` | Further pages of a long result |
+| `cancel_task` | End a running turn gracefully; partial result and conversation are kept and it stays resumable |
+| `list_tasks` | Known tasks, to find task ids again after a restart |
 
-`get_result` returns up to 60,000 characters per call. Continue with
-`next_cursor` while `has_more` is true. Detailed work events remain available
-through `get_transcript` and `~/.agent-bridge/transcripts/`; sparse task
+Payloads carry only what a coordinator acts on: null, false, and empty fields
+are left out, and errors come back as MCP tool errors. A finished `wait_task`
+inlines up to 20,000 characters of the result; while `next_cursor` is present,
+`get_result` returns the next page (up to 60,000 characters). Detailed work
+events stay in `~/.agent-bridge/transcripts/` and the dashboard; sparse task
 lifecycle and error summaries use the rotating files in
 `~/.agent-bridge/logs/`. Transcript writes are buffered and reads do not flush
 them to disk. Buffered events reach disk after 64 KB or 30 s, or as soon as a
 turn ends; a normal stop flushes everything, so only a crash or a hard kill can
 lose that last window. A turn whose worker stays silent past `stall_timeout_sec`
-(default 1800 s, per worker) ends `failed` / `stalled`; `check_task` shows
-`silent_for_sec`.
+(default 1800 s, per worker) ends `failed` / `stalled`; a running `wait_task`
+shows `silent_for_sec`.
 
 A pending `wait_task` never polls the model — local waits are event-driven
 inside Bridge — but each returned timeout is a model-visible turn. For a long
 task the token-free pattern is dispatch-and-later-check: `dispatch_task`, end
-the turn, then `check_task` / `get_result` on a later one. Bridge cannot wake a
+the turn, then `wait_task(timeout_sec=0)` on a later one. Bridge cannot wake a
 dormant coordinator at completion; that takes a host scheduler or a later user
 turn. A single ~90-minute wait (`timeout_sec=5400`) works only when the host
 MCP tool timeout exceeds it with margin and the call executes directly — Codex
@@ -137,19 +133,18 @@ Code Mode turns it into repeated model-visible yields. Details:
 [SETUP.md](SETUP.md#waiting-and-timeouts).
 
 Tasks keep their owning Bridge instance. After a coordinator restart, a task a
-live sibling still owns shows `remote: true` in `list_tasks` / `check_task` /
-`wait_task` / `get_result` — the new instance can poll it and read its result,
-but never runs or cancels it; `owner_lost: true` marks one whose owner died
-mid-run. `pause_task` ends an in-flight turn gracefully — the row lands
-terminal (`cancelled` / `stop_reason: "paused"`) with its partial result,
-transcript, and session intact — and `resume_task` continues it as a new,
-linked task on the same conversation. A dead owner's `resumable` row can be
-resumed too: the next instance adopts the session and reaps its orphaned
-worker before respawning, so two executors never drive one conversation. With
-opt-in `[server] shutdown_policy = "linger"`, an orderly host shutdown (stdin
-EOF) lets in-flight turns finish first, bounded by `linger_max_sec` (default
-86400 s); linger cannot defeat a host force-kill of the Bridge process tree —
-park the turn with `pause_task` first, then `resume_task` after the restart.
+live sibling still owns shows `owner: "sibling"` — the new instance can wait on
+it and read its result, but never runs or cancels it; `owner: "lost"` marks one
+whose owner died mid-run. `cancel_task` ends an in-flight turn gracefully — the
+row lands `cancelled` with its partial result, transcript, and session intact —
+and `dispatch_task(continue_task=...)` continues it as a new, linked task on the
+same conversation. A dead owner's resumable row can be continued too: the next
+instance adopts the session and reaps its orphaned worker before respawning, so
+two executors never drive one conversation. With opt-in `[server]
+shutdown_policy = "linger"`, an orderly host shutdown (stdin EOF) lets
+in-flight turns finish first, bounded by `linger_max_sec` (default 86400 s);
+linger cannot defeat a host force-kill of the Bridge process tree — cancel the
+turn first, then continue it after the restart.
 
 ### Remaining quota
 
@@ -165,8 +160,8 @@ timeout_sec` and cached up to `cache_sec` or the earliest window reset. Custom A
 reading. Details: [SETUP.md](SETUP.md#remaining-quota-in-list_agents).
 
 Claude's overall status covers its shared limits. Model-specific weekly limits
-remain in `windows`; check the requested model's window before dispatch, even
-when the overall status is `ok`.
+remain in `windows`; when the requested model's window is at 0%,
+`dispatch_task` adds a warning even though the overall status is `ok`.
 
 ### Coordinator mode
 
@@ -180,7 +175,7 @@ Change it in chat, or set `[coordinator] mode` in `~/.agent-bridge/agents.toml`.
 
 ### Orchestration rulebook
 
-[ORCHESTRATION.md](ORCHESTRATION.md) is the coordinator rulebook: when to dispatch, to whom, how to verify. The skill and MCP handshake instructions are projections of it. First start writes the skill automatically. Chinese: [ORCHESTRATION.zh-CN.md](ORCHESTRATION.zh-CN.md).
+[ORCHESTRATION.md](ORCHESTRATION.md) is the coordinator rulebook: when to dispatch, to whom, how to verify. The MCP handshake instructions are a short projection of it. Chinese: [ORCHESTRATION.zh-CN.md](ORCHESTRATION.zh-CN.md).
 
 ### Tests
 
@@ -222,7 +217,7 @@ uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git
 codex mcp add agent_bridge -- %USERPROFILE%\.local\bin\agent-bridge.exe
 ```
 
-重启 Codex。协调者 skill 会在服务器第一次启动、以及升级后内容变化时自动写入；平时重启不会覆盖你的本地改动。其它宿主和代理见 [SETUP.md](SETUP.md)。
+重启 Codex。协调者需要的规则随 MCP 握手下发，不会再安装其它文件。其它宿主和代理见 [SETUP.md](SETUP.md)。
 
 ### 接到 Cursor
 
@@ -280,47 +275,40 @@ revivable = true
 
 | 工具 | 作用 |
 | --- | --- |
-| `list_agents` | 探测 worker，报告剩余额度、代理 / 环境 + 协调者策略 |
+| `list_agents` | Worker、是否可用、剩余额度、各 Worker 的固定说明、路由模式 / 偏好 |
 | `set_preferences` | 持久化协调者模式 / 路由偏好 |
-| `dispatch_task` | 在项目 `cwd` 里开始或续上一次回合 |
-| `wait_task` | 最多等待 `timeout_sec`（默认 180）；超时只结束本次调用，不会杀 Worker |
-| `check_task` | 非阻塞状态查询 |
-| `get_result` | 分页读取完整结果 + 改过的文件 |
-| `get_transcript` | 分页会话日志 |
-| `cancel_task` | 取消进行中的回合 |
-| `pause_task` | 优雅结束当前回合，保留可续性 |
-| `resume_task` | 在同一会话上继续已暂停/取消/失败的任务 |
-| `list_sessions` | 已知会话 |
-| `list_tasks` | 本实例任务 + 兄弟实例持有的任务（`remote` / `owner` 元数据） |
-| `end_session` | 关掉 worker 进程 |
+| `dispatch_task` | 在项目 `cwd` 里开一轮；带 `session_id` 追问；用 `continue_task` 续上未完成的任务 |
+| `wait_task` | 最多等待 `timeout_sec`（默认 180；`0` 只查一次）；完成时直接带回结果第一页 |
+| `get_result` | 长结果的后续分页 |
+| `cancel_task` | 优雅结束在途回合；部分结果和会话保留，可以续 |
+| `list_tasks` | 已知任务，重启后用来找回 task id |
 
-`get_result` 每次最多返回 60,000 个字符；`has_more` 为 true 时，用
-`next_cursor` 继续读取。详细工作事件仍可通过 `get_transcript` 和
-`~/.agent-bridge/transcripts/` 查询；任务生命周期及错误摘要写入
+返回体只带协调者用得上的字段：值为空、false 或 null 的字段一律省略，出错时返回
+MCP 工具错误。完成的 `wait_task` 内联最多 20,000 个字符的结果；只要有
+`next_cursor`，就用 `get_result` 取下一页（每页最多 60,000 个字符）。详细工作事件
+保存在 `~/.agent-bridge/transcripts/`，可在面板里看；任务生命周期及错误摘要写入
 `~/.agent-bridge/logs/` 下的轮转日志。转录采用缓冲批量写入，读取不会触发刷盘。
 缓冲事件在累计 64 KB、间隔 30 秒或一轮结束时落盘；正常停止会全部刷出，只有崩溃或被强杀才可能丢掉最后这一窗口。
 Worker 静默超过 `stall_timeout_sec`（默认 1800 秒，可按 Worker 设置）的一轮会以
-`failed` / `stalled` 结束；`check_task` 会给出 `silent_for_sec`。
+`failed` / `stalled` 结束；运行中的 `wait_task` 会给出 `silent_for_sec`。
 
 挂起的 `wait_task` 不会轮询模型——本地等待在 Bridge 内部由事件驱动——但每次
 超时返回都是一个模型可见的回合。长任务的零轮询模式是「派发后稍后再查」：
-`dispatch_task` 之后结束本轮，稍后 `check_task` / `get_result`。Bridge 无法
+`dispatch_task` 之后结束本轮，稍后 `wait_task(timeout_sec=0)`。Bridge 无法
 在任务完成时唤醒休眠的协调者——得靠宿主定时机制或用户的下一轮。单次约
 90 分钟的等待（`timeout_sec=5400`）只在宿主 MCP 工具超时高于它并留余量、
 且该调用直接执行时成立——Codex Code Mode 会把它切成一串模型可见的 yield。
 细节见 [SETUP.md](SETUP.md#waiting-and-timeouts)。
 
-任务始终归属创建它的 Bridge 实例。协调者重启后，仍由其他存活实例持有的任务在
-`list_tasks` / `check_task` / `wait_task` / `get_result` 中显示 `remote: true`
-——新实例可以继续跟踪并读取其结果，但不会运行或取消它；`owner_lost: true`
-表示持有方已中途退出。`pause_task` 会优雅结束在途回合——任务行落为终态
-（`cancelled` / `stop_reason: "paused"`），部分结果、转录和会话都保留；
-`resume_task` 再以同一会话上的新任务继续。持有方已死的 `resumable` 任务
-也能续：下一个实例会先收养其会话、清掉孤儿 worker 再重新拉起，同一会话不会
-出现两个执行体。开启 `[server] shutdown_policy = "linger"` 后，正常关闭
-宿主（stdin EOF）会先等在途回合跑完，上限为 `linger_max_sec`（默认 86400 秒）；
-linger 无法对抗宿主强杀整个 Bridge 进程树——要跨重启保活，先 `pause_task`，
-重启后再 `resume_task`。
+任务始终归属创建它的 Bridge 实例。协调者重启后，仍由其他存活实例持有的任务显示
+`owner: "sibling"`——新实例可以等待并读取其结果，但不会运行或取消它；
+`owner: "lost"` 表示持有方已中途退出。`cancel_task` 会优雅结束在途回合——任务行
+落为 `cancelled`，部分结果、转录和会话都保留；`dispatch_task(continue_task=...)`
+再以同一会话上的新任务继续。持有方已死的可续任务也能续：下一个实例会先收养其会话、
+清掉孤儿 worker 再重新拉起，同一会话不会出现两个执行体。开启 `[server]
+shutdown_policy = "linger"` 后，正常关闭宿主（stdin EOF）会先等在途回合跑完，
+上限为 `linger_max_sec`（默认 86400 秒）；linger 无法对抗宿主强杀整个 Bridge
+进程树——要跨重启保活，先取消该回合，重启后再续。
 
 ### 剩余额度
 
@@ -334,7 +322,7 @@ Codex（app-server）、Kimi Code（`kimi login`）
 可以打印一份不走缓存的读数。细节见 [SETUP.md](SETUP.md#remaining-quota-in-list_agents)。
 
 Claude 的整体状态只汇总通用额度；模型专属周额度保留在 `windows` 中。
-即使整体为 `ok`，派发前仍需检查指定模型的窗口。
+指定模型的窗口为 0% 时，即使整体为 `ok`，`dispatch_task` 也会附带一条警告。
 
 ### 协调者档位
 
@@ -348,7 +336,7 @@ Claude 的整体状态只汇总通用额度；模型专属周额度保留在 `wi
 
 ### 协调规则书
 
-[ORCHESTRATION.md](ORCHESTRATION.md) 是给协调者的规则书：什么时候派、派给谁、怎么验收。skill 和 MCP 握手 instructions 是它的投影。第一次启动会自动写入 skill。中文译本：[ORCHESTRATION.zh-CN.md](ORCHESTRATION.zh-CN.md)。
+[ORCHESTRATION.md](ORCHESTRATION.md) 是给协调者的规则书：什么时候派、派给谁、怎么验收。MCP 握手 instructions 是它的精简投影。中文译本：[ORCHESTRATION.zh-CN.md](ORCHESTRATION.zh-CN.md)。
 
 ### 测试
 

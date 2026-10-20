@@ -101,7 +101,7 @@ def prepare_lab(lab: Path, opencode_model: str) -> tuple[Path, Path]:
                 "You are the Agent Bridge coordinator in this folder.",
                 "Workers are reached only through MCP tools named",
                 "`mcp__agent-bridge__list_agents`, `dispatch_task`, `wait_task`,",
-                "`get_result`, `list_sessions`, and `end_session`.",
+                "`get_result`, `cancel_task`, and `list_tasks`.",
                 "Do not run `opencode`, `claude`, or `claude-agent-acp`.",
                 "Do not create worker files yourself.",
                 "",
@@ -147,9 +147,8 @@ def collect_tools(stream_text: str) -> list[str]:
             "mcp__agent-bridge__dispatch_task",
             "mcp__agent-bridge__wait_task",
             "mcp__agent-bridge__get_result",
-            "mcp__agent-bridge__end_session",
-            "mcp__agent-bridge__check_task",
-            "mcp__agent-bridge__list_sessions",
+            "mcp__agent-bridge__cancel_task",
+            "mcp__agent-bridge__list_tasks",
         ):
             if token in blob and token not in names:
                 names.append(token)
@@ -178,7 +177,7 @@ def run_claude(lab: Path, mcp_path: Path, prompt: str, claude_home: Path) -> sub
         "--disallowedTools",
         "Write,Edit,NotebookEdit,Bash,Skill",
         "--allowedTools",
-        "mcp__agent-bridge__list_agents,mcp__agent-bridge__dispatch_task,mcp__agent-bridge__wait_task,mcp__agent-bridge__check_task,mcp__agent-bridge__get_result,mcp__agent-bridge__get_transcript,mcp__agent-bridge__list_sessions,mcp__agent-bridge__end_session,Read",
+        "mcp__agent-bridge__list_agents,mcp__agent-bridge__dispatch_task,mcp__agent-bridge__wait_task,mcp__agent-bridge__get_result,mcp__agent-bridge__cancel_task,mcp__agent-bridge__list_tasks,Read",
     ]
     print("run:", " ".join(argv[:4]), "...")
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
@@ -200,18 +199,18 @@ def prompt_for(lab: Path, opencode_model: str) -> str:
     target = (lab / COORD_FILE).resolve()
     return f"""You are the coordinator. Users talk only to you.
 
-Use Agent Bridge MCP tools only. The tools are named mcp__agent-bridge__list_agents, mcp__agent-bridge__dispatch_task, mcp__agent-bridge__wait_task, mcp__agent-bridge__get_result, mcp__agent-bridge__list_sessions, mcp__agent-bridge__end_session.
+Use Agent Bridge MCP tools only. The tools are named mcp__agent-bridge__list_agents, mcp__agent-bridge__dispatch_task, mcp__agent-bridge__wait_task, mcp__agent-bridge__get_result, mcp__agent-bridge__list_tasks.
 
 Do not run opencode or any other CLI. Do not create {COORD_FILE} yourself.
 
 1. Call list_agents. Confirm opencode is available and dispatch_enabled is true.
 2. dispatch_task with agent="opencode", cwd="{lab.resolve()}", model="{opencode_model}", user_requested=true, message exactly:
 Create a file named {COORD_FILE} in the working directory containing exactly the text hello-bridge. Do not do anything else.
-3. Loop wait_task until the task is terminal. A timeout is not failure; call wait_task again.
-4. get_result.
+3. Loop wait_task until the task is terminal. A running answer is not failure; call wait_task again.
+4. The finished wait_task carries the result; call get_result only while next_cursor is present.
 5. dispatch_task again on the same session_id with message:
 Append a second line `round-two` to {COORD_FILE}. Keep the first line unchanged.
-6. wait_task until terminal, then get_result, then end_session.
+6. wait_task until terminal.
 
 The file on disk that must exist afterwards is {target}. You do not write it.
 """

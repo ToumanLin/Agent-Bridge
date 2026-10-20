@@ -112,10 +112,9 @@ async def test_tool_forwards_request_id_and_reports_payload_conflict(bridge_home
     args = dict(ctx=ctx, agent="fake", message="hello", cwd=str(tmp_path), request_id=str(uuid.uuid4()))
     try:
         first = await dispatch_task(**args)
-        assert first["ok"] is True
+        assert set(first) == {"task_id", "session_id"}
         assert await dispatch_task(**args) == {**first, "reused": True}
-        conflict = await dispatch_task(**{**args, "message": "different"})
-        assert conflict["ok"] is False
-        assert conflict["error_type"] == "ValueError"
+        with pytest.raises(RuntimeError, match="different dispatch request"):
+            await dispatch_task(**{**args, "message": "different"})
     finally:
         await registry.stop()

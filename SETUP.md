@@ -8,7 +8,7 @@ Codex, Cursor, Kimi Code, ZCode, Grok Build, Claude Code, and Devin can all act 
 uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git
 ```
 
-That is the whole install. Then register the MCP server in the coordinator. The first time a top-level host starts Bridge, the coordinator skill is written automatically (skipped if Bridge was inherited inside a worker); later starts rewrite it only after the bundled skill changed, so local edits survive restarts but not upgrades. Need [uv](https://docs.astral.sh/uv/) first.
+That is the whole install. Then register the MCP server in the coordinator. The coordinator's rules arrive with the MCP handshake; no skill file is installed. Releases that did install an `agent-bridge` skill have it removed by `agent-bridge upgrade` and by the first top-level start of this version. Need [uv](https://docs.astral.sh/uv/) first.
 
 ## Resolve the Agent Bridge executable
 
@@ -62,7 +62,7 @@ npm install -g @deepseek-ai/dsh-acp-demo
 .\.venv\Scripts\python.exe scripts\install_dsh_acp.py
 ```
 
-The helper writes `$AGENT_BRIDGE_HOME/dsh-acp` (default `~/.agent-bridge/dsh-acp`) and installs the ACP peers the cordis file imports. Bridge copies that cordis file next to the chosen `node_modules` so ESM can resolve plugins. An unbuilt checkout `src/bin.ts` is ignored unless `tsx` is installed. DSH persistence is `$AGENT_BRIDGE_HOME/dsh-sessions/<session_id>` so a user project does not get `./.sessions`. `get_result.files_changed` is a turn-scoped workspace diff, not only ACP tool_call events (DSH often sends none). It is capped at 200 paths; `files_changed_total` / `files_changed_truncated` tell you when to fall back to `git status`.
+The helper writes `$AGENT_BRIDGE_HOME/dsh-acp` (default `~/.agent-bridge/dsh-acp`) and installs the ACP peers the cordis file imports. Bridge copies that cordis file next to the chosen `node_modules` so ESM can resolve plugins. An unbuilt checkout `src/bin.ts` is ignored unless `tsx` is installed. DSH persistence is `$AGENT_BRIDGE_HOME/dsh-sessions/<session_id>` so a user project does not get `./.sessions`. A finished task's `files_changed` is a turn-scoped workspace diff, not only ACP tool_call events (DSH often sends none). It is capped at 200 paths; `files_more` tell you when to fall back to `git status`.
 
 Restart Codex after editing `config.toml`.
 
@@ -78,7 +78,7 @@ Then `wait_task(timeout_sec=5400)` can stay pending as one request. Keep margin 
 MCP tool definitions are negotiated when the stdio connection starts. Adding
 or changing a tool in Bridge therefore does not update a coordinator that is
 already connected: its in-memory catalog can continue to show the previous
-set (for example, without `pause_task` / `resume_task`). After any tool
+set (for example, still listing `check_task` after an upgrade removed it). After any tool
 registration or signature change, close every coordinator that holds a Bridge
 connection, update the installation if needed, and restart the coordinator so
 it performs a fresh `tools/list` request. A plain restart is enough when the
@@ -192,7 +192,6 @@ ZCode has **three** JSON shapes. Do not mix them.
 - `timeoutMs` is milliseconds. 600000 leaves room for `wait_task` default 180 s. Without it, poll about 15–20 s.
 - If a `.zcode` file in the **same scope** already lists any MCP server, ZCode skips that scope's `.agents/mcp.json` entirely. The two sources are not merged.
 - After saving, confirm the server is enabled under **Settings → MCP 服务器** (configured-MCP group). Agent Bridge is a hand-added stdio server, not a marketplace plugin — it will not appear under 设置 → 插件 / 插件市场. Official: [MCP](https://zcode.z.ai/cn/docs/mcp-services), [Plugin](https://zcode.z.ai/cn/docs/plugin), [Skill](https://zcode.z.ai/en/docs/skill).
-- Native user skills live in `%USERPROFILE%\.zcode\skills`. Bridge writes `agent-bridge` there on first top-level start.
 
 ## Register the MCP server (Grok Build)
 
@@ -215,9 +214,9 @@ pattern = "agent_bridge__*"
 - `startup_timeout_sec` / `tool_timeout_sec` are seconds. Official Grok default for tools is 6000; 600 is the Agent Bridge recommendation so `wait_task` default 180 s has headroom. If the host still kills the call, poll about 30–45 s.
 - Permission rules use the official verbose `[[permission.rules]]` form. MCP tools are named `{server}__{tool}` (for example `agent_bridge__dispatch_task`).
 - Project files may contain MCP servers and permission rules. `[ui] permission_mode` is a user-level setting — do not put it in a project example.
-- Grok also discovers the coordinator skill from `%USERPROFILE%\.agents\skills` (already installed). It reads `~/.grok/skills` too; Bridge does not need a second copy. Official: [MCP](https://docs.x.ai/build/features/mcp-servers), [permissions](https://docs.x.ai/build/features/permissions), [skills](https://docs.x.ai/build/features/skills-plugins-marketplaces).
+- Official: [MCP](https://docs.x.ai/build/features/mcp-servers), [permissions](https://docs.x.ai/build/features/permissions), [skills](https://docs.x.ai/build/features/skills-plugins-marketplaces).
 - Grok also merges `~/.cursor/mcp.json` and project `.cursor/mcp.json` below `config.toml` ([compat](https://docs.x.ai/build/features/mcp-servers)). That second server is usually named `agent-bridge` (hyphen). To test the native `[mcp_servers.agent_bridge]` block only, set `[compat.cursor] mcps = false` (and `[compat.claude] mcps = false` if needed). `grok inspect` shows each server's origin.
-- Grok as a **worker** is a different process. If that worker inherits this MCP config, the nested Bridge has dispatch, preference updates, cancel/pause/resume, and session shutdown disabled: `dispatch_enabled=false`, and nested `dispatch_task` / `set_preferences` / `cancel_task` / `pause_task` / `resume_task` / `end_session` are rejected. It also uses a `nested/` subdirectory of `AGENT_BRIDGE_HOME` so it cannot share the coordinator's `state.json`. A host that env-clears the MCP child drops both the worker-context mark and that home override; Grok's stdio MCP does not env-clear.
+- Grok as a **worker** is a different process. If that worker inherits this MCP config, the nested Bridge has dispatch, preference updates, and cancel disabled: `dispatch_enabled=false`, and nested `dispatch_task` / `set_preferences` / `cancel_task` are rejected. It also uses a `nested/` subdirectory of `AGENT_BRIDGE_HOME` so it cannot share the coordinator's `state.json`. A host that env-clears the MCP child drops both the worker-context mark and that home override; Grok's stdio MCP does not env-clear.
 
 CLI checks:
 
@@ -275,7 +274,6 @@ Use `--scope user` for every project. After adding, put `"timeout": 600000` on t
 ```
 
 MCP tools are named `mcp__{server}__{tool}` (for example `mcp__agent-bridge__dispatch_task`). Do not put `permissions.defaultMode` in a project example — that is a user-scoped preference.
-- Native user skills live in `%USERPROFILE%\.claude\skills`. Bridge writes `agent-bridge` there on first top-level start. Claude Code does **not** read `~/.agents/skills`.
 - Rules file: copy [ORCHESTRATION.md](ORCHESTRATION.md) as `CLAUDE.md` at the project root (native). Claude Code may also read `AGENTS.md`; CLAUDE.md is the one to use when you have a choice.
 - Claude Code stdio MCP inherits the process environment (no Codex-style env-clear). Still use the resolved absolute `command`.
 - Claude Code as a **worker** is a different process (`claude-agent-acp`, not the product TUI). If that worker inherits this MCP config from the project `.mcp.json`, the nested Bridge has dispatch, preference updates, cancel, and session shutdown disabled.
@@ -324,8 +322,8 @@ One command, after you close every coordinator that is holding a Bridge instance
 agent-bridge upgrade
 ```
 
-- `uv tool` install → `uv tool upgrade agent-bridge`, then refresh skill copies that already exist.
-- git checkout → `git pull` and `uv sync --extra dev` in that checkout, then the same skill refresh.
+- `uv tool` install → `uv tool upgrade agent-bridge`, then remove `agent-bridge` skill copies older releases installed.
+- git checkout → `git pull` and `uv sync --extra dev` in that checkout, then the same skill cleanup.
 - Anything else → the command tells you to `uv tool install git+https://github.com/FeiZhuLulu/Agent-Bridge.git`.
 
 Restart Codex / Cursor / Kimi Code / ZCode / Grok Build / Claude Code so they reconnect and pick up new tools and the MCP handshake instructions.
@@ -346,19 +344,19 @@ error: failed to remove file `...\.venv\Lib\site-packages\../../Scripts/agent-br
 
 If you still launch from a checkout, use `uv --directory … run --no-sync agent-bridge` or `.venv/Scripts/python.exe -m agent_bridge`. POSIX hosts can replace a running binary, so this failure is Windows-only. `agent-bridge upgrade` / `uv tool upgrade` also need the coordinators closed first — same lock.
 
-Instances share the `~/.agent-bridge` state directory but not sessions: every session and task record carries the identity of the Bridge instance that owns it. `list_sessions` shows only the calling instance's records, saves leave a live sibling's records untouched on disk, and records whose owning instance has exited are adopted at the next boot — their in-flight tasks surface as `failed` / `bridge_restarted`. A session started from one host is continued from that host; it does not appear in another host's `list_sessions` while its owner is alive.
+Instances share the `~/.agent-bridge` state directory but not sessions: every session and task record carries the identity of the Bridge instance that owns it. Saves leave a live sibling's records untouched on disk, and records whose owning instance has exited are adopted at the next boot — their in-flight tasks surface as `failed` / `bridge_restarted`. A session started from one host is continued from that host while its owner is alive.
 
-Its task rows stay visible though: with `server.remote_tasks` on (the default), `list_tasks`, `check_task`, `wait_task`, and `get_result` resolve a task a live sibling still owns as `remote: true` with `owner` (`pid` / `create_time` / `alive`) metadata — a restarted coordinator can rediscover a task by id, keep polling it, and read the finished result, but it can never run or control it (`cancel_task`, `pause_task`, and `resume_task` on a live sibling's task are rejected; `owner_lost: true` marks a queued/running task whose owner already died — `resume_task` / `cancel_task` adopt that row). Set `remote_tasks = false` to restore the old local-only behavior where such ids answer `unknown task`.
+Its task rows stay visible though: with `server.remote_tasks` on (the default), `list_tasks`, `wait_task`, and `get_result` resolve a task a live sibling still owns with `owner: "sibling"` — a restarted coordinator can rediscover a task by id, keep waiting on it, and read the finished result, but it can never run or control it (`cancel_task` on a live sibling's task is rejected, and `dispatch_task(continue_task=...)` on one is handed to that owner through the shared queue; `owner: "lost"` marks a task whose owner already died — `cancel_task` and `continue_task` adopt that row). Set `remote_tasks = false` to restore the old local-only behavior where such ids answer `unknown task`.
 
 ## Server lifecycle
 
 Abandoned server instances self-exit: after `server.idle_exit_sec` (default 7200 s) with no MCP requests and no queued or running tasks, the process shuts its workers down and exits. Configure in `[server]` (repo `agents.toml` or `%USERPROFILE%\.agent-bridge\agents.toml`); `idle_exit_sec = 0` disables it. `list_agents` also warns when other Bridge instances are running on this machine — one per coordinator host is normal, a pile-up means a host keeps abandoning spawns.
 
-`server.shutdown_policy` decides what an orderly host close (MCP stdio transport EOF / lifespan shutdown) does to in-flight turns. The default `cancel` cancels them at once, unchanged from before. Opt-in `linger` instead keeps the Bridge process alive until they finish — transcript, result artifact, and `state.json` all land as usual — bounded by `server.linger_max_sec` (default 86400 s); whatever is still running at the deadline is cancelled and normal teardown proceeds, so shutdown never hangs unbounded. `list_agents` reports both values in its `server` block.
+`server.shutdown_policy` decides what an orderly host close (MCP stdio transport EOF / lifespan shutdown) does to in-flight turns. The default `cancel` cancels them at once, unchanged from before. Opt-in `linger` instead keeps the Bridge process alive until they finish — transcript, result artifact, and `state.json` all land as usual — bounded by `server.linger_max_sec` (default 86400 s); whatever is still running at the deadline is cancelled and normal teardown proceeds, so shutdown never hangs unbounded. Neither value is reported over MCP; read them from `agents.toml`.
 
-Linger only covers an orderly close while the Bridge process itself stays alive and keeps owning the worker pipes. Force-killing it (`taskkill /f`, `kill -9`, Codex terminating its MCP Job Object) loses the live turn regardless of policy — linger cannot defeat a host force-kill. To carry work across one, park the turn with `pause_task` first and continue it with `resume_task` after the restart. Stronger guarantees would need a persistent daemon, which Bridge deliberately is not.
+Linger only covers an orderly close while the Bridge process itself stays alive and keeps owning the worker pipes. Force-killing it (`taskkill /f`, `kill -9`, Codex terminating its MCP Job Object) loses the live turn regardless of policy — linger cannot defeat a host force-kill. To carry work across one, end the turn with `cancel_task` first and continue it with `dispatch_task(continue_task=...)` after the restart. Stronger guarantees would need a persistent daemon, which Bridge deliberately is not.
 
-`pause_task` is the graceful way to park an in-flight turn: the adapter's own cancel runs first so the partial result, usage, transcript, and native session id all land through the normal return path, then the task ends terminal — `status=cancelled`, `stop_reason="paused"`, `paused=true`, `resumable=true`. It is a safe cancel, not frozen execution; no worker protocol can suspend a turn mid-flight. `resume_task` (accepting paused, cancelled, or failed rows) dispatches a **new** continuation task on the same session and native conversation — the old row is never rewritten, it just gains `resumed_by`, and the new one carries `resume_of` and `source="resume"`. Omitting `message` sends a default "pick up where the paused turn left off" prompt. Snapshots and `list_tasks` report `paused` / `resumable` / `resume_hint`, and `resume_task` rejects a live sibling's task while adopting a dead owner's — reaping the orphaned worker first so two executors never drive one conversation.
+`cancel_task` is graceful: the adapter's own cancel runs first so the partial result, usage, transcript, and native session id all land through the normal return path (a turn still running after 10 s is force-cancelled), then the task ends `cancelled` with `resumable: true`. It is a safe cancel, not frozen execution; no worker protocol can suspend a turn mid-flight. `dispatch_task(continue_task=<task_id>)` (accepting cancelled or failed rows) dispatches a **new** continuation task on the same session and native conversation — the old row is never rewritten, it just gains `resumed_by`, and the new one carries `resume_of` (both shown in `list_tasks`). Omitting `message` sends a default "pick up where the previous turn left off" prompt; continuing the same row twice returns the first continuation with `reused: true`. A dead owner's row is adopted first — reaping the orphaned worker so two executors never drive one conversation.
 
 ## Waiting and timeouts
 
@@ -366,13 +364,13 @@ Five separate clocks decide how long things run — do not conflate them:
 
 | Control | Owner | What it bounds |
 | --- | --- | --- |
-| `wait_task timeout_sec` | This call | How long one observation call blocks (default 180). `timed_out` ends the call only; a host-side MCP cancel likewise cuts the waiter, never the worker's background task. |
+| `wait_task timeout_sec` | This call | How long one observation call blocks (default 180; 0 only checks). A `running` answer ends the call only; a host-side MCP cancel likewise cuts the waiter, never the worker's background task. |
 | `[agents.<name>] stall_timeout_sec` | Worker | Silence budget before Bridge fails the turn as `stalled` (default 1800, 0 disables). Worker lifetime is bounded by this plus process survival — not by any waiter. |
 | `[server] idle_exit_sec`, `shutdown_policy`, `linger_max_sec` | Bridge server | Abandoned-server self-exit and orderly-close behavior (see Server lifecycle). A queued/running task already suppresses idle exit. |
 | Host MCP tool timeout | Coordinator host | The per-call ceiling that decides how long one `wait_task` may stay pending: Codex `tool_timeout_sec`, Kimi `toolTimeoutMs`, ZCode `timeoutMs`, Claude `timeout`, Grok `tool_timeout_sec`, Cursor ~45–60 s fixed. |
 | Codex Code Mode exec/wait yield | Codex host | When MCP calls route through Code Mode, the outer `exec` yields and each yield/wait boundary is a model-visible turn (inspected Codex defaults are ~10 s, not a universal 60 s). Bridge cannot set it. |
 
-Token cost: a pending `wait_task` does not poll the model — a local wait parks one Bridge coroutine on an event, and a sibling-owned wait only polls `state.json` inside the Bridge process. What spends coordinator turns is each returned timeout or Code Mode yield the model must re-decide. The zero-polling pattern for long tasks is dispatch-and-later-check: `dispatch_task`, end the turn (or do other work), then `list_tasks` / `check_task` / `get_result` on a later turn. Bridge cannot wake a dormant coordinator at completion — that needs a host scheduler or notification mechanism.
+Token cost: a pending `wait_task` does not poll the model — a local wait parks one Bridge coroutine on an event, and a sibling-owned wait only polls `state.json` inside the Bridge process. What spends coordinator turns is each returned timeout or Code Mode yield the model must re-decide. The zero-polling pattern for long tasks is dispatch-and-later-check: `dispatch_task`, end the turn (or do other work), then `list_tasks` / `wait_task(timeout_sec=0)` on a later turn. Bridge cannot wake a dormant coordinator at completion — that needs a host scheduler or notification mechanism.
 
 ## Remaining quota in `list_agents`
 
@@ -382,22 +380,17 @@ Every `list_agents` row carries a `quota` block so the coordinator can weigh how
 "quota": {
   "status": "ok",
   "windows": [
-    {"name": "5h", "remaining_percent": 82.0, "resets_at": "2026-09-07T05:00:00+00:00", "resets_in_sec": 9120},
-    {"name": "weekly", "remaining_percent": 61.5, "resets_at": "2026-09-11T00:00:00+00:00", "resets_in_sec": 331200}
-  ],
-  "balance": null,
-  "plan": "plus",
-  "source": "codex app-server account/rateLimits/read",
-  "fetched_at": "2026-09-07T02:28:00+00:00",
-  "cached": false,
-  "stale": false,
-  "detail": null
+    {"name": "5h", "remaining_percent": 82.0, "resets_at": "2026-09-07T05:00:00+00:00"},
+    {"name": "weekly", "remaining_percent": 61.5, "resets_at": "2026-09-11T00:00:00+00:00"}
+  ]
 }
 ```
 
+Empty fields are left out: `balance` appears only when the provider reports one, `stale: true` only when a fresh lookup failed and the last good reading is shown, and `detail` only when the status is not `ok`. `agent-bridge --quota` prints the full reading, including plan, source, and fetch time.
+
 - `status` is `ok`, `exhausted` (an applicable window is fully used, or the account is blocked), or `unknown`. `unknown` means Bridge could not read the number — the reason is in `detail` — and never that the quota is empty. Quota does not change `available`, and Bridge does not route on it: the rulebook tells the coordinator to treat it as information next to your `[coordinator] instructions`.
-- `windows[]` are the CLI's rolling limits; `balance` is optional provider-reported credit; `cached` means the reading was reused from the last lookup, `stale` that a fresh lookup failed and the last good reading is shown instead.
-- Claude's `status` summarizes only its shared `5h` and `weekly` limits because `list_agents` has no target model. The `weekly:opus` and `weekly:sonnet` windows retain their values, including zero: the coordinator must check the requested model's window before dispatch. A depleted model alone does not exhaust the shared status; without a usable shared reading, status is `unknown`. An `ok` shared status does not guarantee that a particular model has quota.
+- `windows[]` are the CLI's rolling limits; `balance` is optional provider-reported credit.
+- Claude's `status` summarizes only its shared `5h` and `weekly` limits because `list_agents` has no target model. The `weekly:opus` and `weekly:sonnet` windows retain their values, including zero: when the requested model's window is at zero, `dispatch_task` returns a warning saying so. A depleted model alone does not exhaust the shared status; without a usable shared reading, status is `unknown`. An `ok` shared status does not guarantee that a particular model has quota.
 
 Where each number comes from:
 
@@ -428,13 +421,12 @@ A task that fails with a quota-looking error (`quota`, `rate limit`, `insufficie
 
 ## Orchestration rules
 
-The coordinator learns how to drive the Bridge through three channels; [ORCHESTRATION.md](ORCHESTRATION.md) is the source of truth for all of them ([ORCHESTRATION.zh-CN.md](ORCHESTRATION.zh-CN.md) is the human-readable translation):
+The coordinator learns how to drive the Bridge through two channels; [ORCHESTRATION.md](ORCHESTRATION.md) is the long form ([ORCHESTRATION.zh-CN.md](ORCHESTRATION.zh-CN.md) is the human-readable translation):
 
-1. **MCP instructions — automatic.** The server sends its hard rules (tools-only access, `cwd` semantics, timeout-is-not-failure, verify-yourself) in the MCP handshake. Nothing to install, but hosts vary in how prominently they surface it, so don't rely on it alone.
-2. **Skill — automatic.** The first MCP start, any start after the bundled skill changed, and `agent-bridge upgrade` write [skills/agent-bridge/SKILL.md](skills/agent-bridge/SKILL.md) into the host skill directories. It loads on demand when the coordinator is about to dispatch.
-3. **Rules file — fallback for hosts without skills.** Copy [ORCHESTRATION.md](ORCHESTRATION.md) to the target repository root as `AGENTS.md` (Codex, Cursor, Kimi Code, ZCode, and Grok Build all read it there) or as `CLAUDE.md` for Claude Code, or to `%USERPROFILE%\.codex\AGENTS.md` / `%USERPROFILE%\.kimi-code\AGENTS.md` / `%USERPROFILE%\.claude\CLAUDE.md` for a host-global default; the Cursor-global equivalent is User Rules in Cursor settings. Keep the English file under 9500 characters (Grok may copy it as `AGENTS.md`) and under 32 KiB — Codex concatenates the home file with per-directory `AGENTS.md` files from the git root down to cwd; Kimi Code does the same and warns past 32 KiB.
+1. **MCP instructions and tool descriptions — automatic.** The server sends its hard rules (tools-only access, `cwd` semantics, a running answer is not failure, verify-yourself) in the MCP handshake, and each tool's description says what its arguments and answer mean. Nothing to install.
+2. **Rules file — optional.** Copy [ORCHESTRATION.md](ORCHESTRATION.md) to the target repository root as `AGENTS.md` (Codex, Cursor, Kimi Code, ZCode, and Grok Build all read it there) or as `CLAUDE.md` for Claude Code, or to `%USERPROFILE%\.codex\AGENTS.md` / `%USERPROFILE%\.kimi-code\AGENTS.md` / `%USERPROFILE%\.claude\CLAUDE.md` for a host-global default; the Cursor-global equivalent is User Rules in Cursor settings. Keep the English file under 9500 characters (Grok may copy it as `AGENTS.md`) and under 32 KiB — Codex concatenates the home file with per-directory `AGENTS.md` files from the git root down to cwd; Kimi Code does the same and warns past 32 KiB.
 
-Your own project's `AGENTS.md` stays yours: if you use the skill or the MCP instructions, the rulebook takes no `AGENTS.md` slot at all.
+Your own project's `AGENTS.md` stays yours: if the MCP instructions are enough, the rulebook takes no `AGENTS.md` slot at all.
 
 ## Coordinator mode and routing preferences
 
@@ -477,7 +469,7 @@ The coordinator can pin a worker model and thinking intensity on `dispatch_task`
 dispatch_task(agent="antigravity", model="gemini-3.7-flash", effort="low", ...)
 ```
 
-`agy models` lists slugs such as `gemini-3.7-flash-low`. Either pass that full slug, or pass the family plus `effort=low|medium|high`. New agy sessions get `--new-project` and `--add-dir <cwd>` so work stays in the requested repo, not `~\.gemini\antigravity-cli\scratch`. Grok accepts a `grok models` slug plus `effort=off|low|medium|high|max` (`off` maps to Grok `none`, `max` to Grok `xhigh`). Grok `/new` still starts on the campaign default (currently grok-4.6 xhigh); Bridge calls `session/setModel` after the session exists. Accept Grok model selection from `get_result.observed_model` (Grok `turn_started.model_id`), not from the worker quoting `You are Grok 4.6`. Kimi accepts one of the slugs its own session advertises (`kimi-code/k3`, `kimi-code/k3-256k`, `kimi-code/kimi-for-coding`, ...) plus `effort=off|low|medium|high|max`. OpenCode accepts a `provider/model` slug the session advertises plus the same five effort tokens mapped onto that model's variants. DSH accepts `model="deepseek-official/deepseek-v4-flash"` and `effort=low|high|max`. Changing DSH model/effort on an existing session respawns the process. Claude Code accepts a slug the session advertises (`sonnet`, `opus`, `haiku`, or a full id) plus `effort=off|low|medium|high|max` mapped onto that model's levels (`off` → `default`, `max` → `xhigh` unless the session lists `max`). Codex CLI accepts a Codex slug plus `effort=off|low|medium|high|max` (`off` → `none`). Bridge runs `codex exec --json` with the prompt on stdin and `--approve-for-me` by default. Devin CLI accepts a model id the session advertises (`swe-1-7-medium`, `claude-opus-5-high`, …); the level is part of the id and `effort` is ignored with a warning.
+`agy models` lists slugs such as `gemini-3.7-flash-low`. Either pass that full slug, or pass the family plus `effort=low|medium|high`. New agy sessions get `--new-project` and `--add-dir <cwd>` so work stays in the requested repo, not `~\.gemini\antigravity-cli\scratch`. Grok accepts a `grok models` slug plus `effort=off|low|medium|high|max` (`off` maps to Grok `none`, `max` to Grok `xhigh`). Grok `/new` still starts on the campaign default (currently grok-4.6 xhigh); Bridge calls `session/setModel` after the session exists. Accept Grok model selection from the finished task's `model` (Grok `turn_started.model_id`), not from the worker quoting `You are Grok 4.6`. Kimi accepts one of the slugs its own session advertises (`kimi-code/k3`, `kimi-code/k3-256k`, `kimi-code/kimi-for-coding`, ...) plus `effort=off|low|medium|high|max`. OpenCode accepts a `provider/model` slug the session advertises plus the same five effort tokens mapped onto that model's variants. DSH accepts `model="deepseek-official/deepseek-v4-flash"` and `effort=low|high|max`. Changing DSH model/effort on an existing session respawns the process. Claude Code accepts a slug the session advertises (`sonnet`, `opus`, `haiku`, or a full id) plus `effort=off|low|medium|high|max` mapped onto that model's levels (`off` → `default`, `max` → `xhigh` unless the session lists `max`). Codex CLI accepts a Codex slug plus `effort=off|low|medium|high|max` (`off` → `none`). Bridge runs `codex exec --json` with the prompt on stdin and `--approve-for-me` by default. Devin CLI accepts a model id the session advertises (`swe-1-7-medium`, `claude-opus-5-high`, …); the level is part of the id and `effort` is ignored with a warning.
 
 ## Worker: Kimi Code
 
@@ -492,8 +484,8 @@ kimi login
 
 Two behaviors worth knowing before you read a Kimi result:
 
-- **Thinking levels are declared per model, not global.** Bridge maps `effort` onto whatever the selected model advertises. `kimi-code/k3-256k` only advertises `low` / `high` / `max`, so `medium` lands on `high` and `off` on `low`; a boolean model gets `off` / `on` instead. When nothing maps, `get_result.warnings` says so and the turn still runs on the model's own default.
-- **A failed Kimi turn does not look failed.** Its ACP host maps a failed turn to `stopReason: end_turn` with empty text, so a quota or provider error is indistinguishable on the wire from a clean no-op. Bridge reads Kimi's `wire.jsonl` after every turn and puts the real reason in `get_result.warnings`, alongside `observed_model` / `observed_effort`. Never read an empty Kimi turn as success without checking there.
+- **Thinking levels are declared per model, not global.** Bridge maps `effort` onto whatever the selected model advertises. `kimi-code/k3-256k` only advertises `low` / `high` / `max`, so `medium` lands on `high` and `off` on `low`; a boolean model gets `off` / `on` instead. When nothing maps, the finished task's `warnings` say so and the turn still runs on the model's own default.
+- **A failed Kimi turn does not look failed.** Its ACP host maps a failed turn to `stopReason: end_turn` with empty text, so a quota or provider error is indistinguishable on the wire from a clean no-op. Bridge reads Kimi's `wire.jsonl` after every turn and puts the real reason in the finished task's `warnings`. Never read an empty Kimi turn as success without checking there.
 
 Bridge also forces the session into Kimi's `yolo` mode after creating it (Kimi starts in manual-approval `default` mode), and revives sessions with `session/resume` rather than `session/load`, because `load` replays the entire persisted history before it answers.
 
@@ -508,7 +500,7 @@ opencode auth
 
 OpenCode has **no product login**. You connect providers by storing API keys (or that provider's own oauth) with `opencode auth`. Official routes are OpenCode Zen and OpenCode Go; anything else is just another connected provider. `list_agents` reports the CLI as available when `opencode` is on PATH — a missing provider key only shows up when a turn actually talks to the model.
 
-`dispatch_task.model` is a `provider/model` slug the live session advertises (`opencode/...`, `xai/...`, …). `effort` maps onto that model's variants (`default|low|medium|high` is common; Bridge `max` usually becomes `high`). An unknown slug fails the turn and lists the real options; a model with no variants, or an effort that will not map, comes back as a warning. `get_result.observed_model` / `observed_effort` are the last values Bridge successfully set on the session after that mapping, not a live sampler dump. Switching model on a live session re-applies effort: OpenCode resets the variant to the new model's default. Bridge revives with `session/resume` rather than `session/load`. Permissions are ACP `requestPermission`; Bridge auto-picks `allow-always`.
+`dispatch_task.model` is a `provider/model` slug the live session advertises (`opencode/...`, `xai/...`, …). `effort` maps onto that model's variants (`default|low|medium|high` is common; Bridge `max` usually becomes `high`). An unknown slug fails the turn and lists the real options; a model with no variants, or an effort that will not map, comes back as a warning. The reported `model` / `effort` are the last values Bridge successfully set on the session after that mapping, not a live sampler dump. Switching model on a live session re-applies effort: OpenCode resets the variant to the new model's default. Bridge revives with `session/resume` rather than `session/load`. Permissions are ACP `requestPermission`; Bridge auto-picks `allow-always`.
 
 If OpenCode's configured default model is disabled, the first prompt fails with `Model is disabled`. Pass a slug from `opencode models` for a provider that still has a working key.
 
@@ -522,7 +514,7 @@ Default approval is `--approve-for-me` (auto review + workspace-write). `--yolo`
 
 `dispatch_task.model` is a Codex slug (`gpt-5.6-sol`, …). `effort` maps `off` → `none`; `low|medium|high|max` pass through. Follow-ups reuse `exec resume <thread_id>`.
 
-Config, login, or execpolicy failures that happen before JSONL starts return a bounded stderr tail in `get_result.error`. `get_transcript` keeps the upstream `turn.completed` payload as `raw` and records one normalized `turn_end` per completed turn.
+Config, login, or execpolicy failures that happen before JSONL starts return a bounded stderr tail in the finished task's `error`. The transcript keeps the upstream `turn.completed` payload as `raw` and records one normalized `turn_end` per completed turn.
 
 ## Worker: Claude Code
 
@@ -544,7 +536,7 @@ $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1"
 
 If `OPENROUTER_API_KEY` is set and `ANTHROPIC_AUTH_TOKEN` is not, Bridge copies it and defaults the base URL to OpenRouter **only when** `ANTHROPIC_API_KEY` is also unset. A machine that uses OpenRouter for OpenCode and a direct Anthropic key for Claude keeps the Anthropic key. Set `ANTHROPIC_BASE_URL` yourself if you want that Anthropic key treated as a gateway conflict (Bridge then blanks it once a token and base URL are both present).
 
-`dispatch_task.model` is a slug the live session advertises (`sonnet`, `opus`, `haiku`, or a full id). `effort` maps onto that model's levels (`default|low|medium|high|xhigh` is common; Bridge `off` → `default`, `max` → `xhigh` unless the session lists `max`). An unknown slug fails the turn and lists the real options; a model with no effort option, or an effort that will not map, comes back as a warning. `get_result.observed_model` / `observed_effort` are the last values Bridge successfully set after that mapping. Switching model on a live session re-applies effort. Bridge forces `bypassPermissions` after `session/new` (a fresh session starts in manual `default` mode); if that mode is not advertised — for example when the process is root — ACP `requestPermission` still auto-picks `allow-always`. Revive uses `session/resume`: `session/load` replays the whole history.
+`dispatch_task.model` is a slug the live session advertises (`sonnet`, `opus`, `haiku`, or a full id). `effort` maps onto that model's levels (`default|low|medium|high|xhigh` is common; Bridge `off` → `default`, `max` → `xhigh` unless the session lists `max`). An unknown slug fails the turn and lists the real options; a model with no effort option, or an effort that will not map, comes back as a warning. The reported `model` / `effort` are the last values Bridge successfully set after that mapping. Switching model on a live session re-applies effort. Bridge forces `bypassPermissions` after `session/new` (a fresh session starts in manual `default` mode); if that mode is not advertised — for example when the process is root — ACP `requestPermission` still auto-picks `allow-always`. Revive uses `session/resume`: `session/load` replays the whole history.
 
 ## Worker: Devin CLI
 
@@ -557,7 +549,7 @@ devin auth login
 
 Auth is `devin auth login` on disk or `WINDSURF_API_KEY`. `list_agents` runs `devin auth status` and reports its first line as `auth=`. Bridge drops `ACP_BACKEND` from the worker environment: Devin Desktop stamps that variable on every child process, and with it set the CLI trusts only credentials the ACP host passes in and refuses `session/new` — so a Devin Desktop coordinator can still dispatch to a `devin` worker.
 
-`dispatch_task.model` is a model id the live session advertises (`devin models list`): the level is part of the id (`swe-1-7`, `swe-1-7-medium`, `claude-opus-5-high`), so there is no `effort` option — a Bridge `effort` is ignored with a warning. An unknown id fails the turn and lists the real options. Bridge forces `bypass` after `session/new` (a fresh session starts in `accept-edits`; `DEVIN_PERMISSION_MODE` is parsed but not applied to ACP sessions). Revive uses `session/load` — Devin has no `session/resume` — and Devin ignores `noReplay`, so the persisted history is replayed as `session/update` notifications before `load` answers. Bridge resets its turn state before prompting, so `get_result` and `files_changed` for the new turn are clean, but `get_transcript` will show the replayed history again after a revive; that is a side effect, not the way to fetch history. Mode and model survive the reload. A long session may take longer than the 60 s handshake timeout to replay; if that bites, lower `idle_unload_sec` for devin or open a new session.
+`dispatch_task.model` is a model id the live session advertises (`devin models list`): the level is part of the id (`swe-1-7`, `swe-1-7-medium`, `claude-opus-5-high`), so there is no `effort` option — a Bridge `effort` is ignored with a warning. An unknown id fails the turn and lists the real options. Bridge forces `bypass` after `session/new` (a fresh session starts in `accept-edits`; `DEVIN_PERMISSION_MODE` is parsed but not applied to ACP sessions). Revive uses `session/load` — Devin has no `session/resume` — and Devin ignores `noReplay`, so the persisted history is replayed as `session/update` notifications before `load` answers. Bridge resets its turn state before prompting, so `get_result` and `files_changed` for the new turn are clean, but the transcript will show the replayed history again after a revive; that is a side effect, not the way to fetch history. Mode and model survive the reload. A long session may take longer than the 60 s handshake timeout to replay; if that bites, lower `idle_unload_sec` for devin or open a new session.
 
 ## Permissions
 
