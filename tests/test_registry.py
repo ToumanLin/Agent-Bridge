@@ -60,11 +60,10 @@ async def test_dispatch_records_model_and_effort(bridge_home, tmp_path):
         await registry.stop()
 
 
-async def test_env_status_includes_config_warnings(bridge_home, monkeypatch):
+def test_env_status_includes_config_warnings(bridge_home):
     registry = Registry.create(bridge_home)
     registry.config.warnings = ["unsupported agents.toml section(s) ignored: scheduler"]
-    monkeypatch.setattr("agent_bridge.registry.count_sibling_servers", lambda: 0)
-    assert (await registry.env_status())["warnings"] == registry.config.warnings
+    assert registry.env_status()["warnings"] == registry.config.warnings
 
 
 @pytest.mark.asyncio
@@ -1288,34 +1287,6 @@ def test_registry_injection_overrides_env(bridge_home, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_env_status_does_not_block_event_loop(bridge_home, monkeypatch):
-    def slow_count() -> int:
-        time.sleep(0.5)
-        return 3
-
-    monkeypatch.setattr("agent_bridge.registry.count_sibling_servers", slow_count)
-    ticks = 0
-
-    async def counter() -> None:
-        nonlocal ticks
-        while True:
-            ticks += 1
-            await asyncio.sleep(0.02)
-
-    registry = Registry.create(bridge_home)
-    task = asyncio.create_task(counter())
-    try:
-        status = await registry.env_status()
-        assert ticks >= 10
-        warnings = status.get("warnings") or []
-        assert any("3 other agent-bridge server instance(s)" in item for item in warnings)
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-
-@pytest.mark.asyncio
 async def test_oneshot_adapter_marks_session_idle_unloaded(bridge_home, tmp_path, monkeypatch):
     monkeypatch.setattr(FakeAdapter, "resident", False)
     work = tmp_path / "work"
@@ -1343,23 +1314,6 @@ async def test_oneshot_adapter_marks_session_idle_unloaded(bridge_home, tmp_path
         assert second["session_id"] == first["session_id"]
     finally:
         await registry.stop()
-
-
-@pytest.mark.asyncio
-async def test_env_status_caches_sibling_count(bridge_home, monkeypatch):
-    calls = 0
-
-    def counted() -> int:
-        nonlocal calls
-        calls += 1
-        return 1
-
-    monkeypatch.setattr("agent_bridge.registry.count_sibling_servers", counted)
-    registry = Registry.create(bridge_home)
-    first = await registry.env_status()
-    second = await registry.env_status()
-    assert calls == 1
-    assert first.get("warnings") == second.get("warnings")
 
 
 @pytest.mark.asyncio

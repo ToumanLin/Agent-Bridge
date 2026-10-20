@@ -3,13 +3,16 @@
 Registry keeps its rich internal snapshots (the dashboard, CLI, and tests read
 those). Every MCP answer goes through here instead, so the coordinator only
 sees fields it can act on: no process ids, no duplicate counters, no prose
-hints, and no key whose value is null, false, or empty unless that value is
-the answer (``available``, ``dispatch_enabled``).
+hints, no echo of what the coordinator just sent, and no key whose value is
+null, false, or empty unless that value is the answer (``dispatch_enabled``).
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 # Per-worker facts that never change between calls. They used to ride on every
@@ -63,17 +66,15 @@ def quota_view(quota: Mapping[str, Any] | None) -> dict[str, Any] | None:
 
 
 def agent_view(row: Mapping[str, Any]) -> dict[str, Any]:
-    available = bool(row.get("available"))
+    """One usable worker. Missing ones are only named (agents_view.unavailable):
+    their probe detail is an install hint for a person, not the coordinator."""
     name = row.get("agent")
     return compact(
         {
             "agent": name,
-            "available": available,
-            "detail": None if available else row.get("detail"),
             "note": AGENT_NOTES.get(str(name)),
-            "quota": quota_view(row.get("quota")) if available else None,
-        },
-        keep=("available",),
+            "quota": quota_view(row.get("quota")),
+        }
     )
 
 
@@ -88,17 +89,22 @@ def agents_view(
             "dispatch_enabled": bool(coordinator.get("dispatch_enabled")),
             "instructions": coordinator.get("instructions"),
             "warnings": list(env.get("warnings") or []),
-            "agents": [agent_view(row) for row in agents],
+            "agents": [agent_view(row) for row in agents if row.get("available")],
+            "unavailable": [row.get("agent") for row in agents if not row.get("available")],
         },
         keep=("dispatch_enabled", "agents"),
     )
 
 
-def _stop(reason: Any) -> str | None:
-    """end_turn is the normal case and says nothing; a pause is the MCP cancel."""
+def _stop(reason: Any, status: Any) -> str | None:
+    """end_turn is the normal case and says nothing; a pause is the MCP cancel.
+
+    A reason that only repeats the status (cancelled/cancelled) says nothing either.
+    """
     if reason in {None, "end_turn"}:
         return None
-    return "cancelled" if reason == "paused" else str(reason)
+    reason = "cancelled" if reason == "paused" else str(reason)
+    return None if reason == status else reason
 
 
 def _owner(snapshot: Mapping[str, Any]) -> str | None:
@@ -116,19 +122,23 @@ def _files(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     return compact({"files_changed": files, "files_more": max(0, total - len(files)) or None})
 
 
-# Bookkeeping keys of a run_usage record; the rest are token counters.
-USAGE_META = {"scope", "v"}
+# Keys of a run_usage record the coordinator does not act on: bookkeeping, and
+# the whole conversation's counters on a resumed run (this run's are the answer).
+USAGE_META = {"scope", "v", "conversation_total"}
 
 
 def usage_view(usage: Any) -> dict[str, Any] | None:
     """run_usage without its bookkeeping keys, or None when it counted nothing.
 
     A turn cancelled before the worker reported usage leaves only the
-    bookkeeping keys behind; that block says nothing and is dropped.
+    bookkeeping keys behind; that block says nothing and is dropped. quality
+    is shown only when it is an estimate; exact is the norm.
     """
     if not isinstance(usage, Mapping):
         return None
     view = {key: value for key, value in usage.items() if key not in USAGE_META}
+    if view.get("quality") == "exact":
+        del view["quality"]
     if not any(isinstance(value, (int, float)) and not isinstance(value, bool) for value in view.values()):
         return None
     return view
@@ -151,6 +161,7 @@ def task_view(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     status = snapshot.get("status")
     owner = _owner(snapshot)
     if status in RUNNING:
+        # Progress only: usage arrives once, with the finished answer.
         return compact(
             {
                 "task_id": snapshot.get("task_id"),
@@ -160,7 +171,6 @@ def task_view(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                 "elapsed_sec": snapshot.get("elapsed_sec"),
                 "silent_for_sec": snapshot.get("silent_for_sec"),
                 "activity": snapshot.get("recent_activity"),
-                "run_usage": usage_view(snapshot.get("run_usage")),
                 # A queued/running row whose owner died can never finish.
                 "resumable": bool(snapshot.get("resumable")) if owner == "lost" else None,
             }
@@ -171,7 +181,7 @@ def task_view(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             "task_id": snapshot.get("task_id"),
             "session_id": snapshot.get("session_id"),
             "status": status,
-            "stop_reason": _stop(snapshot.get("stop_reason")),
+            "stop_reason": _stop(snapshot.get("stop_reason"), status),
             "owner": owner,
             "error": snapshot.get("error") if failed else None,
             "error_kind": snapshot.get("error_kind") if failed else None,
@@ -201,31 +211,72 @@ def dispatch_view(result: Mapping[str, Any], warnings: list[str] | None = None) 
         {
             "task_id": result.get("task_id"),
             "session_id": result.get("session_id"),
-            "continues": result.get("resumed_from"),
             "reused": bool(result.get("reused")),
             "warnings": warnings or [],
         }
     )
 
 
-def task_row(row: Mapping[str, Any], session_titles: Mapping[str, str | None]) -> dict[str, Any]:
-    """list_tasks row."""
+def _seconds(stamp: Any) -> Any:
+    """An ISO timestamp without its microseconds."""
+    try:
+        return datetime.fromisoformat(str(stamp)).replace(microsecond=0).isoformat()
+    except ValueError:
+        return stamp
+
+
+def _same_dir(left: Any, right: str) -> bool:
+    try:
+        return os.path.normcase(Path(str(left)).resolve()) == os.path.normcase(Path(right).resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def task_row(row: Mapping[str, Any], title: str | None) -> dict[str, Any]:
+    """list_tasks row. A continuation names its origin (resume_of); the
+    origin's resumed_by would only say the same thing backwards."""
     remote = bool(row.get("remote"))
     owner = None
     if remote:
         owner = "lost" if row.get("owner_lost") or not (row.get("owner") or {}).get("alive", True) else "sibling"
+    status = row.get("status")
     return compact(
         {
             "task_id": row.get("task_id"),
             "session_id": row.get("session_id"),
             "agent": row.get("agent"),
-            "title": session_titles.get(str(row.get("session_id"))),
-            "status": row.get("status"),
-            "stop_reason": _stop(row.get("stop_reason")),
+            "title": title,
+            "status": status,
+            "stop_reason": _stop(row.get("stop_reason"), status),
             "owner": owner,
             "resumable": _resumable(row),
             "resume_of": row.get("resume_of"),
-            "resumed_by": row.get("resumed_by"),
-            "created_at": row.get("created_at"),
+            "created_at": _seconds(row.get("created_at")) if row.get("created_at") else None,
         }
     )
+
+
+def tasks_view(
+    rows: list[Mapping[str, Any]],
+    session_titles: Mapping[str, str | None],
+    *,
+    limit: int,
+    cwd: str | None = None,
+) -> dict[str, Any]:
+    """list_tasks answer: newest first, at most ``limit`` rows (0 = all),
+    optionally only tasks run in ``cwd``. A session's title rides on its
+    newest row only; older rows of the same session_id share it."""
+    if cwd:
+        rows = [row for row in rows if _same_dir(row.get("cwd"), cwd)]
+    rows = sorted(rows, key=lambda row: str(row.get("created_at") or ""), reverse=True)
+    more = max(0, len(rows) - limit) if limit > 0 else 0
+    if more:
+        rows = rows[:limit]
+    titled: set[str] = set()
+    tasks = []
+    for row in rows:
+        session_id = str(row.get("session_id"))
+        title = None if session_id in titled else session_titles.get(session_id)
+        titled.add(session_id)
+        tasks.append(task_row(row, title))
+    return compact({"tasks": tasks, "tasks_more": more or None}, keep=("tasks",))

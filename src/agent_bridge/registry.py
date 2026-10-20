@@ -10,8 +10,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-import psutil
-
 from agent_bridge.adapters import build_adapter
 from agent_bridge.adapters.antigravity import check_agy_model_effort
 from agent_bridge.adapters.base import Adapter
@@ -39,7 +37,6 @@ from agent_bridge.paths import ensure_home, is_safe_id, result_path, state_path,
 from agent_bridge.persist import atomic_write_json, atomic_write_text, read_json, read_json_strict
 from agent_bridge.probes import probe_agent
 from agent_bridge.processes import (
-    count_sibling_servers,
     owner_alive,
     process_create_time,
     reap_orphan_for_session,
@@ -292,7 +289,6 @@ class Registry:
         )
         self.runtime_context = _resolve_runtime_context(runtime_context)
         self.dispatch_enabled = self.runtime_context == "coordinator"
-        self._sibling_cache: tuple[float, int] | None = None
         self._quota_cache = QuotaCache(config.quota.cache_sec)
         self._stopping = False
         self._stop_started = False
@@ -1232,34 +1228,12 @@ class Registry:
             providers=provider_table(self.config),
         )
 
-    SIBLING_CACHE_SEC = 60
-
-    async def _sibling_count(self) -> int:
-        now = time.monotonic()
-        if self._sibling_cache is not None:
-            cached_at, count = self._sibling_cache
-            if now - cached_at < self.SIBLING_CACHE_SEC:
-                return count
-        try:
-            count = await asyncio.to_thread(count_sibling_servers)
-        except (psutil.Error, OSError) as exc:
-            log.warning("could not count sibling agent-bridge servers: %s", exc)
-            count = 0
-        self._sibling_cache = (time.monotonic(), count)
-        return count
-
-    async def env_status(self) -> dict:
+    def env_status(self) -> dict:
+        # Sibling instances are an operator fact (`agent-bridge env`), not
+        # something a coordinator can act on.
         status = describe_env(self.config.env)
         if self.config.warnings:
             status.setdefault("warnings", []).extend(self.config.warnings)
-        siblings = await self._sibling_count()
-        if siblings > 0:
-            warnings = status.setdefault("warnings", [])
-            warnings.append(
-                f"{siblings} other agent-bridge server instance(s) running on this machine "
-                "(each coordinator host holds its own; abandoned ones self-exit after "
-                "server.idle_exit_sec)"
-            )
         return status
 
     def coordinator_status(self) -> dict:
@@ -1901,6 +1875,7 @@ class Registry:
                 "task_id": task.task_id,
                 "session_id": task.session_id,
                 "agent": task.agent,
+                "cwd": task.cwd,
                 "status": task.status.value,
                 "stop_reason": task.stop_reason,
                 "error": task.error,

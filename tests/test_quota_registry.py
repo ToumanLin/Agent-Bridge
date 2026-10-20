@@ -23,7 +23,6 @@ def _only_fake(registry: Registry) -> None:
 @pytest.mark.asyncio
 async def test_list_agents_rows_carry_quota_without_touching_available(bridge_home, monkeypatch):
     registry = Registry.create(bridge_home)
-    monkeypatch.setattr("agent_bridge.registry.count_sibling_servers", lambda: 0)
     rows = await registry.list_agents()
     assert rows, "bundled agents.toml should list workers"
     for row in rows:

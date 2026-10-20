@@ -24,7 +24,7 @@ Do it yourself when: after 1–2 files you know the exact edit; the job is readi
 
 Dispatch when: the change spans several files or needs unexplored work; tests or a build loop must be iterated; breadth research; or not dispatching would eat many mechanical turns.
 
-If every worker is `available: false` or the tools are missing, do the work yourself.
+`list_agents.agents` holds only usable workers; missing ones are named in `unavailable`. If `agents` is empty or the tools are missing, do the work yourself.
 
 Each `list_agents` row carries `quota` — information, not a routing rule. `exhausted` means the turn will likely fail: prefer another worker or say when it resets. `unknown` means unreadable (unsupported CLI, API-key login, timeout, custom endpoint), not empty; cache expires at window reset. DSH balance is unsupported.
 

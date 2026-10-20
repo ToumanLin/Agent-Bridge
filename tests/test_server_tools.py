@@ -8,6 +8,7 @@ import asyncio
 import json
 import types
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -46,7 +47,7 @@ def _no_empty_values(payload):
     """No key carries null / false / empty — except answers that are booleans by nature."""
     if isinstance(payload, dict):
         for key, value in payload.items():
-            if key not in {"available", "dispatch_enabled", "result"}:
+            if key not in {"dispatch_enabled", "result", "tasks"}:
                 empty = value is None or value is False or (isinstance(value, (list, dict, str)) and not value)
                 assert not empty, f"{key} is {value!r}"
             _no_empty_values(value)
@@ -135,25 +136,25 @@ async def test_list_agents_is_compact(bridge_home, monkeypatch):
         },
     ]
     monkeypatch.setattr(Registry, "list_agents", lambda self: asyncio.sleep(0, result=rows))
-    env = {"proxy": None, "proxy_source": None, "present": ["A"], "missing": ["B"], "warnings": ["2 other instances"]}
-    monkeypatch.setattr(Registry, "env_status", lambda self: asyncio.sleep(0, result=env))
+    env = {"proxy": None, "proxy_source": None, "present": ["A"], "missing": ["B"], "warnings": ["config warning"]}
+    monkeypatch.setattr(Registry, "env_status", lambda self: env)
     payload = await list_agents(_ctx(registry))
+    # A missing worker is only named: its probe detail is an install hint for a person.
     assert payload == {
         "mode": registry.config.coordinator.mode,
         "dispatch_enabled": True,
-        "warnings": ["2 other instances"],
+        "warnings": ["config warning"],
         "agents": [
             {
                 "agent": "kimi",
-                "available": True,
                 "note": "an empty result with warnings is a failed turn, not a no-op",
                 "quota": {
                     "status": "ok",
                     "windows": [{"name": "weekly", "remaining_percent": 40.0, "resets_at": "2026-10-20T00:00:00Z"}],
                 },
             },
-            {"agent": "grok", "available": False, "detail": "grok not found", "note": payload["agents"][1]["note"]},
         ],
+        "unavailable": ["grok"],
     }
     assert "server" not in payload and "env" not in payload and "coordinator" not in payload
 
@@ -203,7 +204,6 @@ async def test_wait_zero_is_a_check_and_running_payload_is_progress(bridge, monk
         "elapsed_sec",
         "silent_for_sec",
         "activity",
-        "run_usage",
         "resumable",
     }
     timed_out = await wait_task(ctx, sent["task_id"], timeout_sec=0.2)
@@ -220,7 +220,7 @@ async def test_cancel_is_graceful_and_continue_task_resumes(bridge, monkeypatch)
     await asyncio.sleep(0.2)
     stopped = await cancel_task(ctx, sent["task_id"])
     assert stopped["status"] == "cancelled"
-    assert stopped["stop_reason"] == "cancelled"
+    assert "stop_reason" not in stopped
     assert stopped["resumable"] is True
     assert "partial progress" in stopped["result"]
     # Idempotent on a finished task.
@@ -230,7 +230,7 @@ async def test_cancel_is_graceful_and_continue_task_resumes(bridge, monkeypatch)
     monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "0.05")
     monkeypatch.delenv("AGENT_BRIDGE_FAKE_PARTIAL")
     resumed = await dispatch_task(ctx, continue_task=sent["task_id"])
-    assert resumed["continues"] == sent["task_id"]
+    assert set(resumed) == {"task_id", "session_id"}
     assert resumed["session_id"] == sent["session_id"]
     done = await wait_task(ctx, resumed["task_id"], timeout_sec=30)
     assert done["status"] == "completed"
@@ -238,11 +238,14 @@ async def test_cancel_is_graceful_and_continue_task_resumes(bridge, monkeypatch)
     replay = await dispatch_task(ctx, continue_task=sent["task_id"])
     assert replay["task_id"] == resumed["task_id"] and replay["reused"] is True
 
-    rows = {row["task_id"]: row for row in (await list_tasks(ctx))["tasks"]}
-    assert rows[sent["task_id"]]["resumed_by"] == resumed["task_id"]
+    listed = (await list_tasks(ctx, cwd=cwd))["tasks"]
+    assert [row["task_id"] for row in listed] == [resumed["task_id"], sent["task_id"]]
+    rows = {row["task_id"]: row for row in listed}
+    assert "resumed_by" not in rows[sent["task_id"]]
     assert "resumable" not in rows[sent["task_id"]]
     assert rows[resumed["task_id"]]["resume_of"] == sent["task_id"]
     _no_empty_values(rows)
+    assert (await list_tasks(ctx, cwd=str(Path(cwd).parent)))["tasks"] == []
 
 
 @pytest.mark.asyncio
@@ -304,7 +307,8 @@ async def test_dispatch_warns_on_exhausted_model_window(bridge):
 async def test_set_preferences_returns_policy_only(bridge):
     _reg, ctx, _cwd = bridge
     payload = await set_preferences(ctx, mode="eager", instructions="research goes to antigravity")
-    assert payload == {"mode": "eager", "instructions": "research goes to antigravity"}
+    assert payload == {"mode": "eager"}
+    assert _reg.coordinator_status()["instructions"] == "research goes to antigravity"
 
 
 @pytest.mark.asyncio

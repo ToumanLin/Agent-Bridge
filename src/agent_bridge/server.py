@@ -52,6 +52,10 @@ INSTRUCTIONS = (
 # most turns need no get_result call.
 FIRST_PAGE_CHARS = 20_000
 
+# Rows list_tasks returns by default; Registry keeps up to 200 finished tasks
+# plus every live sibling's, and a coordinator wants the recent few.
+LIST_TASKS_LIMIT = 20
+
 mcp = MCPServer[Registry](
     "agent-bridge",
     version=package_version("agent-bridge"),
@@ -89,7 +93,7 @@ async def list_agents(ctx: Context) -> dict[str, Any]:
         registry = _registry(ctx)
         return public.agents_view(
             await registry.list_agents(),
-            await registry.env_status(),
+            registry.env_status(),
             registry.coordinator_status(),
         )
     except Exception as exc:
@@ -106,7 +110,8 @@ async def set_preferences(
     try:
         result = _registry(ctx).set_preferences(mode=mode, instructions=instructions)
         coordinator = result.get("coordinator") or {}
-        return public.compact({"mode": coordinator.get("mode"), "instructions": coordinator.get("instructions")})
+        # The instructions text is what the caller just sent; only the mode is news.
+        return {"mode": coordinator.get("mode")}
     except Exception as exc:
         raise _failure(exc) from exc
 
@@ -202,12 +207,21 @@ async def cancel_task(ctx: Context, task_id: str) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def list_tasks(ctx: Context, active_only: bool = False) -> dict[str, Any]:
-    """Known tasks, oldest first, to find task_ids again after a restart. active_only keeps queued/running ones."""
+async def list_tasks(
+    ctx: Context,
+    active_only: bool = False,
+    cwd: str | None = None,
+    limit: int = LIST_TASKS_LIMIT,
+) -> dict[str, Any]:
+    """Known tasks, newest first, to find task_ids again after a restart. active_only keeps queued/running ones; cwd keeps tasks run there; limit caps rows (0 = all), tasks_more counts the rest."""
     try:
         registry = _registry(ctx)
-        titles = registry.session_titles()
-        return {"tasks": [public.task_row(row, titles) for row in registry.list_tasks(active_only=active_only)]}
+        return public.tasks_view(
+            registry.list_tasks(active_only=active_only),
+            registry.session_titles(),
+            limit=limit,
+            cwd=cwd,
+        )
     except Exception as exc:
         raise _failure(exc) from exc
 

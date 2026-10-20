@@ -37,8 +37,9 @@ HELP = f"""Agent Bridge — connect local coding agents.
 
 Usage:
   agent-bridge                 start the MCP server on stdio
-  agent-bridge --env           print reconstructed worker environment
-  agent-bridge --quota         print each worker's remaining quota (fresh, no cache)
+  agent-bridge --env           print reconstructed worker environment and other running instances
+  agent-bridge --agents        print each worker's probe: version, or why it is unavailable
+  agent-bridge --quota        print each worker's remaining quota (fresh, no cache)
   agent-bridge --version       print the installed version
   agent-bridge upgrade         one-command update (close coordinators first)
   agent-bridge help            this text
@@ -236,7 +237,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         from agent_bridge.config import load_config
         from agent_bridge.worker_env import describe_env
 
-        print(json.dumps(describe_env(load_config().env), indent=2, ensure_ascii=False))
+        # One instance per open coordinator host is normal; a pile-up means a
+        # host keeps abandoning spawns (they self-exit after server.idle_exit_sec).
+        status = {**describe_env(load_config().env), "other_instances": count_sibling_servers()}
+        print(json.dumps(status, indent=2, ensure_ascii=False))
+        return
+    if command in {"--agents", "agents"}:
+        import asyncio
+
+        from agent_bridge.config import load_config
+        from agent_bridge.probes import probe_agent
+
+        # The MCP list_agents only names a missing worker; the reason and any
+        # install hint are for the person reading this.
+        config = load_config()
+
+        async def probe_all() -> list[dict]:
+            return list(await asyncio.gather(*(probe_agent(cfg, config.env) for cfg in config.agents.values())))
+
+        print(json.dumps(asyncio.run(probe_all()), indent=2, ensure_ascii=False))
         return
     if command in {"--quota", "quota"}:
         import asyncio

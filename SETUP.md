@@ -334,7 +334,7 @@ Already on a clone and want the tool install instead: `uv tool install git+https
 
 ## Multiple coordinators on one machine
 
-Running Codex, Cursor, Kimi Code, ZCode, Grok Build, and Claude Code coordinators at the same time is supported: each host spawns its own Bridge process, and `list_agents` merely counts independent siblings (not a nested Bridge inside a worker this instance started). A `uv tool` install is shared and does not sync on spawn.
+Running Codex, Cursor, Kimi Code, ZCode, Grok Build, and Claude Code coordinators at the same time is supported: each host spawns its own Bridge process, and `agent-bridge env` merely counts independent siblings (`other_instances`) (not a nested Bridge inside a worker this instance started). A `uv tool` install is shared and does not sync on spawn.
 
 What must not run twice is the **installer** of a git checkout. A plain `uv run` syncs the project before executing, and that sync rewrites `.venv\Scripts\agent-bridge.exe` — on Windows a file every running instance holds open. The second host's spawn then dies before the MCP handshake with:
 
@@ -350,13 +350,13 @@ Its task rows stay visible though: with `server.remote_tasks` on (the default), 
 
 ## Server lifecycle
 
-Abandoned server instances self-exit: after `server.idle_exit_sec` (default 7200 s) with no MCP requests and no queued or running tasks, the process shuts its workers down and exits. Configure in `[server]` (repo `agents.toml` or `%USERPROFILE%\.agent-bridge\agents.toml`); `idle_exit_sec = 0` disables it. `list_agents` also warns when other Bridge instances are running on this machine — one per coordinator host is normal, a pile-up means a host keeps abandoning spawns.
+Abandoned server instances self-exit: after `server.idle_exit_sec` (default 7200 s) with no MCP requests and no queued or running tasks, the process shuts its workers down and exits. Configure in `[server]` (repo `agents.toml` or `%USERPROFILE%\.agent-bridge\agents.toml`); `idle_exit_sec = 0` disables it. `agent-bridge env` reports `other_instances`, the other Bridge servers running on this machine — one per coordinator host is normal, a pile-up means a host keeps abandoning spawns.
 
 `server.shutdown_policy` decides what an orderly host close (MCP stdio transport EOF / lifespan shutdown) does to in-flight turns. The default `cancel` cancels them at once, unchanged from before. Opt-in `linger` instead keeps the Bridge process alive until they finish — transcript, result artifact, and `state.json` all land as usual — bounded by `server.linger_max_sec` (default 86400 s); whatever is still running at the deadline is cancelled and normal teardown proceeds, so shutdown never hangs unbounded. Neither value is reported over MCP; read them from `agents.toml`.
 
 Linger only covers an orderly close while the Bridge process itself stays alive and keeps owning the worker pipes. Force-killing it (`taskkill /f`, `kill -9`, Codex terminating its MCP Job Object) loses the live turn regardless of policy — linger cannot defeat a host force-kill. To carry work across one, end the turn with `cancel_task` first and continue it with `dispatch_task(continue_task=...)` after the restart. Stronger guarantees would need a persistent daemon, which Bridge deliberately is not.
 
-`cancel_task` is graceful: the adapter's own cancel runs first so the partial result, usage, transcript, and native session id all land through the normal return path (a turn still running after 10 s is force-cancelled), then the task ends `cancelled` with `resumable: true`. It is a safe cancel, not frozen execution; no worker protocol can suspend a turn mid-flight. `dispatch_task(continue_task=<task_id>)` (accepting cancelled or failed rows) dispatches a **new** continuation task on the same session and native conversation — the old row is never rewritten, it just gains `resumed_by`, and the new one carries `resume_of` (both shown in `list_tasks`). Omitting `message` sends a default "pick up where the previous turn left off" prompt; continuing the same row twice returns the first continuation with `reused: true`. A dead owner's row is adopted first — reaping the orphaned worker so two executors never drive one conversation.
+`cancel_task` is graceful: the adapter's own cancel runs first so the partial result, usage, transcript, and native session id all land through the normal return path (a turn still running after 10 s is force-cancelled), then the task ends `cancelled` with `resumable: true`. It is a safe cancel, not frozen execution; no worker protocol can suspend a turn mid-flight. `dispatch_task(continue_task=<task_id>)` (accepting cancelled or failed rows) dispatches a **new** continuation task on the same session and native conversation — the old row is never rewritten, it just gains `resumed_by` (so it is no longer offered as resumable), and the new one carries `resume_of`, which `list_tasks` shows. Omitting `message` sends a default "pick up where the previous turn left off" prompt; continuing the same row twice returns the first continuation with `reused: true`. A dead owner's row is adopted first — reaping the orphaned worker so two executors never drive one conversation.
 
 ## Waiting and timeouts
 
@@ -461,7 +461,7 @@ uv run --no-sync python scripts/setup_lab.py
 4. Ask it to find a nit and send a follow-up on the same `session_id`.
 5. Confirm the second turn does not start a new Grok session.
 
-If a worker is missing, `list_agents` reports `available: false` and the coordinator should pick another worker or do the work itself.
+If a worker is missing, `list_agents` names it under `unavailable` instead of `agents`, and the coordinator should pick another worker or do the work itself. `agent-bridge agents` prints each worker's probe, including why a missing one failed and any install hint.
 
 The coordinator can pin a worker model and thinking intensity on `dispatch_task`:
 
