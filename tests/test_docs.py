@@ -151,30 +151,24 @@ def test_stall_watchdog_documented_and_retired_tools_gone():
             assert tool not in text, f"{tool} still in {name}"
 
 
-def test_docs_cover_long_wait_and_token_efficient_patterns():
+def test_docs_describe_turn_free_waiting():
     setup = _read("SETUP.md")
     en = _read("ORCHESTRATION.md")
     zh = _read("ORCHESTRATION.zh-CN.md")
     readme = _read("README.md")
-    # Optional Codex single-long-wait example keeps margin above 5400.
-    assert "tool_timeout_sec = 5700" in setup
-    assert "wait_task(timeout_sec=5400)" in setup
-    # The distinct timeout controls are named by owner.
-    for token in (
-        "stall_timeout_sec",
-        "idle_exit_sec",
-        "shutdown_policy",
-        "linger_max_sec",
-        "Code Mode",
-        "yield",
-    ):
+    # The other clocks are still named by owner.
+    for token in ("stall_timeout_sec", "idle_exit_sec", "shutdown_policy", "linger_max_sec"):
         assert token in setup
-    # Dispatch-and-later-check is the zero-poll pattern; docs never claim
-    # Bridge can wake a dormant coordinator by itself.
-    assert "dispatch-and-later-check" in setup
-    assert "cannot wake a dormant coordinator" in setup
-    assert "cannot wake a dormant coordinator" in en
-    assert "5400" in en
-    assert "5400" in zh
-    assert "5400" in readme
-    assert "休眠的协调者" in zh
+    # Waiting happens in a background process, never in a held tool call.
+    for text in (setup, readme):
+        assert "background_wait" in text
+        assert "agent-bridge wait" in text
+        assert "openai/codex#32188" in text
+    assert "never blocks" in setup and "never blocks" in en
+    assert "background_wait" in en and "background_wait" in zh
+    assert "end your turn" in en
+    assert "结束本轮" in zh
+    # The removed long-wait recipes do not come back.
+    for text in (setup, en, zh, readme):
+        assert "timeout_sec=5400" not in text
+        assert "tool_timeout_sec = 5700" not in text

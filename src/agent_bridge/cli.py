@@ -41,6 +41,7 @@ Usage:
   agent-bridge --agents        print each worker's probe: version, or why it is unavailable
   agent-bridge --quota        print each worker's remaining quota (fresh, no cache)
   agent-bridge --version       print the installed version
+  agent-bridge wait <task_id>  block until tasks finish (run it in the background)
   agent-bridge upgrade         one-command update (close coordinators first)
   agent-bridge help            this text
 
@@ -265,6 +266,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         print(json.dumps(asyncio.run(describe_quotas(load_config())), indent=2, ensure_ascii=False))
         return
+    if command == "wait":
+        from agent_bridge.waiter import main as wait_main
+
+        raise SystemExit(wait_main(args[1:]))
     if command in {"upgrade", "--upgrade"}:
         for note in upgrade():
             print(note)

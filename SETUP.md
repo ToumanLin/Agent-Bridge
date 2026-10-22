@@ -66,15 +66,6 @@ The helper writes `$AGENT_BRIDGE_HOME/dsh-acp` (default `~/.agent-bridge/dsh-acp
 
 Restart Codex after editing `config.toml`.
 
-Optional — only for a single ~90-minute `wait_task` per call; most setups should keep 600:
-
-```toml
-[mcp_servers.agent_bridge]
-tool_timeout_sec = 5700
-```
-
-Then `wait_task(timeout_sec=5400)` can stay pending as one request. Keep margin — do not set both values to exactly 5400. This ceiling is enforced by the host, not Bridge: whether a given Codex version accepts and honors it must be verified (upstream defaults have moved across versions), and it only helps a *direct* MCP call. If the model routes tools through Code Mode, the outer `exec` still yields on its own cadence and every yield/wait boundary is a model-visible turn. Codex-side `features.code_mode.direct_only_tool_namespaces` can force direct exposure for the Agent Bridge namespace, but the generated name (likely `mcp__agent_bridge` for this server key) is client-derived and version-sensitive — verify it instead of assuming. See [Waiting and timeouts](#waiting-and-timeouts).
-
 MCP tool definitions are negotiated when the stdio connection starts. Adding
 or changing a tool in Bridge therefore does not update a coordinator that is
 already connected: its in-memory catalog can continue to show the previous
@@ -108,7 +99,7 @@ agent-bridge --env
 - Use the same full path `uv tool` installed. If you still launch from a checkout, keep `--no-sync` (see Install).
 - Cursor usually picks up `mcp.json` edits without a restart, though the docs still recommend restarting after changes. If the server gets stuck in an error state after a failed spawn, rename the server key — a new identity forces a fresh connection; a full Cursor restart also works.
 - Cursor forwards more of the desktop environment than Codex, but Bridge rebuilds proxy/env itself either way; `agents.toml [env]` still applies.
-- Cursor's MCP tool timeout is around one minute (not configurable like Codex `tool_timeout_sec`). From Cursor, call `wait_task` with `timeout_sec` ≈ 45 and loop; the default 180 gets killed by the host first.
+- Cursor's MCP tool timeout is around one minute (not configurable like Codex `tool_timeout_sec`). No Bridge call waits that long: `wait_task` never blocks.
 
 ## Register the MCP server (Kimi Code)
 
@@ -126,7 +117,7 @@ agent-bridge --env
 }
 ```
 
-- Kimi Code's default single-tool-call timeout is 60 s, so a default `wait_task(timeout_sec=180)` gets killed by the host. `toolTimeoutMs` is the per-server override; `[mcp] tool_timeout_ms` in `config.toml` or `KIMI_MCP_TOOL_TIMEOUT_MS` moves the global default. With the value above, `wait_task` behaves like it does under Codex; without it, pass ≈ 45 and loop.
+- Kimi Code's default single-tool-call timeout is 60 s. `toolTimeoutMs` is the per-server override; `[mcp] tool_timeout_ms` in `config.toml` or `KIMI_MCP_TOOL_TIMEOUT_MS` moves the global default. The value above leaves headroom for slow calls such as a first `list_agents` quota read or a graceful `cancel_task`; `wait_task` never blocks.
 - Kimi asks for approval per MCP tool call unless the run is in YOLO mode. To pre-approve Bridge only, add to `%USERPROFILE%\.kimi-code\config.toml`:
 
 ```toml
@@ -189,7 +180,7 @@ ZCode has **three** JSON shapes. Do not mix them.
 
 - User file: `%USERPROFILE%\.zcode\cli\config.json` (`mcp.servers`).
 - Workspace file: `<project>\.zcode\config.json` (`mcp.servers`).
-- `timeoutMs` is milliseconds. 600000 leaves room for `wait_task` default 180 s. Without it, poll about 15–20 s.
+- `timeoutMs` is milliseconds. 600000 leaves headroom for slow calls (a first `list_agents` quota read, a graceful `cancel_task`); `wait_task` never blocks.
 - If a `.zcode` file in the **same scope** already lists any MCP server, ZCode skips that scope's `.agents/mcp.json` entirely. The two sources are not merged.
 - After saving, confirm the server is enabled under **Settings → MCP 服务器** (configured-MCP group). Agent Bridge is a hand-added stdio server, not a marketplace plugin — it will not appear under 设置 → 插件 / 插件市场. Official: [MCP](https://zcode.z.ai/cn/docs/mcp-services), [Plugin](https://zcode.z.ai/cn/docs/plugin), [Skill](https://zcode.z.ai/en/docs/skill).
 
@@ -211,7 +202,7 @@ tool = "mcp"
 pattern = "agent_bridge__*"
 ```
 
-- `startup_timeout_sec` / `tool_timeout_sec` are seconds. Official Grok default for tools is 6000; 600 is the Agent Bridge recommendation so `wait_task` default 180 s has headroom. If the host still kills the call, poll about 30–45 s.
+- `startup_timeout_sec` / `tool_timeout_sec` are seconds. Official Grok default for tools is 6000; 600 is the Agent Bridge recommendation; no Bridge call blocks for long.
 - Permission rules use the official verbose `[[permission.rules]]` form. MCP tools are named `{server}__{tool}` (for example `agent_bridge__dispatch_task`).
 - Project files may contain MCP servers and permission rules. `[ui] permission_mode` is a user-level setting — do not put it in a project example.
 - Official: [MCP](https://docs.x.ai/build/features/mcp-servers), [permissions](https://docs.x.ai/build/features/permissions), [skills](https://docs.x.ai/build/features/skills-plugins-marketplaces).
@@ -261,7 +252,8 @@ claude mcp add --scope project --transport stdio agent-bridge -- "C:\ABSOLUTE\PA
 
 Use `--scope user` for every project. After adding, put `"timeout": 600000` on the server entry (milliseconds). Official: [MCP](https://code.claude.com/docs/en/mcp), [MCP servers](https://code.claude.com/docs/en/mcp-servers).
 
-- `timeout` is milliseconds. 600000 leaves room for `wait_task` default 180 s. The CLI default for an unset `MCP_TOOL_TIMEOUT` is about 28 hours, so 180 s usually survives without the field; set it anyway so the budget is explicit. If the host still kills the call (the desktop app has historically ignored this and died around 60 s), poll about 45 s.
+- `timeout` is milliseconds. 600000 leaves headroom for slow calls (a first `list_agents` quota read, a graceful `cancel_task`); `wait_task` never blocks.
+- Waiting: when a `dispatch_task` answer carries `background_wait`, the coordinator runs that command as a background Bash job and ends its turn; the job's exit wakes Claude Code. Bridge recognizes Claude Code by its MCP client name `claude-code`.
 - Startup wait is `MCP_TIMEOUT` (milliseconds, default 30 s). 30 s is enough for Bridge.
 - To pre-approve Bridge tools only, add to `<project>\.claude\settings.json` or `%USERPROFILE%\.claude\settings.json`:
 
@@ -360,17 +352,20 @@ Linger only covers an orderly close while the Bridge process itself stays alive 
 
 ## Waiting and timeouts
 
-Five separate clocks decide how long things run — do not conflate them:
+No Bridge tool holds a coordinator turn while a worker runs. `wait_task` reports a task's state and returns at once. The coordinator dispatches, ends its turn, and reads the task later:
+
+- **Claude Code** (CLI and desktop): the `dispatch_task` answer carries `background_wait`, for example `agent-bridge wait task_3f2a…`. Run as a background Bash job, it blocks in a process — no model calls — and its exit re-invokes Claude Code with one JSON line: `done` / `pending` tasks and the next step (`wait_task` for each finished one). Bridge adds the field only for the MCP client `claude-code`.
+- **Codex, Cursor, Kimi Code, ZCode, Grok Build**: these hosts cannot yet be woken by a finished background job (Codex: [openai/codex#32188](https://github.com/openai/codex/issues/32188)). The coordinator ends its turn after dispatching; the next user turn reads the task with `wait_task` or `list_tasks`.
+
+`agent-bridge wait <task_id>… [--any] [--timeout SEC]` reads `state.json` once a second. It returns when every task (or, with `--any`, one) is finished, or when the Bridge instance running a task has died (`owner: "lost"`). Exit codes: 0 finished, 1 unknown task id (after a 15 s grace for a dispatch still being written), 2 timed out. It never touches a worker.
+
+Other clocks still apply:
 
 | Control | Owner | What it bounds |
 | --- | --- | --- |
-| `wait_task timeout_sec` | This call | How long one observation call blocks (default 180; 0 only checks). A `running` answer ends the call only; a host-side MCP cancel likewise cuts the waiter, never the worker's background task. |
-| `[agents.<name>] stall_timeout_sec` | Worker | Silence budget before Bridge fails the turn as `stalled` (default 1800, 0 disables). Worker lifetime is bounded by this plus process survival — not by any waiter. |
+| `[agents.<name>] stall_timeout_sec` | Worker | Silence budget before Bridge fails the turn as `stalled` (default 1800, 0 disables). |
 | `[server] idle_exit_sec`, `shutdown_policy`, `linger_max_sec` | Bridge server | Abandoned-server self-exit and orderly-close behavior (see Server lifecycle). A queued/running task already suppresses idle exit. |
-| Host MCP tool timeout | Coordinator host | The per-call ceiling that decides how long one `wait_task` may stay pending: Codex `tool_timeout_sec`, Kimi `toolTimeoutMs`, ZCode `timeoutMs`, Claude `timeout`, Grok `tool_timeout_sec`, Cursor ~45–60 s fixed. |
-| Codex Code Mode exec/wait yield | Codex host | When MCP calls route through Code Mode, the outer `exec` yields and each yield/wait boundary is a model-visible turn (inspected Codex defaults are ~10 s, not a universal 60 s). Bridge cannot set it. |
-
-Token cost: a pending `wait_task` does not poll the model — a local wait parks one Bridge coroutine on an event, and a sibling-owned wait only polls `state.json` inside the Bridge process. What spends coordinator turns is each returned timeout or Code Mode yield the model must re-decide. The zero-polling pattern for long tasks is dispatch-and-later-check: `dispatch_task`, end the turn (or do other work), then `list_tasks` / `wait_task(timeout_sec=0)` on a later turn. Bridge cannot wake a dormant coordinator at completion — that needs a host scheduler or notification mechanism.
+| Host MCP tool timeout | Coordinator host | Per-call ceiling (Codex `tool_timeout_sec`, Kimi `toolTimeoutMs`, ZCode `timeoutMs`, Claude `timeout`, Grok `tool_timeout_sec`, Cursor ~60 s). Bridge calls finish well inside it. |
 
 ## Remaining quota in `list_agents`
 
@@ -457,7 +452,7 @@ uv run --no-sync python scripts/setup_lab.py
 
 1. Open the coordinator (Codex, Cursor, Kimi Code, ZCode, Grok Build, or Claude Code) on the `lab/` folder — not the Agent Bridge repo root.
 2. Ask: `用 grok 在当前目录写一个 smoke.txt，内容 hello-bridge，做完后你自己 git diff 验收。` The coordinator must pass that folder as `dispatch_task.cwd` (not the Agent Bridge install path).
-3. Confirm it calls `dispatch_task` → loops `wait_task` → `get_result` → inspects the diff. `wait_task` defaults to 180 seconds; a timeout is not failure.
+3. Confirm it calls `dispatch_task`, ends its turn (in Claude Code, after starting `background_wait`), then reads the task with `wait_task` and inspects the diff.
 4. Ask it to find a nit and send a follow-up on the same `session_id`.
 5. Confirm the second turn does not start a new Grok session.
 

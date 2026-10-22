@@ -104,7 +104,7 @@ Close coordinators that are holding Bridge, then `agent-bridge upgrade`, then re
 | `list_agents` | Workers, availability, remaining quota, per-worker notes, routing mode / instructions |
 | `set_preferences` | Persist coordinator mode / routing preferences |
 | `dispatch_task` | Start a turn in the project `cwd`, follow up on a `session_id`, or resume an unfinished task with `continue_task` |
-| `wait_task` | Wait up to `timeout_sec` (default 180; `0` just checks); a finished task comes back with the first page of its result |
+| `wait_task` | A task's state now, never blocking; a finished task comes back with the first page of its result |
 | `get_result` | Further pages of a long result |
 | `cancel_task` | End a running turn gracefully; partial result and conversation are kept and it stays resumable |
 | `list_tasks` | Known tasks, to find task ids again after a restart |
@@ -122,14 +122,15 @@ lose that last window. A turn whose worker stays silent past `stall_timeout_sec`
 (default 1800 s, per worker) ends `failed` / `stalled`; a running `wait_task`
 shows `silent_for_sec`.
 
-A pending `wait_task` never polls the model — local waits are event-driven
-inside Bridge — but each returned timeout is a model-visible turn. For a long
-task the token-free pattern is dispatch-and-later-check: `dispatch_task`, end
-the turn, then `wait_task(timeout_sec=0)` on a later one. Bridge cannot wake a
-dormant coordinator at completion; that takes a host scheduler or a later user
-turn. A single ~90-minute wait (`timeout_sec=5400`) works only when the host
-MCP tool timeout exceeds it with margin and the call executes directly — Codex
-Code Mode turns it into repeated model-visible yields. Details:
+Waiting never holds a coordinator turn. `dispatch_task` returns at once and
+the coordinator ends its turn. In Claude Code the answer also carries
+`background_wait` — a command such as `agent-bridge wait task_…` — which the
+coordinator starts as a background shell job: it blocks in a process, not in
+the model, and its exit wakes Claude Code with a short JSON report. Other
+hosts have no such wake-up yet (Codex: [openai/codex#32188](https://github.com/openai/codex/issues/32188)),
+so there the coordinator ends its turn and reads the task with `wait_task`
+on a later turn. `agent-bridge wait <id>… [--any] [--timeout SEC]` also works
+by hand from any shell. Details:
 [SETUP.md](SETUP.md#waiting-and-timeouts).
 
 Tasks keep their owning Bridge instance. After a coordinator restart, a task a
@@ -278,7 +279,7 @@ revivable = true
 | `list_agents` | Worker、是否可用、剩余额度、各 Worker 的固定说明、路由模式 / 偏好 |
 | `set_preferences` | 持久化协调者模式 / 路由偏好 |
 | `dispatch_task` | 在项目 `cwd` 里开一轮；带 `session_id` 追问；用 `continue_task` 续上未完成的任务 |
-| `wait_task` | 最多等待 `timeout_sec`（默认 180；`0` 只查一次）；完成时直接带回结果第一页 |
+| `wait_task` | 查询任务当前状态，从不阻塞；完成时直接带回结果第一页 |
 | `get_result` | 长结果的后续分页 |
 | `cancel_task` | 优雅结束在途回合；部分结果和会话保留，可以续 |
 | `list_tasks` | 已知任务，重启后用来找回 task id |
@@ -292,13 +293,14 @@ MCP 工具错误。完成的 `wait_task` 内联最多 20,000 个字符的结果�
 Worker 静默超过 `stall_timeout_sec`（默认 1800 秒，可按 Worker 设置）的一轮会以
 `failed` / `stalled` 结束；运行中的 `wait_task` 会给出 `silent_for_sec`。
 
-挂起的 `wait_task` 不会轮询模型——本地等待在 Bridge 内部由事件驱动——但每次
-超时返回都是一个模型可见的回合。长任务的零轮询模式是「派发后稍后再查」：
-`dispatch_task` 之后结束本轮，稍后 `wait_task(timeout_sec=0)`。Bridge 无法
-在任务完成时唤醒休眠的协调者——得靠宿主定时机制或用户的下一轮。单次约
-90 分钟的等待（`timeout_sec=5400`）只在宿主 MCP 工具超时高于它并留余量、
-且该调用直接执行时成立——Codex Code Mode 会把它切成一串模型可见的 yield。
-细节见 [SETUP.md](SETUP.md#waiting-and-timeouts)。
+等待永远不会占住协调者的回合。`dispatch_task` 立即返回，协调者随即结束本轮。
+在 Claude Code 里，返回中还带有 `background_wait`——形如 `agent-bridge wait task_…`
+的命令——协调者把它作为后台 shell 任务启动：等待发生在一个进程里而不是模型里，
+进程退出时会带着一段简短的 JSON 报告唤醒 Claude Code。其它宿主目前还没有这种唤醒
+机制（Codex 见 [openai/codex#32188](https://github.com/openai/codex/issues/32188)），
+协调者结束本轮后，在之后的回合用 `wait_task` 读取任务。任何 shell 里也可以手动运行
+`agent-bridge wait <id>… [--any] [--timeout SEC]`。细节见
+[SETUP.md](SETUP.md#waiting-and-timeouts)。
 
 任务始终归属创建它的 Bridge 实例。协调者重启后，仍由其他存活实例持有的任务显示
 `owner: "sibling"`——新实例可以等待并读取其结果，但不会运行或取消它；

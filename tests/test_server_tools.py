@@ -6,6 +6,7 @@ these tests pin what a coordinator actually receives through the tools.
 
 import asyncio
 import json
+import time
 import types
 import uuid
 from pathlib import Path
@@ -41,6 +42,21 @@ TOOLS = {
 
 def _ctx(registry: Registry):
     return types.SimpleNamespace(request_context=types.SimpleNamespace(lifespan_context=registry))
+
+
+async def _finished(registry: Registry, ctx, task_id: str) -> dict:
+    """Let the task finish inside Bridge, then read it the way a woken coordinator does."""
+    await registry.wait_task(task_id, timeout_sec=30)
+    return await wait_task(ctx, task_id)
+
+
+def _client_ctx(registry: Registry, client_name: str):
+    session = types.SimpleNamespace(
+        client_params=types.SimpleNamespace(client_info=types.SimpleNamespace(name=client_name))
+    )
+    return types.SimpleNamespace(
+        request_context=types.SimpleNamespace(lifespan_context=registry), session=session
+    )
 
 
 def _no_empty_values(payload):
@@ -79,6 +95,7 @@ async def test_public_catalog_and_text_budget():
     by_name = {tool.name: tool for tool in tools}
     assert set(by_name) == TOOLS
     assert by_name["wait_task"].input_schema["required"] == ["task_id"]
+    assert set(by_name["wait_task"].input_schema["properties"]) == {"task_id"}
     assert by_name["cancel_task"].input_schema["required"] == ["task_id"]
     dispatch = by_name["dispatch_task"].input_schema
     assert "continue_task" in dispatch["properties"]
@@ -161,10 +178,10 @@ async def test_list_agents_is_compact(bridge_home, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_dispatch_wait_returns_result_inline(bridge):
-    _reg, ctx, cwd = bridge
+    registry, ctx, cwd = bridge
     sent = await dispatch_task(ctx, message="build it", agent="fake", cwd=cwd)
     assert set(sent) == {"task_id", "session_id"}
-    done = await wait_task(ctx, sent["task_id"], timeout_sec=30)
+    done = await _finished(registry, ctx, sent["task_id"])
     assert done["status"] == "completed"
     assert done["result"] == "[fake:fake] build it"
     assert "next_cursor" not in done
@@ -188,12 +205,14 @@ async def test_dispatch_wait_returns_result_inline(bridge):
 
 
 @pytest.mark.asyncio
-async def test_wait_zero_is_a_check_and_running_payload_is_progress(bridge, monkeypatch):
+async def test_wait_task_never_blocks_and_running_payload_is_progress(bridge, monkeypatch):
     _reg, ctx, cwd = bridge
     monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "30")
     sent = await dispatch_task(ctx, message="slow", agent="fake", cwd=cwd)
     await asyncio.sleep(0.2)
-    running = await wait_task(ctx, sent["task_id"], timeout_sec=0)
+    started = time.monotonic()
+    running = await wait_task(ctx, sent["task_id"])
+    assert time.monotonic() - started < 2
     assert running["status"] == "running"
     assert "result" not in running and "files_changed" not in running
     assert set(running) <= {
@@ -206,14 +225,12 @@ async def test_wait_zero_is_a_check_and_running_payload_is_progress(bridge, monk
         "activity",
         "resumable",
     }
-    timed_out = await wait_task(ctx, sent["task_id"], timeout_sec=0.2)
-    assert timed_out["status"] == "running"
     await cancel_task(ctx, sent["task_id"])
 
 
 @pytest.mark.asyncio
 async def test_cancel_is_graceful_and_continue_task_resumes(bridge, monkeypatch):
-    _reg, ctx, cwd = bridge
+    registry, ctx, cwd = bridge
     monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "30")
     monkeypatch.setenv("AGENT_BRIDGE_FAKE_PARTIAL", "1")
     sent = await dispatch_task(ctx, message="long job", agent="fake", cwd=cwd)
@@ -232,7 +249,7 @@ async def test_cancel_is_graceful_and_continue_task_resumes(bridge, monkeypatch)
     resumed = await dispatch_task(ctx, continue_task=sent["task_id"])
     assert set(resumed) == {"task_id", "session_id"}
     assert resumed["session_id"] == sent["session_id"]
-    done = await wait_task(ctx, resumed["task_id"], timeout_sec=30)
+    done = await _finished(registry, ctx, resumed["task_id"])
     assert done["status"] == "completed"
     # A second resume of the same row returns the continuation, not a new turn.
     replay = await dispatch_task(ctx, continue_task=sent["task_id"])
@@ -256,7 +273,7 @@ async def test_dispatch_argument_errors(bridge):
     with pytest.raises(RuntimeError, match="continue_task takes only"):
         await dispatch_task(ctx, continue_task="t-1", agent="fake")
     with pytest.raises(RuntimeError, match=r"^unknown task t-missing$"):
-        await wait_task(ctx, "t-missing", timeout_sec=0)
+        await wait_task(ctx, "t-missing")
 
 
 @pytest.mark.asyncio
@@ -271,10 +288,10 @@ async def test_request_id_reused_only_when_true(bridge):
 
 @pytest.mark.asyncio
 async def test_long_result_pages_through_get_result(bridge):
-    _reg, ctx, cwd = bridge
+    registry, ctx, cwd = bridge
     long_message = "y" * (FIRST_PAGE_CHARS + 5000)
     sent = await dispatch_task(ctx, message=long_message, agent="fake", cwd=cwd)
-    done = await wait_task(ctx, sent["task_id"], timeout_sec=30)
+    done = await _finished(registry, ctx, sent["task_id"])
     assert len(done["result"]) == FIRST_PAGE_CHARS
     rest = await get_result(ctx, sent["task_id"], cursor=done["next_cursor"])
     assert set(rest) == {"result"}
@@ -315,7 +332,7 @@ async def test_set_preferences_returns_policy_only(bridge):
 async def test_nested_bridge_refuses_cancel(bridge):
     registry, ctx, cwd = bridge
     sent = await dispatch_task(ctx, message="x", agent="fake", cwd=cwd)
-    await wait_task(ctx, sent["task_id"], timeout_sec=30)
+    await _finished(registry, ctx, sent["task_id"])
     registry.dispatch_enabled = False
     with pytest.raises(RuntimeError):
         await cancel_task(ctx, sent["task_id"])
@@ -335,3 +352,34 @@ def test_registry_rejects_dict_lifespan(bridge_home):
     ctx = types.SimpleNamespace(request_context=types.SimpleNamespace(lifespan_context={"registry": registry}))
     with pytest.raises(RuntimeError, match="not available"):
         _registry(ctx)
+
+
+@pytest.mark.asyncio
+async def test_claude_code_dispatch_gets_background_wait(bridge, monkeypatch):
+    registry, _ctx, cwd = bridge
+    monkeypatch.setattr("agent_bridge.server.shutil.which", lambda name: "C:/bin/agent-bridge.exe")
+    sent = await dispatch_task(_client_ctx(registry, "claude-code"), message="hi", agent="fake", cwd=cwd)
+    assert sent["background_wait"] == f"agent-bridge wait {sent['task_id']}"
+    resumed = await dispatch_task(_client_ctx(registry, "claude-code"), message="again", agent="fake", cwd=cwd)
+    assert resumed["background_wait"].endswith(resumed["task_id"])
+
+
+@pytest.mark.asyncio
+async def test_background_wait_falls_back_to_absolute_exe(bridge, monkeypatch):
+    registry, _ctx, cwd = bridge
+    monkeypatch.setattr("agent_bridge.server.shutil.which", lambda name: None)
+    monkeypatch.setattr("agent_bridge.server.sys.argv", ["C:/tools/agent-bridge.exe"])
+    sent = await dispatch_task(_client_ctx(registry, "claude-code"), message="hi", agent="fake", cwd=cwd)
+    assert sent["background_wait"].startswith('"')
+    assert sent["background_wait"].endswith(f'agent-bridge.exe" wait {sent["task_id"]}')
+
+
+@pytest.mark.asyncio
+async def test_other_hosts_get_no_background_wait(bridge):
+    registry, ctx, cwd = bridge
+    for client in ("codex-mcp-client", "cursor", ""):
+        sent = await dispatch_task(_client_ctx(registry, client), message="hi", agent="fake", cwd=cwd)
+        assert "background_wait" not in sent
+    # A context without session info (older SDK paths) is treated as unknown.
+    sent = await dispatch_task(ctx, message="hi", agent="fake", cwd=cwd)
+    assert "background_wait" not in sent

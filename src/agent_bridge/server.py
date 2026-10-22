@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
+import shutil
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from importlib.metadata import version as package_version
+from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import Context, MCPServer
@@ -11,9 +15,10 @@ from mcp_types import ToolAnnotations
 from agent_bridge import public
 from agent_bridge.dashboard import maybe_open_dashboard
 from agent_bridge.logging_setup import setup_logging
-from agent_bridge.models import DEFAULT_WAIT_SEC
 from agent_bridge.paths import ensure_home
 from agent_bridge.registry import RESULT_PAGE_MAX_CHARS, Registry
+
+log = logging.getLogger(__name__)
 
 READ_ONLY = ToolAnnotations(
     read_only_hint=True,
@@ -43,9 +48,10 @@ INSTRUCTIONS = (
     "Reach workers only through these tools, never by running their CLIs. "
     "Call list_agents first; if dispatch_enabled is false you are inside a "
     "worker: do not dispatch, cancel, or set preferences. dispatch_task.cwd is "
-    "this project's absolute path. A running wait_task answer is not a failure; "
-    "wait again. Verify a worker's work with your own git diff and tests. "
-    "Tasks with owner sibling belong to another Bridge: only wait on them."
+    "this project's absolute path. Never loop on wait_task: after dispatching, "
+    "end your turn (start background_wait first when given). Verify workers' "
+    "work with your own git diff and tests. Tasks owned by a sibling Bridge "
+    "are read-only."
 )
 
 # How much result text a finished wait_task / cancel_task carries inline, so
@@ -71,6 +77,28 @@ def _registry(ctx: Context) -> Registry:
         maybe_open_dashboard(lifespan_ctx.home, lifespan_ctx.config.dashboard)
         return lifespan_ctx
     raise RuntimeError("Agent Bridge registry is not available")
+
+
+# MCP clientInfo names of hosts whose shell can run a background job and wake
+# the model when it exits (Claude Code's Bash run_in_background).
+BACKGROUND_WAKE_CLIENTS = ("claude-code",)
+
+
+def _client_name(ctx: Context) -> str:
+    try:
+        params = ctx.session.client_params
+    except Exception:
+        return ""
+    info = getattr(params, "client_info", None)
+    return str(getattr(info, "name", "") or "").lower()
+
+
+def _wait_command(task_id: str) -> str:
+    """The shell command that blocks until ``task_id`` finishes."""
+    if shutil.which("agent-bridge"):
+        return f"agent-bridge wait {task_id}"
+    exe = Path(sys.argv[0]).resolve().as_posix()
+    return f'"{exe}" wait {task_id}'
 
 
 def _failure(exc: Exception) -> RuntimeError:
@@ -130,7 +158,7 @@ async def dispatch_task(
     user_requested: bool = False,
     request_id: str | None = None,
 ) -> dict[str, Any]:
-    """Start a worker turn; returns at once. New: agent, cwd, message. Follow-up: add session_id. Resume an unfinished (cancelled/failed) task: continue_task=task_id, message optional. user_requested: user explicitly asked (manual mode). request_id: UUID for retry dedup."""
+    """Start a worker turn; returns at once. New: agent, cwd, message. Follow-up: add session_id. Resume a cancelled/failed task: continue_task=task_id. background_wait in the answer: run it as a background shell job, then end your turn; its exit wakes you."""
     try:
         registry = _registry(ctx)
         if continue_task:
@@ -163,21 +191,22 @@ async def dispatch_task(
                 request_id=request_id,
             )
         warnings = registry.quota_warnings(str(result.get("agent") or agent or ""), result.get("model") or model)
-        return public.dispatch_view(result, warnings)
+        view = public.dispatch_view(result, warnings)
+        client = _client_name(ctx)
+        log.info("dispatch_task client=%s task_id=%s", client or "unknown", view["task_id"])
+        if any(name in client for name in BACKGROUND_WAKE_CLIENTS):
+            view["background_wait"] = _wait_command(view["task_id"])
+        return view
     except Exception as exc:
         raise _failure(exc) from exc
 
 
 @mcp.tool(annotations=READ_ONLY)
-async def wait_task(ctx: Context, task_id: str, timeout_sec: float = DEFAULT_WAIT_SEC) -> dict[str, Any]:
-    """Wait up to timeout_sec (0 = just check) for a task. Running: progress only; call again. Finished: status, files_changed, usage and the first page of result; next_cursor means get_result has more. Keep timeout_sec under the host's tool timeout."""
+async def wait_task(ctx: Context, task_id: str) -> dict[str, Any]:
+    """A task's state now; never blocks. Running: progress only, so end your turn rather than calling again. Finished: status, files_changed, usage and the first page of result; next_cursor means get_result has more."""
     try:
         registry = _registry(ctx)
-        if timeout_sec <= 0:
-            snapshot = registry.check_task(task_id)
-        else:
-            snapshot = await registry.wait_task(task_id, timeout_sec=timeout_sec)
-        return _with_first_page(registry, public.task_view(snapshot))
+        return _with_first_page(registry, public.task_view(registry.check_task(task_id)))
     except Exception as exc:
         raise _failure(exc) from exc
 

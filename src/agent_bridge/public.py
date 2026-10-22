@@ -96,7 +96,7 @@ def agents_view(
     )
 
 
-def _stop(reason: Any, status: Any) -> str | None:
+def stop_reason_view(reason: Any, status: Any) -> str | None:
     """end_turn is the normal case and says nothing; a pause is the MCP cancel.
 
     A reason that only repeats the status (cancelled/cancelled) says nothing either.
@@ -181,7 +181,7 @@ def task_view(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             "task_id": snapshot.get("task_id"),
             "session_id": snapshot.get("session_id"),
             "status": status,
-            "stop_reason": _stop(snapshot.get("stop_reason"), status),
+            "stop_reason": stop_reason_view(snapshot.get("stop_reason"), status),
             "owner": owner,
             "error": snapshot.get("error") if failed else None,
             "error_kind": snapshot.get("error_kind") if failed else None,
@@ -247,7 +247,7 @@ def task_row(row: Mapping[str, Any], title: str | None) -> dict[str, Any]:
             "agent": row.get("agent"),
             "title": title,
             "status": status,
-            "stop_reason": _stop(row.get("stop_reason"), status),
+            "stop_reason": stop_reason_view(row.get("stop_reason"), status),
             "owner": owner,
             "resumable": _resumable(row),
             "resume_of": row.get("resume_of"),
