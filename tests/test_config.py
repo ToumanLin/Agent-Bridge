@@ -49,6 +49,10 @@ def test_loads_bundled_agents():
     assert "CLAUDE_CONFIG_DIR" in cfg.env.inherit
     assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" in cfg.env.inherit
     assert "OPENROUTER_API_KEY" in cfg.env.inherit
+    # A local gateway reaches workers through these, so they must survive an
+    # MCP host that clears the environment.
+    assert "OPENCODE_CONFIG" in cfg.env.inherit
+    assert "GOOGLE_GEMINI_BASE_URL" in cfg.env.inherit
     # An explicit [env] inherit in agents.toml replaces DEFAULT_INHERIT_KEYS
     # wholesale, so Kimi's keys have to be listed there too.
     assert "KIMI_CODE_HOME" in cfg.env.inherit
@@ -427,3 +431,23 @@ def test_load_config_reports_overlay_path_on_bad_toml(tmp_path):
         load_config(tmp_path)
     assert str(path) in str(exc_info.value)
     assert "Fix or delete the file" in str(exc_info.value)
+
+
+def test_user_overlay_sets_a_codex_model_provider(tmp_path):
+    (tmp_path / "agents.toml").write_text(
+        """
+[agents.codex.model_provider]
+id = "magpie"
+base_url = "http://127.0.0.1:3425/v1"
+http_headers = { x-openai-actor-authorization = "magpie" }
+""",
+        encoding="utf-8",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.agents["codex"].model_provider == {
+        "id": "magpie",
+        "base_url": "http://127.0.0.1:3425/v1",
+        "http_headers": {"x-openai-actor-authorization": "magpie"},
+    }
+    assert cfg.agents["codex"].protocol == "codex"
+    assert load_config(tmp_path / "nope").agents["codex"].model_provider == {}

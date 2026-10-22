@@ -88,6 +88,72 @@ def test_build_argv_resume_and_yolo():
     assert cmd[-3:] == ["resume", "thread-1", "-"]
 
 
+GATEWAY = {
+    "id": "magpie",
+    "name": "magpie",
+    "base_url": "http://127.0.0.1:3425/v1",
+    "wire_api": "responses",
+    "env_key": "MAGPIE_API_KEY",
+    "http_headers": {"x-openai-actor-authorization": "magpie"},
+}
+
+
+def test_build_argv_without_provider_has_no_provider_override():
+    cmd = build_codex_exec_argv(["codex"], cwd="/tmp/p")
+    assert not any(arg.startswith("model_provider") for arg in cmd)
+
+
+def test_build_argv_selects_a_custom_provider_with_c_overrides():
+    cmd = build_codex_exec_argv(["codex"], cwd="/tmp/p", model="m", model_provider=GATEWAY)
+    assert 'model_provider="magpie"' in cmd
+    assert 'model_providers.magpie.base_url="http://127.0.0.1:3425/v1"' in cmd
+    assert 'model_providers.magpie.wire_api="responses"' in cmd
+    assert 'model_providers.magpie.env_key="MAGPIE_API_KEY"' in cmd
+    assert 'model_providers.magpie.http_headers={ x-openai-actor-authorization = "magpie" }' in cmd
+    # every override is its own -c value, and the id is not repeated as a field
+    assert not any(arg.startswith("model_providers.magpie.id") for arg in cmd)
+    for arg in cmd:
+        if arg.startswith(("model_provider", "model_providers")):
+            assert cmd[cmd.index(arg) - 1] == "-c"
+    # the stdin marker still ends the command
+    assert cmd[-1] == "-"
+
+
+def test_provider_values_survive_a_toml_round_trip():
+    import tomllib
+
+    cmd = build_codex_exec_argv(["codex"], cwd="/tmp/p", model_provider=GATEWAY)
+    parsed: dict = {}
+    for arg in cmd:
+        if arg.startswith("model_providers.magpie.http_headers="):
+            parsed = tomllib.loads(arg.replace("model_providers.magpie.http_headers", "h", 1))
+    assert parsed == {"h": {"x-openai-actor-authorization": "magpie"}}
+
+
+def test_provider_id_must_be_a_plain_name():
+    for bad in (None, "", "a.b", 'x"y', "a b"):
+        with pytest.raises(ValueError, match="model_provider needs an id"):
+            build_codex_exec_argv(["codex"], cwd="/tmp/p", model_provider={"id": bad, "base_url": "u"})
+
+
+def test_provider_rejects_a_value_toml_cannot_hold():
+    with pytest.raises(ValueError, match="cannot write"):
+        build_codex_exec_argv(["codex"], cwd="/tmp/p", model_provider={"id": "g", "bad": object()})
+
+
+def test_adapter_passes_the_configured_provider_to_codex(tmp_path):
+    agent = AgentConfig(
+        name="codex",
+        protocol="codex",
+        command=[str(_launcher(tmp_path))],
+        model_provider=GATEWAY,
+    )
+    session = Session(session_id="s1", agent="codex", cwd=str(tmp_path))
+    task = Task(task_id="t1", session_id="s1", agent="codex", message="hi", cwd=str(tmp_path))
+    cmd = CodexAdapter(agent, tmp_path)._build_cmd(session, task)
+    assert 'model_provider="magpie"' in cmd
+
+
 def test_jsonl_takes_last_agent_message_and_requires_turn_completed():
     state = CodexTurnState()
     apply_codex_event(state, {"type": "thread.started", "thread_id": "t1"})

@@ -36,6 +36,8 @@ DEFAULT_INHERIT_KEYS = (
     "MOONSHOT_API_KEY",
     "DEEPSEEK_API_KEY",
     "OPENCODE_API_KEY",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
     "XAI_API_KEY",
     "GROK_API_KEY",
     "GROK_HOME",
@@ -72,6 +74,7 @@ DEFAULT_INHERIT_KEYS = (
     "WINDSURF_API_KEY",
     "GOOGLE_API_KEY",
     "GEMINI_API_KEY",
+    "GOOGLE_GEMINI_BASE_URL",
     "CLOUDFLARE_API_TOKEN",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
@@ -93,6 +96,9 @@ class AgentConfig(BaseModel):
     cwd: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
     session_meta: dict[str, Any] = Field(default_factory=dict)
+    # Codex only: a custom model provider (e.g. a local gateway) passed as -c
+    # overrides, since the exec worker ignores config.toml. See codex_exec.
+    model_provider: dict[str, Any] = Field(default_factory=dict)
     revivable: bool = False
     idle_unload_sec: int = 0
     stall_timeout_sec: int = Field(default=1800, ge=0)

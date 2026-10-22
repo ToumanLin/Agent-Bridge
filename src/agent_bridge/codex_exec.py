@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import subprocess
 import tomllib
 from collections.abc import Mapping, Sequence
@@ -212,6 +214,50 @@ def yolo_requested(session_meta: Mapping[str, Any] | None) -> bool:
     return value is True or value == "true" or value == 1
 
 
+_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _toml_key(key: str) -> str:
+    return key if _BARE_KEY.fullmatch(key) else json.dumps(key)
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, Mapping):
+        body = ", ".join(f"{_toml_key(str(k))} = {_toml_value(v)}" for k, v in value.items())
+        return "{ " + body + " }" if body else "{}"
+    raise ValueError(f"cannot write {type(value).__name__} as a Codex -c value")
+
+
+def model_provider_overrides(provider: Mapping[str, Any] | None) -> list[str]:
+    """``-c`` arguments that select a custom Codex model provider.
+
+    ``--ignore-user-config`` hides the provider tables in ``config.toml``, so a
+    gateway has to arrive as ``-c`` overrides. ``id`` names the provider; every
+    other key becomes ``model_providers.<id>.<key>``. Put the credential in the
+    worker env and name it with ``env_key``: argv is visible to other processes.
+    """
+    if not provider:
+        return []
+    raw_id = provider.get("id")
+    provider_id = raw_id if isinstance(raw_id, str) else ""
+    if not _BARE_KEY.fullmatch(provider_id):
+        raise ValueError("[agents.codex] model_provider needs an id of letters, digits, '_' or '-'")
+    args = ["-c", f"model_provider={_toml_value(provider_id)}"]
+    for key, value in provider.items():
+        if key == "id":
+            continue
+        args += ["-c", f"model_providers.{provider_id}.{_toml_key(str(key))}={_toml_value(value)}"]
+    return args
+
+
 def build_codex_exec_argv(
     command: list[str],
     *,
@@ -220,6 +266,7 @@ def build_codex_exec_argv(
     effort: str | None = None,
     resume_id: str | None = None,
     yolo: bool = False,
+    model_provider: Mapping[str, Any] | None = None,
 ) -> list[str]:
     cmd = [
         *command,
@@ -228,6 +275,7 @@ def build_codex_exec_argv(
         "--ignore-user-config",
         "-c",
         AUTH_STORE_OVERRIDE,
+        *model_provider_overrides(model_provider),
     ]
     if yolo:
         cmd.append("--yolo")

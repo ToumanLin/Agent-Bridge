@@ -62,6 +62,7 @@ class CodexAdapter(Adapter):
             effort=task.effort or session.effort,
             resume_id=session.native_session_id,
             yolo=yolo_requested(self.agent.session_meta),
+            model_provider=self.agent.model_provider,
         )
 
     async def _drain_stderr(self, proc: asyncio.subprocess.Process, session_id: str) -> str:
