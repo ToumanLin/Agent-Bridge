@@ -21,6 +21,7 @@ from agent_bridge.config import (
     normalize_coordinator_mode,
     write_coordinator_overlay,
 )
+from agent_bridge.gateway import describe_route
 from agent_bridge.grok_observe import observe_grok_session
 from agent_bridge.kimi_observe import observe_kimi_session
 from agent_bridge.models import (
@@ -1204,6 +1205,9 @@ class Registry:
         async def describe(cfg: AgentConfig) -> dict:
             row = await probe_agent(cfg, self.config.env)
             row["quota"] = await self._quota_for(cfg, available=bool(row.get("available")))
+            route = await asyncio.to_thread(describe_route, cfg)
+            if route:
+                row["route"] = route
             return row
 
         return list(await asyncio.gather(*(describe(cfg) for cfg in self.config.agents.values())))

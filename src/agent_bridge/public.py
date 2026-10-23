@@ -24,6 +24,8 @@ AGENT_NOTES = {
     "claude": "model/effort are the last values Bridge set, not a live sampler",
     "cursor": "model/effort are what Cursor confirmed after mapping, not a live sampler",
     "devin": "the effort level is part of the model id; effort is ignored",
+    "codex": "model is a codex slug such as gpt-5.6-sol, not a display name; leave it unset for the default",
+    "antigravity": "model is an agy slug such as gemini-3.7-flash; leave it unset for the default",
 }
 
 RUNNING = {"queued", "running"}
@@ -73,6 +75,7 @@ def agent_view(row: Mapping[str, Any]) -> dict[str, Any]:
         {
             "agent": name,
             "note": AGENT_NOTES.get(str(name)),
+            "route": row.get("route"),
             "quota": quota_view(row.get("quota")),
         }
     )
