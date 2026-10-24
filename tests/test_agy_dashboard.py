@@ -521,3 +521,21 @@ async def test_run_turn_cancel_during_spawn_still_reaps(tmp_path, monkeypatch):
         t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()
     ]
     assert leftover == []
+
+
+def test_codex_payload_records_reach_the_feed():
+    def rec(kind, payload):
+        return {"type": kind, "ts": "t", "data": {"payload": payload}}
+
+    msg = _norm(rec("message_chunk", {"type": "item.completed", "item": {"id": "1", "type": "agent_message", "text": "hi"}}))
+    assert msg == {"t": "msg", "ts": "t", "text": "hi"}
+    think = _norm(rec("raw", {"type": "item.completed", "item": {"id": "2", "type": "reasoning", "text": "hmm"}}))
+    assert think["t"] == "think" and think["text"] == "hmm"
+    start = _norm(rec("raw", {"type": "item.started", "item": {"id": "3", "type": "command_execution", "command": "ls"}}))
+    assert start["t"] == "tool" and start["input"] == "ls" and start["status"] == "in_progress"
+    done = _norm(rec("raw", {"type": "item.completed", "item": {"id": "3", "type": "command_execution", "command": "ls", "exit_code": 0, "aggregated_output": "a"}}))
+    assert done["id"] == "3" and done["status"] == "completed" and done["output"] == "a"
+    edit = _norm(rec("tool_call", {"type": "item.completed", "item": {"id": "4", "type": "file_change", "changes": [{"path": "a.py", "kind": "update"}]}}))
+    assert edit["kind"] == "edit" and "a.py" in edit["input"]
+    assert _norm(rec("raw", {"type": "turn.started"})) is None
+    assert _norm(rec("error", {"type": "error", "message": "boom"}))["text"] == "boom"

@@ -115,11 +115,71 @@ def _legacy_payload_flat(d):
     return merged
 
 
+def _codex_event(ts, p):
+    """Dashboard event for a Codex ``exec --json`` record kept as ``data.payload``.
+
+    The adapter stores the raw JSONL object, with command and reasoning items
+    typed "raw", so the feed is rebuilt from the payload's own ``type`` and
+    ``item.type``. Returns None for lifecycle noise.
+    """
+    ptype = p.get("type")
+    item = p.get("item") if isinstance(p.get("item"), dict) else None
+    if item is None:
+        if ptype == "error":
+            return {"t": "error", "ts": ts, "text": str(p.get("message") or "error")}
+        if ptype == "turn.failed":
+            err = p.get("error")
+            msg = err.get("message") if isinstance(err, dict) else err
+            return {"t": "error", "ts": ts, "text": str(msg or "turn failed")}
+        return None
+    itype = item.get("type")
+    text = item.get("text")
+    if itype == "agent_message" and ptype == "item.completed":
+        return {"t": "msg", "ts": ts, "text": text} if isinstance(text, str) and text else None
+    if itype == "reasoning" and ptype == "item.completed":
+        return {"t": "think", "ts": ts, "text": text} if isinstance(text, str) and text else None
+    if itype == "command_execution":
+        done = ptype == "item.completed"
+        failed = done and (item.get("status") == "failed" or item.get("exit_code") not in (0, None))
+        ev = {
+            "t": "tool",
+            "ts": ts,
+            "id": item.get("id"),
+            "kind": "execute",
+            "title": "shell",
+            "input": str(item.get("command") or "")[:MAX_INPUT_CHARS],
+            "status": ("failed" if failed else "completed") if done else "in_progress",
+        }
+        if done and item.get("aggregated_output"):
+            ev["output"] = str(item["aggregated_output"])[:MAX_INPUT_CHARS]
+        return ev
+    if itype == "file_change" and ptype == "item.completed":
+        changes = [c for c in item.get("changes") or [] if isinstance(c, dict)]
+        paths = ", ".join(f"{c.get('kind', 'edit')} {c.get('path', '')}".strip() for c in changes)
+        return {
+            "t": "tool",
+            "ts": ts,
+            "id": item.get("id"),
+            "kind": "edit",
+            "title": "file change",
+            "input": paths[:MAX_INPUT_CHARS],
+            "status": "failed" if item.get("status") == "failed" else "completed",
+        }
+    return None
+
+
 def normalize_event(rec):
     """Convert a raw transcript JSONL record into a compact dashboard event."""
     t = rec.get("type")
     ts = rec.get("ts")
     d = rec.get("data") or {}
+    payload = d.get("payload")
+    if isinstance(payload, dict) and (
+        isinstance(payload.get("item"), dict)
+        or str(payload.get("type") or "").startswith(("thread.", "turn.", "item."))
+        or (payload.get("type") == "error" and "message" in payload)
+    ):
+        return _codex_event(ts, payload)
     if isinstance(d.get("payload"), dict):
         d = _legacy_payload_flat(d)
 
