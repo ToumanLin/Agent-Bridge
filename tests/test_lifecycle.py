@@ -57,7 +57,7 @@ async def test_sibling_task_is_visible_readonly(bridge_home, tmp_path, monkeypat
             assert task_id not in b.tasks
             assert session_id not in b.sessions
 
-            checked = b.check_task(task_id)
+            checked = await b.check_task(task_id)
             assert checked["remote"] is True
             assert checked["status"] == "running"
             assert checked["owner"] == {"pid": 1001, "create_time": 11.0, "alive": True}
@@ -88,7 +88,7 @@ async def test_sibling_task_is_visible_readonly(bridge_home, tmp_path, monkeypat
             assert waited["status"] == "completed"
             assert "sibling work" in waited["result_text"]
 
-            result = b.get_result(task_id)
+            result = await b.get_result(task_id)
             assert result["remote"] is True
             assert result["result_complete"] is True
             assert "sibling work" in result["result_text"]
@@ -142,7 +142,7 @@ async def test_remote_task_owner_lost_is_truthful(bridge_home, monkeypatch):
         )
         atomic_write_json(state_path(bridge_home), payload)
 
-        checked = b.check_task("task_orphan")
+        checked = await b.check_task("task_orphan")
         assert checked["remote"] is True
         assert checked["owner_lost"] is True
         assert checked["owner"] == {"pid": 5555, "create_time": 3.0, "alive": False}
@@ -180,9 +180,9 @@ async def test_remote_tasks_disabled_keeps_local_only(bridge_home, tmp_path, mon
             assert b.config.server.remote_tasks is False
             assert task_id not in b.tasks
             with pytest.raises(KeyError, match="unknown task"):
-                b.check_task(task_id)
+                await b.check_task(task_id)
             with pytest.raises(KeyError, match="unknown task"):
-                b.get_result(task_id)
+                await b.get_result(task_id)
             with pytest.raises(KeyError, match="unknown task"):
                 await b.wait_task(task_id, timeout_sec=0)
             assert all(row["task_id"] != task_id for row in b.list_tasks())
@@ -216,10 +216,10 @@ async def test_remote_row_written_by_old_build_still_resolves(bridge_home, monke
             }
         )
         atomic_write_json(state_path(bridge_home), payload)
-        checked = b.check_task("task_v1")
+        checked = await b.check_task("task_v1")
         assert checked["remote"] is True
         assert checked["status"] == "completed"
-        result = b.get_result("task_v1")
+        result = await b.get_result("task_v1")
         assert result["remote"] is True
         assert "v1 result" in result["result_text"]
     finally:

@@ -134,7 +134,7 @@ async def test_pause_running_task_preserves_partial(bridge_home, tmp_path, monke
         assert rows[task_id]["resumable"] is True
         assert "resume_task" in rows[task_id]["resume_hint"]
 
-        result = registry.get_result(task_id)
+        result = await registry.get_result(task_id)
         assert result["paused"] is True
         assert result["resumable"] is True
         assert "partial progress" in result["result_text"]
@@ -188,6 +188,9 @@ async def test_pause_then_resume_same_session(bridge_home, tmp_path, monkeypatch
         native = registry.sessions[session_id].native_session_id
         turns = registry.sessions[session_id].turns
 
+        # The continuation's dispatch awaits flush_state() before returning, so
+        # it can start running before resume_task does: shorten the delay first.
+        monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "0.01")
         resumed = await registry.resume_task(task_id)
         new_id = resumed["task_id"]
         assert resumed["resumed_from"] == task_id
@@ -196,7 +199,7 @@ async def test_pause_then_resume_same_session(bridge_home, tmp_path, monkeypatch
 
         # Old row unchanged in identity: still the paused terminal row, now
         # pointing forward at its continuation.
-        old = registry.check_task(task_id)
+        old = await registry.check_task(task_id)
         assert old["status"] == "cancelled"
         assert old["paused"] is True
         assert old["resumed_by"] == new_id
@@ -208,7 +211,6 @@ async def test_pause_then_resume_same_session(bridge_home, tmp_path, monkeypatch
         assert new_task.message == RESUME_DEFAULT_MESSAGE
 
         # Same session + native conversation.
-        monkeypatch.setenv("AGENT_BRIDGE_FAKE_DELAY", "0.01")
         waited = await registry.wait_task(new_id, timeout_sec=5)
         assert waited["status"] == "completed"
         assert registry.sessions[session_id].native_session_id == native
@@ -418,7 +420,7 @@ async def test_resume_delegates_to_live_remote_owner(bridge_home, tmp_path, monk
             assert task_id not in b.tasks
             # The remote view resolves read-only and resumable — the hint
             # names the routed path, not a rejection.
-            checked = b.check_task(task_id)
+            checked = await b.check_task(task_id)
             assert checked["remote"] is True
             assert checked["paused"] is True
             assert checked["resumable"] is True
@@ -440,7 +442,7 @@ async def test_resume_delegates_to_live_remote_owner(bridge_home, tmp_path, monk
             assert a.tasks[new_id].session_id == session_id
 
             # B sees both rows as remote and can poll the new one to done.
-            remote_new = b.check_task(new_id)
+            remote_new = await b.check_task(new_id)
             assert remote_new["remote"] is True
             assert remote_new["owner"]["pid"] == 4242
             waited = await b.wait_task(new_id, timeout_sec=15)
@@ -955,7 +957,7 @@ async def test_old_disk_rows_without_pause_fields(bridge_home, monkeypatch):
     registry = Registry.create(bridge_home)
     await registry.start()
     try:
-        checked = registry.check_task("task_old")
+        checked = await registry.check_task("task_old")
         assert checked["paused"] is False
         assert checked["resumable"] is False
         assert "resume_of" not in checked
@@ -993,7 +995,7 @@ async def test_remote_snapshot_marks_dead_owner_paused_resumable(
             ).model_dump(mode="json")
         )
         atomic_write_json(state_path(bridge_home), payload)
-        checked = b.check_task("task_premote")
+        checked = await b.check_task("task_premote")
         assert checked["remote"] is True
         assert checked["paused"] is True
         assert checked["resumable"] is True
@@ -1020,7 +1022,7 @@ async def test_resume_on_ended_session_rejected(bridge_home, tmp_path, monkeypat
         with pytest.raises(RuntimeError, match="was ended"):
             await registry.resume_task(task_id)
         # And the snapshot reports it truthfully.
-        checked = registry.check_task(task_id)
+        checked = await registry.check_task(task_id)
         assert checked["resumable"] is False
         assert "ended" in checked["resume_hint"]
     finally:

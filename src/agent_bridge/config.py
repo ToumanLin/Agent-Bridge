@@ -72,6 +72,26 @@ DEFAULT_INHERIT_KEYS = (
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
     "OPENROUTER_API_KEY",
     "WINDSURF_API_KEY",
+    "ZCODE_HOME",
+    "ZCODE_BIN",
+    "ZCODE_NODE",
+    "ZCODE_MODEL",
+    "ZCODE_PROVIDER",
+    "ZCODE_BASE_URL",
+    "ZCODE_ACP_MODE",
+    "ZCODE_ACP_DEBUG",
+    "MINIMAX_DATA_DIR",
+    "MAVIS_DATA_DIR",
+    "MAVIS_REGION",
+    "MAVIS_BUILD_ENV",
+    "MAVIS_PROFILE",
+    "MCODE_CONFIG_DIR",
+    "MCODE_API_BASE_URL",
+    "MCODE_AUTH_BASE_URL",
+    "MCODE_REGION",
+    "MCODE_CLIENT_ID",
+    "MCODE_SCOPE",
+    "MCODE_AUTH_PROVIDER",
     "GOOGLE_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_GEMINI_BASE_URL",
@@ -96,12 +116,13 @@ class AgentConfig(BaseModel):
     cwd: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
     session_meta: dict[str, Any] = Field(default_factory=dict)
-    # Codex only: a custom model provider (e.g. a local gateway) passed as -c
-    # overrides, since the exec worker ignores config.toml. See codex_exec.
-    model_provider: dict[str, Any] = Field(default_factory=dict)
     revivable: bool = False
     idle_unload_sec: int = 0
     stall_timeout_sec: int = Field(default=1800, ge=0)
+    # Hard cap on one turn's wall-clock length (0 = disabled). Catches a
+    # worker that stays chatty forever without ever going silent —
+    # stall_timeout_sec alone cannot see that case (H-16).
+    turn_timeout_sec: int = Field(default=0, ge=0)
     print_timeout: str = "120m"
     # What PromptResponse.usage counters mean on ACP workers (the spec's docs
     # contradict themselves, and agents diverged):
@@ -110,6 +131,15 @@ class AgentConfig(BaseModel):
     #   "turn"         — the snapshot is this turn alone; counted in full.
     # Only consulted when no UsageUpdate counters arrived for the turn.
     prompt_usage_scope: Literal["conversation", "turn"] = "conversation"
+    # How Bridge answers worker permission prompts when no human is present:
+    # "allow_once" grants each request for that call only (default, least
+    # privilege), "allow_always" persists the grant inside the worker,
+    # "deny" cancels every request.
+    permission_policy: str = "allow_once"
+    # Codex only: each item is passed as `codex exec -c <item>` (raw TOML
+    # key=value). No key validation, no filtering, user config.toml is
+    # never read.
+    config_overrides: list[str] = Field(default_factory=list)
 
 
 class EnvConfig(BaseModel):
@@ -120,6 +150,9 @@ class EnvConfig(BaseModel):
     set: dict[str, str] = Field(default_factory=dict)
     proxy_url: str | None = None
     no_proxy: str | None = None
+    # Glob patterns of env keys a worker subprocess must never see; keys
+    # explicitly assigned via ``set``/agent ``env`` always survive.
+    deny: list[str] = Field(default_factory=list)
 
 
 class ServerConfig(BaseModel):
@@ -267,7 +300,9 @@ def _coerce_env(raw: dict[str, Any]) -> dict[str, Any]:
     proxy: dict[str, Any] = raw_proxy if isinstance(raw_proxy, dict) else {}
     out: dict[str, Any] = {}
     if "inherit" in block and block["inherit"] is not None:
-        out["inherit"] = [str(item) for item in block["inherit"]]
+        raw_inherit = block["inherit"]
+        # A bare string is one name, not an iterable of characters.
+        out["inherit"] = [raw_inherit] if isinstance(raw_inherit, str) else [str(item) for item in raw_inherit]
     if "discover_proxy" in block:
         out["discover_proxy"] = bool(block["discover_proxy"])
     if isinstance(block.get("set"), dict):
@@ -278,6 +313,10 @@ def _coerce_env(raw: dict[str, Any]) -> dict[str, Any]:
     no_proxy = proxy.get("no_proxy") or proxy.get("no") or block.get("no_proxy")
     if no_proxy:
         out["no_proxy"] = str(no_proxy).strip()
+    if "deny" in block and block["deny"] is not None:
+        raw_deny = block["deny"]
+        # A bare string is one glob, not an iterable of characters.
+        out["deny"] = [raw_deny] if isinstance(raw_deny, str) else [str(item) for item in raw_deny]
     return out
 
 
@@ -288,6 +327,10 @@ def _merge_env(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
             raw_set = out.get("set")
             current: dict[str, Any] = raw_set if isinstance(raw_set, dict) else {}
             out["set"] = {**current, **value}
+        elif key == "deny" and isinstance(value, list):
+            raw_deny = out.get("deny")
+            deny_list: list[Any] = raw_deny if isinstance(raw_deny, list) else []
+            out["deny"] = [*deny_list, *value]
         else:
             out[key] = value
     return out

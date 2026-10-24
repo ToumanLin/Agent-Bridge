@@ -4,14 +4,18 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import re
 import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from agent_bridge.adapters.base import STDIO_LIMIT, Adapter
 from agent_bridge.config import AgentConfig
+from agent_bridge.diagnostics import redact_diagnostic
 from agent_bridge.models import Session, Task, TurnResult, agy_effort
 from agent_bridge.processes import (
     drop_pid,
@@ -200,6 +204,45 @@ _MUTATING_TOOL_MARKERS = (
     "patch",
     "create",
 )
+
+
+def agy_projects_dir() -> Path:
+    return Path.home() / ".gemini" / "config" / "projects"
+
+
+def _uri_path(value: str) -> str:
+    p = unquote(value.removeprefix("file:")).replace("\\", "/")
+    p = p.lstrip("/") if re.match(r"^/*[A-Za-z]:", p) else "/" + p.lstrip("/")
+    return os.path.normcase(os.path.normpath(p))
+
+
+def find_agy_project(cwd: str, projects_dir: Path) -> str | None:
+    """Id of the agy project whose folderUri points at ``cwd``, if one exists."""
+    if not projects_dir.is_dir():
+        return None
+    target = _uri_path(cwd)
+    for file in sorted(projects_dir.glob("*.json")):
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        project_id = data.get("id")
+        resources = data.get("projectResources")
+        entries = resources.get("resources") if isinstance(resources, dict) else None
+        if not isinstance(project_id, str) or not isinstance(entries, list):
+            continue
+        for resource in entries:
+            if not isinstance(resource, dict):
+                continue
+            candidates = [resource.get("folderUri")]
+            git = resource.get("gitFolder")
+            if isinstance(git, dict):
+                candidates.append(git.get("folderUri"))
+            if any(isinstance(uri, str) and _uri_path(uri) == target for uri in candidates):
+                return project_id
+    return None
 
 
 def collect_tool_paths(obj: dict[str, Any], into: set[str]) -> None:
@@ -576,7 +619,10 @@ class AgyAdapter(Adapter):
         if session.native_session_id:
             cmd += ["--conversation", session.native_session_id]
         else:
-            cmd += ["--new-project"]
+            # Reuse the cwd's existing project so each dispatch does not add a
+            # duplicate to Antigravity's project list; --new-project only when none exists.
+            project_id = find_agy_project(session.cwd, agy_projects_dir()) if session.cwd else None
+            cmd += ["--project", project_id] if project_id else ["--new-project"]
         cmd += [
             "-p",
             "",
@@ -651,7 +697,13 @@ class AgyAdapter(Adapter):
                 if text:
                     tail = f"{tail}\n{text}"[-STDERR_TAIL_LIMIT:]
         except (ValueError, OSError):
-            log.warning("stderr drain aborted for %s", session_id, exc_info=True)
+            log.warning(
+                "stderr drain aborted for %s (line over %s MiB or stream closed); "
+                "later stderr evidence is lost",
+                session_id,
+                STDIO_LIMIT // (1024 * 1024),
+                exc_info=True,
+            )
             return tail
 
     async def _write_prompt(self, proc: asyncio.subprocess.Process, message: str) -> None:
@@ -689,7 +741,9 @@ class AgyAdapter(Adapter):
         conversation (those counters cover every turn so far); otherwise ``turn``.
         """
         cmd = self._build_cmd(session, task)
-        env = build_worker_env(self.agent.env, config=self.env_config, worker_context=True)
+        env = self._enforce_spawn_env(
+            build_worker_env(self.agent.env, config=self.env_config, worker_context=True, home=self.home)
+        )
         kwargs: dict[str, Any] = {}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -750,7 +804,14 @@ class AgyAdapter(Adapter):
             await self._write_prompt(proc, task.message)
             assert proc.stdout is not None
             while True:
-                line = await proc.stdout.readline()
+                try:
+                    line = await proc.stdout.readline()
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"antigravity emitted a stdout line longer than "
+                        f"{STDIO_LIMIT // (1024 * 1024)} MiB (asyncio stream limit); "
+                        "the turn cannot continue"
+                    ) from exc
                 if not line:
                     break
                 raw = line.decode("utf-8", errors="replace").rstrip()
@@ -873,7 +934,12 @@ class AgyAdapter(Adapter):
                             native_session_id=cid,
                             warnings=[err, *exit_warnings],
                         )
-                    append_event(session.session_id, "error", {"error": err, "code": proc.returncode}, self.home)
+                    append_event(
+                        session.session_id,
+                        "error",
+                        {"error": redact_diagnostic(err), "code": proc.returncode},
+                        self.home,
+                    )
                     return TurnResult(
                         text=result_text,
                         files_changed=sorted(files),

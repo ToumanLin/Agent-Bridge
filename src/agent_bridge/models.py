@@ -23,6 +23,12 @@ class TaskStatus(StrEnum):
     cancelled = "cancelled"
 
 
+class FilesChangedState(StrEnum):
+    pending = "pending"
+    collected = "collected"
+    unavailable = "unavailable"
+
+
 class ProcState(StrEnum):
     spawning = "spawning"
     ready = "ready"
@@ -107,6 +113,14 @@ class Session(BaseModel):
     owner_create_time: float | None = None
 
 
+class TaskFailure(BaseModel):
+    operation: str
+    kind: str
+    prompt_may_have_been_sent: bool
+    exit_code: int | None = None
+    stderr_summary: str | None = None
+
+
 class Task(BaseModel):
     task_id: str
     session_id: str
@@ -137,11 +151,17 @@ class Task(BaseModel):
     files_changed: list[str] = Field(default_factory=list)
     files_changed_total: int = 0
     files_changed_truncated: bool = False
+    files_changed_state: FilesChangedState = FilesChangedState.pending
+    # Paths the worker REPORTED that resolve outside task.cwd. Kept separate
+    # so an escape is never silently folded into an in-workspace path (E3).
+    files_outside_cwd: list[str] = Field(default_factory=list)
+    files_outside_cwd_total: int = 0
     usage: dict[str, Any] = Field(default_factory=dict)
     # Accumulated token consumption for this run (one task / one worker turn,
     # root agent plus subagent streams). `usage` stays the last raw snapshot.
     run_usage: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
+    failure: TaskFailure | None = None
     warnings: list[str] = Field(default_factory=list)
     created_at: str = Field(default_factory=iso)
     started_at: str | None = None
@@ -164,6 +184,8 @@ class TurnResult(BaseModel):
     run_usage: dict[str, Any] = Field(default_factory=dict)
     native_session_id: str | None = None
     error: str | None = None
+    # Structured cause when the worker failed the turn (ACP diagnostics).
+    failure: TaskFailure | None = None
     warnings: list[str] = Field(default_factory=list)
     # Last model/effort the adapter successfully applied this turn. Grok and
     # Kimi observers in Registry overwrite these with on-disk sampler truth.

@@ -2,7 +2,7 @@
 
 > Rulebook for coordinators. Optional: the MCP handshake and tool descriptions carry the hard rules; copy this to a project root as `AGENTS.md` when you want the long form.
 
-You are the coordinator. Users talk only to you. Grok Build, Kimi Code, Antigravity (Gemini), DeepSeek Harness, OpenCode, Claude Code, Codex CLI, and Devin CLI are workers you call. Keep architecture decisions and acceptance. The same product can be a coordinator *and* a worker — those are different processes.
+You are the coordinator. Users talk only to you. Grok Build, Kimi Code, Antigravity (Gemini), DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI, ZCode, and MiniMax Code are workers you call. Keep architecture decisions and acceptance. The same product can be a coordinator *and* a worker — those are different processes.
 
 ## Mode and user preferences
 
@@ -14,7 +14,7 @@ Call `list_agents` first and re-read its `mode` / `instructions` before every di
 
 When the user states a **lasting** preference, persist it with `set_preferences`. Its `instructions` argument replaces the stored text — read the current value first and write the merge. One-off wishes are not preferences.
 
-Workers are reached **only** through Agent Bridge MCP tools (`list_agents`, `set_preferences`, `dispatch_task`, `wait_task`, `get_result`, `cancel_task`, `list_tasks`). If those tools are missing, stop and say so. Do **not** run `kimi`, `grok`, `agy`, `dsh`, `opencode`, `claude`, `claude-agent-acp`, `codex`, or `devin` yourself. `git` / `pytest` after a turn is review, not dispatch.
+Workers are reached **only** through Agent Bridge MCP tools (`list_agents`, `set_preferences`, `dispatch_task`, `wait_task`, `get_result`, `cancel_task`, `list_tasks`). If those tools are missing, stop and say so. Do **not** run `kimi`, `grok`, `agy`, `dsh`, `opencode`, `claude`, `claude-agent-acp`, `codex`, `devin`, `zcode-acp-server`, or `mcode` yourself. `git` / `pytest` after a turn is review, not dispatch.
 
 ## Step 1 — dispatch, or do it yourself?
 
@@ -41,6 +41,8 @@ User `instructions` override this.
 - **Claude Code:** optional implementer — user asked, or Grok and Kimi are busy. Worker binary is `claude-agent-acp`, not product `claude`.
 - **Codex CLI:** optional implementer — user asked, or others are busy. Desktop-bundled `codex exec`, not the Desktop GUI.
 - **Devin CLI:** optional implementer — user asked, or others are busy. `devin acp`, not Devin Desktop.
+- **ZCode:** optional — user asked, or others are busy. `zcode-acp-server`, not the app.
+- **MiniMax Code:** optional — user asked, or others are busy. `mcode acp`.
 - **DeepSeek Harness:** only if others are unavailable or the user asked.
 
 In `auto`/`eager`, tell the user afterwards; in `manual`, the explicit request is the permission.
@@ -58,6 +60,8 @@ In `auto`/`eager`, tell the user afterwards; in `manual`, the explicit request i
    - DSH: `provider/model` + `off|low|high|max`; unknown model fails, unmappable effort warns. Native `--profile acp` switches live via `session/set_config_option`; the demo respawns.
    - Codex CLI: advertised slugs + `off|low|medium|high|max` (`off`→`none`). Default `--approve-for-me`; prompt on stdin. Revive via `exec resume`. Startup failures before JSONL are returned in the finished task's `error`.
    - Devin CLI: advertised model ids (level is part of the id, e.g. `swe-1-7-medium`). Unknown id fails; `effort` ignored with a warning. Mode forced to `bypass`. Revive via `session/load` — it replays old history into the transcript (the result stays clean).
+   - ZCode: `provider\model` or a unique bare id. Thought: `off`→`low`, `medium`→`high`. Unknown or ambiguous model fails; unmappable effort warns. Mode `yolo`. Revive via `session/resume`.
+   - MiniMax Code: `provider/model` or `provider/model#variant`. `thinkingEffort` (`off`→`default`). Unknown model fails; unmappable effort warns. Permission `bypassPermissions`. Revive via `session/resume`.
 3. Do not wait inside a turn. After dispatching, end your turn: `wait_task` never blocks, and calling it in a loop only burns turns. In Claude Code, first start the answer's `background_wait` command as a background shell job — its exit wakes you. Elsewhere the next turn reads the task with `wait_task`. A running answer reports `silent_for_sec` since the worker's last output; a turn silent for `stall_timeout_sec` (default 1800, per worker in `agents.toml`, 0 disables) ends `failed` / `stop_reason="stalled"` — raise the limit for legitimately long silence, or follow up on the `session_id`. `cancel_task` ends a turn gracefully — partial result kept, resumable — and `dispatch_task(continue_task=<task_id>)` continues it on the same conversation (safe cancel, not a freeze).
 4. A finished `wait_task` carries the first page of the result; while `next_cursor` is present, call `get_result` with `cursor=next_cursor` and concatenate the pages. Then inspect `git status` / `git diff` yourself and run the relevant build and tests. Do not trust the worker's self-report. An empty Kimi result with non-empty `warnings` is a failed turn, not a no-op.
 5. If review fails, `dispatch_task` again on the same `session_id` with a concrete problem list. At most three follow-ups, then fix it yourself.

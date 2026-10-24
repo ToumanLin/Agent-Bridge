@@ -62,7 +62,7 @@ npm install -g @deepseek-ai/dsh-acp-demo
 .\.venv\Scripts\python.exe scripts\install_dsh_acp.py
 ```
 
-The helper writes `$AGENT_BRIDGE_HOME/dsh-acp` (default `~/.agent-bridge/dsh-acp`) and installs the ACP peers the cordis file imports. Bridge copies that cordis file next to the chosen `node_modules` so ESM can resolve plugins. An unbuilt checkout `src/bin.ts` is ignored unless `tsx` is installed. DSH persistence is `$AGENT_BRIDGE_HOME/dsh-sessions/<session_id>` so a user project does not get `./.sessions`. A finished task's `files_changed` is a turn-scoped workspace diff, not only ACP tool_call events (DSH often sends none). It is capped at 200 paths; `files_more` tell you when to fall back to `git status`.
+The helper writes `$AGENT_BRIDGE_HOME/dsh-acp` (default `~/.agent-bridge/dsh-acp`) and installs the ACP peers the cordis file imports. Bridge copies that cordis file next to the chosen `node_modules` so ESM can resolve plugins. An unbuilt checkout `src/bin.ts` is ignored unless `tsx` is installed. DSH persistence is `$AGENT_BRIDGE_HOME/dsh-sessions/<session_id>` so a user project does not get `./.sessions`. A finished task's `files_changed` is a turn-scoped workspace diff, not only ACP tool_call events (DSH often sends none). It is capped at 200 paths; `files_more` tells you when to fall back to `git status`.
 
 Restart Codex after editing `config.toml`.
 
@@ -280,7 +280,7 @@ Live coordinator loop (product `claude` as host, OpenCode as worker): `uv run py
 
 ## Environment and proxy
 
-Worker CLIs (Grok, Kimi, DSH, agy, OpenCode, Claude Code, Codex, Devin) read API keys — and, on machines that need one, `HTTPS_PROXY` — from **their** process environment. Two things strip that:
+Worker CLIs (Grok, Kimi, DSH, agy, OpenCode, Claude Code, Codex, Devin, ZCode, MiniMax Code) read API keys — and, on machines that need one, `HTTPS_PROXY` — from **their** process environment. Two things strip that:
 
 1. Codex env-clears the MCP server.
 2. Bridge launches `grok.exe` / `kimi` / `agy` / `opencode` / `claude-agent-acp` directly, so PowerShell functions that wrap those CLIs never run.
@@ -295,6 +295,8 @@ Bridge rebuilds the environment **once at startup** (and again for each worker s
 | `[env.proxy]` | `url` / `no_proxy` in `agents.toml` |
 | `[env.set]` | Explicit key/value map |
 | `[agents.<name>.env]` | Per-worker overlay |
+
+`[env] deny = ["GLOB", ...]` removes worker env keys matching those globs. Keys set explicitly via `[env] set` or the agent's `env` always survive, and Bridge's own `AGENT_BRIDGE_HOME` and worker-context marker are never removed. There is no built-in denylist.
 
 Do **not** put secrets in the repo `agents.toml`. Pin machine-local values in `%USERPROFILE%\.agent-bridge\agents.toml` (see [agents.toml.example](agents.toml.example)):
 
@@ -367,6 +369,18 @@ Other clocks still apply:
 | `[server] idle_exit_sec`, `shutdown_policy`, `linger_max_sec` | Bridge server | Abandoned-server self-exit and orderly-close behavior (see Server lifecycle). A queued/running task already suppresses idle exit. |
 | Host MCP tool timeout | Coordinator host | Per-call ceiling (Codex `tool_timeout_sec`, Kimi `toolTimeoutMs`, ZCode `timeoutMs`, Claude `timeout`, Grok `tool_timeout_sec`, Cursor ~60 s). Bridge calls finish well inside it. |
 
+## ACP failure diagnostics
+
+`wait_task` and `get_result` retain the string `error` and include an optional `failure` object for ACP failures:
+
+- `operation`: the failed operation, such as `process_start`, `initialize`, `model_discovery`, `session/new`, `session/load`, `session/resume`, `session/configure`, `session/set_config_option model`, or `session/prompt`.
+- `kind`: `auth_required`, `unsupported_model`, `timeout`, `connection_closed`, `worker_exit`, `protocol_error`, or `unknown`. Classification uses protocol codes and observed facts, not guesses from stderr.
+- `exit_code`: the observed exit code of the failing process, or `null`. During model discovery this belongs to the discovery command. An exit caused by Bridge's timeout cleanup is not substituted for the original failure.
+- `prompt_may_have_been_sent`: `false` only when this turn has not entered the prompt send operation; `true` means delivery or execution may already have occurred, not that delivery was acknowledged.
+- `stderr_summary`: recognized generic diagnostic phrases only, at most 2048 characters, or `null`. Raw stderr, arbitrary lines, credentials, URLs and local paths are not included. The human-readable `error` is also bounded and common credential fields are redacted.
+
+`failure = null` means no structured evidence is available (including old records, other adapters and interrupted tasks restored after a Bridge restart), not that retrying is safe. Bridge does not automatically replay failed prompts. Even `false` does not prove initialization was side-effect-free. An uncertain dispatch response can be retried with its original `request_id`; replaying that ID retrieves the same retained task, not a fresh execution of a failed task. `available` still describes command resolution, not authentication or session health.
+
 ## Remaining quota in `list_agents`
 
 Every `list_agents` row carries a `quota` block so the coordinator can weigh how much plan a worker has left before dispatching — and so a worker that has run dry does not silently turn into "the coordinator does it itself" on a budget you never meant to spend:
@@ -396,7 +410,7 @@ Where each number comes from:
 | DeepSeek Harness | `unknown` — balance lookup is not supported | DSH can use different providers and accounts; a DeepSeek key does not identify the active account |
 | Grok Build | `GET cli-chat-proxy.grok.com/v1/billing` — what `/usage` calls; **experimental** | Default first-party xAI OAuth scope in `~/.grok/auth.json` (or `GROK_AUTH_PATH`); `[quota] experimental = true` |
 | Claude Code | `GET api.anthropic.com/api/oauth/usage` — what `/usage` calls; **experimental** | `claude auth login` OAuth; `[quota] experimental = true` |
-| Antigravity, Cursor, OpenCode, Devin, others | — | always `unknown` with the reason in `detail` |
+| Antigravity, Cursor, OpenCode, Devin, ZCode, MiniMax Code, others | — | always `unknown` with the reason in `detail` |
 
 Custom API or OAuth endpoints are unsupported for quota lookup. Bridge checks each supported CLI's environment, selected provider/configuration and supported startup selectors before using either credentials or cached quota. Unreadable or unverified configuration returns `unknown`; ordinary HTTP(S)/ALL_PROXY transport proxies are supported. Kimi reads only the default `kimi-code.json` slot. Grok verifies the exact default OAuth scope, issuer, expiry and user ID, and sends the CLI's version and authentication headers. DSH balance remains unsupported.
 
@@ -464,7 +478,7 @@ The coordinator can pin a worker model and thinking intensity on `dispatch_task`
 dispatch_task(agent="antigravity", model="gemini-3.7-flash", effort="low", ...)
 ```
 
-`agy models` lists slugs such as `gemini-3.7-flash-low`. Either pass that full slug, or pass the family plus `effort=low|medium|high`. New agy sessions get `--new-project` and `--add-dir <cwd>` so work stays in the requested repo, not `~\.gemini\antigravity-cli\scratch`. Grok accepts a `grok models` slug plus `effort=off|low|medium|high|max` (`off` maps to Grok `none`, `max` to Grok `xhigh`). Grok `/new` still starts on the campaign default (currently grok-4.6 xhigh); Bridge calls `session/setModel` after the session exists. Accept Grok model selection from the finished task's `model` (Grok `turn_started.model_id`), not from the worker quoting `You are Grok 4.6`. Kimi accepts one of the slugs its own session advertises (`kimi-code/k3`, `kimi-code/k3-256k`, `kimi-code/kimi-for-coding`, ...) plus `effort=off|low|medium|high|max`. OpenCode accepts a `provider/model` slug the session advertises plus the same five effort tokens mapped onto that model's variants. DSH accepts `model="deepseek-official/deepseek-v4-flash"` and `effort=low|high|max`. Changing DSH model/effort on an existing session respawns the process. Claude Code accepts a slug the session advertises (`sonnet`, `opus`, `haiku`, or a full id) plus `effort=off|low|medium|high|max` mapped onto that model's levels (`off` → `default`, `max` → `xhigh` unless the session lists `max`). Codex CLI accepts a Codex slug plus `effort=off|low|medium|high|max` (`off` → `none`). Bridge runs `codex exec --json` with the prompt on stdin and `--approve-for-me` by default. Devin CLI accepts a model id the session advertises (`swe-1-7-medium`, `claude-opus-5-high`, …); the level is part of the id and `effort` is ignored with a warning.
+`agy models` lists slugs such as `gemini-3.7-flash-low`. Either pass that full slug, or pass the family plus `effort=low|medium|high`. New agy sessions reuse the existing Antigravity project whose folder is the cwd via `--project <id>` (creating one with `--new-project` only if none exists), plus `--add-dir <cwd>`, so work stays in the requested repo, not `~\.gemini\antigravity-cli\scratch`. Grok accepts a `grok models` slug plus `effort=off|low|medium|high|max` (`off` maps to Grok `none`, `max` to Grok `xhigh`). Grok `/new` still starts on the campaign default (currently grok-4.6 xhigh); Bridge calls `session/setModel` after the session exists. Accept Grok model selection from the finished task's `model` (Grok `turn_started.model_id`), not from the worker quoting `You are Grok 4.6`. Kimi accepts one of the slugs its own session advertises (`kimi-code/k3`, `kimi-code/k3-256k`, `kimi-code/kimi-for-coding`, ...) plus `effort=off|low|medium|high|max`. OpenCode accepts a `provider/model` slug the session advertises plus the same five effort tokens mapped onto that model's variants. DSH accepts `model="deepseek-official/deepseek-v4-flash"` and `effort=low|high|max`. Changing DSH model/effort on an existing session respawns the process. Claude Code accepts a slug the session advertises (`sonnet`, `opus`, `haiku`, or a full id) plus `effort=off|low|medium|high|max` mapped onto that model's levels (`off` → `default`, `max` → `xhigh` unless the session lists `max`). Codex CLI accepts a Codex slug plus `effort=off|low|medium|high|max` (`off` → `none`). Bridge runs `codex exec --json` with the prompt on stdin and `--approve-for-me` by default. Devin CLI accepts a model id the session advertises (`swe-1-7-medium`, `claude-opus-5-high`, …); the level is part of the id and `effort` is ignored with a warning.
 
 ## Worker: Kimi Code
 
@@ -495,7 +509,7 @@ opencode auth
 
 OpenCode has **no product login**. You connect providers by storing API keys (or that provider's own oauth) with `opencode auth`. Official routes are OpenCode Zen and OpenCode Go; anything else is just another connected provider. `list_agents` reports the CLI as available when `opencode` is on PATH — a missing provider key only shows up when a turn actually talks to the model.
 
-`dispatch_task.model` is a `provider/model` slug the live session advertises (`opencode/...`, `xai/...`, …). `effort` maps onto that model's variants (`default|low|medium|high` is common; Bridge `max` usually becomes `high`). An unknown slug fails the turn and lists the real options; a model with no variants, or an effort that will not map, comes back as a warning. The reported `model` / `effort` are the last values Bridge successfully set on the session after that mapping, not a live sampler dump. Switching model on a live session re-applies effort: OpenCode resets the variant to the new model's default. Bridge revives with `session/resume` rather than `session/load`. Permissions are ACP `requestPermission`; Bridge auto-picks `allow-always`.
+`dispatch_task.model` is a `provider/model` slug the live session advertises (`opencode/...`, `xai/...`, …). `effort` maps onto that model's variants (`default|low|medium|high` is common; Bridge `max` usually becomes `high`). An unknown slug fails the turn and lists the real options; a model with no variants, or an effort that will not map, comes back as a warning. The reported `model` / `effort` are the last values Bridge successfully set on the session after that mapping, not a live sampler dump. Switching model on a live session re-applies effort: OpenCode resets the variant to the new model's default. Bridge revives with `session/resume` rather than `session/load`. Permissions are ACP `requestPermission`; Bridge answers per `[agents.<name>] permission_policy` — `allow_once` (default), `allow_always`, or `deny`. Under `allow_once` a prompt that offers only allow-always is denied.
 
 If OpenCode's configured default model is disabled, the first prompt fails with `Model is disabled`. Pass a slug from `opencode models` for a provider that still has a working key.
 
@@ -503,7 +517,23 @@ If OpenCode's configured default model is disabled, the first prompt fails with 
 
 Bridge drives Desktop-bundled or PATH `codex` through `codex exec --json`. It does not open ChatGPT.exe. Discovery order: `CODEX_CLI_PATH` (env or `$CODEX_HOME/config.toml` / `~/.codex/config.toml`), then `%LOCALAPPDATA%\\OpenAI\\Codex\\bin\\<hash>\\codex.exe` (newest mtime among binaries that pass `exec --help` capability checks), then PATH `codex`.
 
-Login stays in `$CODEX_HOME` when set, otherwise `~/.codex`. `--ignore-user-config` skips Desktop `config.toml` (MCP / Computer Use), and Bridge adds `-c cli_auth_credentials_store="auto"` so ChatGPT login still resolves from keyring or `auth.json`. Project `.codex/config.toml`, `AGENTS.md`, and execpolicy rules can still apply. Bridge inherits `CODEX_HOME` so a custom home used by Desktop is visible to the worker.
+Login stays in `$CODEX_HOME` when set, otherwise `~/.codex`. `--ignore-user-config` skips Desktop `config.toml` (MCP / Computer Use), and Bridge adds `-c cli_auth_credentials_store="auto"` so ChatGPT login still resolves from keyring or `auth.json`. Project `.codex/config.toml` and project hooks/rules normally do not load, because Codex reads project trust from the user config this flag skips; `AGENTS.md` and rules under `$CODEX_HOME/rules` still apply. Bridge inherits `CODEX_HOME` so a custom home used by Desktop is visible to the worker.
+
+`[agents.codex] config_overrides` adds raw `codex exec -c <item>` pairs — for settings `--ignore-user-config` would skip, e.g. a custom model provider. The block below merges field-wise into the bundled codex entry, so only `config_overrides` is needed:
+
+```toml
+[agents.codex]
+config_overrides = [
+  'model_provider="my-gateway"',
+  'model_providers.my-gateway.name="My Gateway"',
+  'model_providers.my-gateway.base_url="https://example.com/v1"',
+  'model_providers.my-gateway.env_key="MY_GATEWAY_API_KEY"',
+]
+```
+
+Keep secrets out of overrides: a key can only be referenced via `env_key` (command-line arguments are visible in the process list). Since Codex clears the MCP child environment, a variable named by `env_key` must also be listed in the host's `env_vars` / `[env.inherit]` like any other worker credential. Task-level `model`/`effort` are appended after overrides, so they keep priority.
+
+When the overrides select a custom provider, `list_agents` shows it as the worker's `route` (provider name and base URL, credentials removed). Any `config_overrides` also makes the Codex quota read `unknown`: Bridge does not guess which account arbitrary overrides select.
 
 Default approval is `--approve-for-me` (auto review + workspace-write). `--yolo` is only used when `[agents.codex] session_meta = { yolo = true }`. Prompt is UTF-8 stdin (`-`), never an argv string.
 
@@ -531,7 +561,7 @@ $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1"
 
 If `OPENROUTER_API_KEY` is set and `ANTHROPIC_AUTH_TOKEN` is not, Bridge copies it and defaults the base URL to OpenRouter **only when** `ANTHROPIC_API_KEY` is also unset. A machine that uses OpenRouter for OpenCode and a direct Anthropic key for Claude keeps the Anthropic key. Set `ANTHROPIC_BASE_URL` yourself if you want that Anthropic key treated as a gateway conflict (Bridge then blanks it once a token and base URL are both present).
 
-`dispatch_task.model` is a slug the live session advertises (`sonnet`, `opus`, `haiku`, or a full id). `effort` maps onto that model's levels (`default|low|medium|high|xhigh` is common; Bridge `off` → `default`, `max` → `xhigh` unless the session lists `max`). An unknown slug fails the turn and lists the real options; a model with no effort option, or an effort that will not map, comes back as a warning. The reported `model` / `effort` are the last values Bridge successfully set after that mapping. Switching model on a live session re-applies effort. Bridge forces `bypassPermissions` after `session/new` (a fresh session starts in manual `default` mode); if that mode is not advertised — for example when the process is root — ACP `requestPermission` still auto-picks `allow-always`. Revive uses `session/resume`: `session/load` replays the whole history.
+`dispatch_task.model` is a slug the live session advertises (`sonnet`, `opus`, `haiku`, or a full id). `effort` maps onto that model's levels (`default|low|medium|high|xhigh` is common; Bridge `off` → `default`, `max` → `xhigh` unless the session lists `max`). An unknown slug fails the turn and lists the real options; a model with no effort option, or an effort that will not map, comes back as a warning. The reported `model` / `effort` are the last values Bridge successfully set after that mapping. Switching model on a live session re-applies effort. Bridge forces `bypassPermissions` after `session/new` (a fresh session starts in manual `default` mode); if that mode is not advertised — for example when the process is root — ACP `requestPermission` is still answered per `[agents.<name>] permission_policy` (`allow_once` default; a prompt offering only allow-always is denied). Revive uses `session/resume`: `session/load` replays the whole history.
 
 ## Worker: Devin CLI
 
@@ -545,6 +575,31 @@ devin auth login
 Auth is `devin auth login` on disk or `WINDSURF_API_KEY`. `list_agents` runs `devin auth status` and reports its first line as `auth=`. Bridge drops `ACP_BACKEND` from the worker environment: Devin Desktop stamps that variable on every child process, and with it set the CLI trusts only credentials the ACP host passes in and refuses `session/new` — so a Devin Desktop coordinator can still dispatch to a `devin` worker.
 
 `dispatch_task.model` is a model id the live session advertises (`devin models list`): the level is part of the id (`swe-1-7`, `swe-1-7-medium`, `claude-opus-5-high`), so there is no `effort` option — a Bridge `effort` is ignored with a warning. An unknown id fails the turn and lists the real options. Bridge forces `bypass` after `session/new` (a fresh session starts in `accept-edits`; `DEVIN_PERMISSION_MODE` is parsed but not applied to ACP sessions). Revive uses `session/load` — Devin has no `session/resume` — and Devin ignores `noReplay`, so the persisted history is replayed as `session/update` notifications before `load` answers. Bridge resets its turn state before prompting, so `get_result` and `files_changed` for the new turn are clean, but the transcript will show the replayed history again after a revive; that is a side effect, not the way to fetch history. Mode and model survive the reload. A long session may take longer than the 60 s handshake timeout to replay; if that bites, lower `idle_unload_sec` for devin or open a new session.
+
+## Worker: ZCode
+
+Product `zcode` is not an ACP server. Bridge drives `zcode-acp-server` from npm package `zcode-acp-server` (the `zcode-acp server` subcommand is the fallback; bare `zcode-acp` is a terminal UI). The adapter launches `zcode app-server` itself. Install the adapter, install ZCode, and sign in once in the ZCode app:
+
+```powershell
+npm install -g zcode-acp-server
+```
+
+Login lives in `~/.zcode/v2` (`config.json` / `credentials.json`), or in `ZCODE_HOME`. If the ZCode CLI is not on `PATH`, set `ZCODE_BIN` to the bundled `zcode` or `zcode.cjs`. `list_agents` reports that login state in `auth=` and does not hide the worker when the login is missing.
+
+`dispatch_task.model` is an advertised `provider\model` value, or a bare model id such as `GLM-5.3` when only one option has that id. A slash form `provider/model` is accepted too. An unknown or ambiguous id fails the turn and lists the real options. `effort` maps onto that model's thought levels (`low|high|max` is common; Bridge `off` → `low`, `medium` → `high` unless the session lists a closer value). A model with no thought option, or an effort that will not map, comes back as a warning. the finished task's `model` is the slug that matched; `observed_effort` is the thought level Bridge set. Switching model on a live session re-applies effort. Bridge forces mode `yolo` after `session/new` (the adapter default is already `yolo` unless `ZCODE_ACP_MODE` or the saved session mode says otherwise). Revive uses `session/resume`: `session/load` replays the whole history.
+
+## Worker: MiniMax Code
+
+`mcode acp` is MiniMax Code's own ACP server (npm `@minimax-ai/code`). Install it and log in once:
+
+```powershell
+npm install -g @minimax-ai/code
+mcode login
+```
+
+Auth is `mcode login` under `~/.minimax` (`auth/<build>/<region>/auth.json`), or `MINIMAX_DATA_DIR` / `MAVIS_DATA_DIR`. `list_agents` reports `auth=` and still lists the worker when the login is missing — the probe only checks that `mcode` is on `PATH`.
+
+`dispatch_task.model` is `provider/model` or `provider/model#variant`, the same shape as `mcode exec --model`. Bridge encodes that into the ACP value the session actually advertises. An unknown slug fails the turn and lists the real `provider/model` options. `effort` maps onto that model's `thinkingEffort` (`default|low|medium|high|xhigh|max` is common; Bridge `off` → `default`). A model with no effort option, or an effort that will not map, comes back as a warning. the finished task's `model` / `effort` are the last values Bridge successfully set after that mapping. Switching model on a live session re-applies effort. Bridge forces `permissionMode=bypassPermissions` after `session/new` (a fresh process starts in `default`, which asks). That option is not the session mode — `session/set_mode` is only `default` / `plan`, and Bridge leaves it on `default`. Revive uses `session/resume`: `session/load` replays the whole history.
 
 ## Permissions
 

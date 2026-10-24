@@ -57,6 +57,18 @@ def test_loads_bundled_agents():
     # wholesale, so Kimi's keys have to be listed there too.
     assert "KIMI_CODE_HOME" in cfg.env.inherit
     assert "KIMI_SHELL_PATH" in cfg.env.inherit
+    assert cfg.agents["zcode"].protocol == "acp"
+    assert cfg.agents["zcode"].command == ["zcode-acp-server"]
+    assert cfg.agents["zcode"].fallback_commands == [["zcode-acp", "server"]]
+    assert cfg.agents["zcode"].revivable is True
+    assert cfg.agents["minimax"].protocol == "acp"
+    assert cfg.agents["minimax"].command == ["mcode", "acp"]
+    assert cfg.agents["minimax"].revivable is True
+    assert "ZCODE_HOME" in cfg.env.inherit
+    assert "ZCODE_BIN" in cfg.env.inherit
+    assert "MINIMAX_DATA_DIR" in cfg.env.inherit
+    assert "MAVIS_DATA_DIR" in cfg.env.inherit
+    assert "MCODE_CONFIG_DIR" in cfg.env.inherit
     assert cfg.agents["dsh"].command[0] == "dsh-acp-demo"
     assert cfg.agents["dsh"].fallback_commands == []
     assert cfg.agents["dsh"].cwd is None
@@ -137,6 +149,7 @@ def test_server_idle_exit_defaults(tmp_path):
     assert AppConfig().server.idle_exit_sec == 7200
     cfg = load_config(tmp_path)
     assert cfg.server.idle_exit_sec == 7200
+    assert load_config(Path(__file__).resolve().parents[1]).server.idle_exit_sec == 7200
 
 
 def test_server_idle_exit_overlay(tmp_path):
@@ -433,21 +446,34 @@ def test_load_config_reports_overlay_path_on_bad_toml(tmp_path):
     assert "Fix or delete the file" in str(exc_info.value)
 
 
-def test_user_overlay_sets_a_codex_model_provider(tmp_path):
+def test_env_deny_overlay(tmp_path):
     (tmp_path / "agents.toml").write_text(
         """
-[agents.codex.model_provider]
-id = "magpie"
-base_url = "http://127.0.0.1:3425/v1"
-http_headers = { x-openai-actor-authorization = "magpie" }
+[env]
+deny = ["APP_*"]
 """,
         encoding="utf-8",
     )
     cfg = load_config(tmp_path)
-    assert cfg.agents["codex"].model_provider == {
-        "id": "magpie",
-        "base_url": "http://127.0.0.1:3425/v1",
-        "http_headers": {"x-openai-actor-authorization": "magpie"},
-    }
-    assert cfg.agents["codex"].protocol == "codex"
-    assert load_config(tmp_path / "nope").agents["codex"].model_provider == {}
+    assert "APP_*" in cfg.env.deny
+
+
+def test_merge_env_unions_deny_lists():
+    from agent_bridge.config import _merge_env
+
+    merged = _merge_env({"deny": ["A_*"]}, {"deny": ["B_*"]})
+    assert merged["deny"] == ["A_*", "B_*"]
+
+
+def test_permission_policy_default_and_overlay(tmp_path):
+    cfg = load_config(tmp_path)
+    assert cfg.agents["claude"].permission_policy == "allow_once"
+    (tmp_path / "agents.toml").write_text(
+        """
+[agents.claude]
+permission_policy = "deny"
+""",
+        encoding="utf-8",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.agents["claude"].permission_policy == "deny"

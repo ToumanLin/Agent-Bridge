@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -18,14 +19,31 @@ from agent_bridge.dsh_home import (
     resolve_dsh_command,
 )
 from agent_bridge.kimi_observe import kimi_home
+from agent_bridge.minimax_meta import describe_minimax_auth, minimax_data_dir
 from agent_bridge.processes import reap_subprocess, resolve_command
-from agent_bridge.worker_env import build_worker_env
+from agent_bridge.worker_env import build_worker_env, enforce_env_deny
+from agent_bridge.zcode_meta import describe_zcode_auth, zcode_home
 
 log = logging.getLogger(__name__)
 
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+VERSION_RE = re.compile(
+    r"(?<![A-Za-z0-9])v?\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?",
+    re.IGNORECASE,
+)
+
+
+def _recognized_version(output: bytes) -> str:
+    text = output.decode("utf-8", errors="replace")
+    for raw in text.splitlines():
+        line = ANSI_ESCAPE_RE.sub("", raw).strip()
+        if line and VERSION_RE.search(line):
+            return line[:200]
+    return ""
+
 
 async def _version_string(executable: str) -> str:
-    for args in ([executable, "--version"], [executable, "-V"], [executable, "version"]):
+    for args in ([executable, "--version"], [executable, "-V"]):
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -39,11 +57,11 @@ async def _version_string(executable: str) -> str:
         except TimeoutError:
             await reap_subprocess(proc)
             continue
-        text = (out or b"").decode("utf-8", errors="replace").strip() or (
-            err or b""
-        ).decode("utf-8", errors="replace").strip()
-        if text:
-            return text.splitlines()[0][:200]
+        if proc.returncode != 0:
+            continue
+        version = _recognized_version(b"\n".join((out or b"", err or b"")))
+        if version:
+            return version
     return ""
 
 
@@ -207,13 +225,39 @@ async def probe_agent(cfg: AgentConfig, env_config: EnvConfig | None = None) -> 
 
     if cfg.name == "devin":
         resolved = apply_devin_env(resolved)
+        # The rewritten env is handed to a spawned CLI; re-apply env.deny so
+        # apply_devin_env cannot reintroduce a denied key.
+        env_cfg = env_config or EnvConfig()
+        spawn_env = enforce_env_deny(resolved, env_cfg, set(env_cfg.set) | set(cfg.env))
         details.append(
             "model=ids the session advertises (`devin models list`), level is part of the id "
             "e.g. swe-1-7-medium, claude-opus-5-high; no effort option; mode forced to bypass"
         )
-        details.append(f"auth={await _devin_auth(command[0], resolved)}")
+        details.append(f"auth={await _devin_auth(command[0], spawn_env)}")
+        resolved = spawn_env
         if resolved.get("WINDSURF_API_KEY"):
             details.append("WINDSURF_API_KEY=set")
+
+    if cfg.name == "zcode":
+        details.append(
+            "model=provider\\model or a unique bare id the session advertises; "
+            "effort mapped onto that model's thought levels; mode forced to yolo"
+        )
+        details.append(f"zcode-home={zcode_home(resolved)}")
+        details.append(f"auth={describe_zcode_auth(resolved)}")
+        details.append(
+            "product `zcode` is not ACP; worker is zcode-acp-server "
+            "(npm zcode-acp-server; fallback `zcode-acp server`)"
+        )
+
+    if cfg.name == "minimax":
+        details.append(
+            "model=provider/model or provider/model#variant "
+            "(mcode exec --model); effort mapped onto thinkingEffort; "
+            "permissionMode forced to bypassPermissions"
+        )
+        details.append(f"minimax-home={minimax_data_dir(resolved)}")
+        details.append(f"auth={describe_minimax_auth(resolved)}")
 
     if cfg.protocol == "codex":
         details.append(

@@ -72,6 +72,31 @@ def test_stop_reason_kept_when_it_says_more_than_status():
     assert view["stop_reason"] == "stalled"
 
 
+def test_failed_task_carries_compact_acp_failure():
+    failure = {
+        "operation": "session/prompt",
+        "kind": "worker_exit",
+        "exit_code": 7,
+        "prompt_may_have_been_sent": True,
+        "stderr_summary": None,
+    }
+    view = task_view({"task_id": "t1", "session_id": "s1", "status": "failed", "error": "boom", "failure": failure})
+    assert view["failure"] == {
+        "operation": "session/prompt",
+        "kind": "worker_exit",
+        "exit_code": 7,
+        "prompt_may_have_been_sent": True,
+    }
+    # false is an answer here, not noise
+    safe = task_view(
+        {"task_id": "t1", "session_id": "s1", "status": "failed", "failure": {**failure, "prompt_may_have_been_sent": False}}
+    )
+    assert safe["failure"]["prompt_may_have_been_sent"] is False
+    # no failure evidence, or a task that did not fail: the key is absent
+    assert "failure" not in task_view({"task_id": "t1", "session_id": "s1", "status": "failed", "failure": None})
+    assert "failure" not in task_view({"task_id": "t1", "session_id": "s1", "status": "completed", "failure": failure})
+
+
 def test_running_task_carries_progress_not_usage():
     view = task_view(
         {

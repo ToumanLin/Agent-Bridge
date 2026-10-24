@@ -13,7 +13,7 @@
 
 ## English
 
-Agent Bridge is a connector for local coding agents. A coordinator — Codex, Cursor, Kimi Code, ZCode, Grok Build, Claude Code, or Devin — directs Antigravity CLI, Grok Build, Kimi Code, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, and Devin CLI. The same product can be a coordinator and a worker; those are different processes. More agents will follow.
+Agent Bridge is a connector for local coding agents. A coordinator — Codex, Cursor, Kimi Code, ZCode, Grok Build, Claude Code, or Devin — directs Antigravity CLI, Grok Build, Kimi Code, DeepSeek Harness, OpenCode, Claude Code, Codex CLI, Devin CLI, ZCode, and MiniMax Code. The same product can be a coordinator and a worker; those are different processes. More agents will follow.
 
 ```text
 User → Coordinator (Codex / Cursor / Kimi Code / ZCode / Grok Build / Claude Code / Devin)
@@ -25,6 +25,8 @@ User → Coordinator (Codex / Cursor / Kimi Code / ZCode / Grok Build / Claude C
                           → Claude Code
                           → Codex CLI
                           → Devin CLI
+                          → ZCode
+                          → MiniMax Code
 ```
 
 It does not drive GUIs. The user talks only to the coordinator.
@@ -147,6 +149,8 @@ in-flight turns finish first, bounded by `linger_max_sec` (default 86400 s);
 linger cannot defeat a host force-kill of the Bridge process tree — cancel the
 turn first, then continue it after the restart.
 
+ACP failures retain the string `error` and add optional `failure` diagnostics: the operation, category, observed exit code, prompt delivery uncertainty and a safe stderr summary. Missing diagnostics do not imply a safe retry; Bridge never automatically replays failed prompts. See [failure diagnostics](SETUP.md#acp-failure-diagnostics).
+
 ### Remaining quota
 
 Each `list_agents` row carries `quota`: `status` ok / exhausted / unknown, the
@@ -188,7 +192,7 @@ uv run pytest
 
 ## 中文
 
-Agent Bridge 是一个联通各个本地 Agent 的连接器。由协调者——Codex、Cursor、Kimi Code、ZCode、Grok Build、Claude Code 或 Devin——指挥 Antigravity CLI、Grok Build、Kimi Code、DeepSeek Harness、OpenCode、Claude Code、Codex CLI、Devin CLI 进行工作。同一个产品可以同时是协调者和 Worker，但那是不同进程。后续将推出更多 Agent 支持。
+Agent Bridge 是一个联通各个本地 Agent 的连接器。由协调者——Codex、Cursor、Kimi Code、ZCode、Grok Build、Claude Code 或 Devin——指挥 Antigravity CLI、Grok Build、Kimi Code、DeepSeek Harness、OpenCode、Claude Code、Codex CLI、Devin CLI、ZCode、MiniMax Code 进行工作。同一个产品可以同时是协调者和 Worker，但那是不同进程。后续将推出更多 Agent 支持。
 
 ```text
 用户 → 协调者（Codex / Cursor / Kimi Code / ZCode / Grok Build / Claude Code / Devin）
@@ -200,6 +204,8 @@ Agent Bridge 是一个联通各个本地 Agent 的连接器。由协调者——
                           → Claude Code
                           → Codex CLI
                           → Devin CLI
+                          → ZCode
+                          → MiniMax Code
 ```
 
 它不操作图形界面。用户只和协调者对话。
@@ -311,6 +317,8 @@ Worker 静默超过 `stall_timeout_sec`（默认 1800 秒，可按 Worker 设置
 shutdown_policy = "linger"` 后，正常关闭宿主（stdin EOF）会先等在途回合跑完，
 上限为 `linger_max_sec`（默认 86400 秒）；linger 无法对抗宿主强杀整个 Bridge
 进程树——要跨重启保活，先取消该回合，重启后再续。
+
+ACP 失败保留字符串 `error`，新增可选 `failure` 诊断：失败操作、类别、已观察到的退出码、prompt 是否可能已发送以及安全的 stderr 摘要。没有诊断不等于可以安全重试；Bridge 不自动重发失败的 prompt。详见[失败诊断](SETUP.md#acp-failure-diagnostics)。
 
 ### 剩余额度
 

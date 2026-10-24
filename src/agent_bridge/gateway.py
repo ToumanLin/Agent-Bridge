@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+import tomllib
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -54,12 +55,35 @@ def _opencode_route(config_path: str) -> dict[str, Any]:
     }
 
 
+def _codex_provider(overrides: Sequence[str]) -> Mapping[str, Any] | None:
+    """The custom model provider a codex ``-c`` override list selects, if any.
+
+    Each item is one ``key=value`` TOML line, so dotted keys such as
+    ``model_providers.magpie.base_url`` parse into nested tables; items that are
+    not valid TOML are ignored (codex rejects them at launch, not here).
+    """
+    provider_id: Any = None
+    tables: dict[str, dict[str, Any]] = {}
+    for item in overrides:
+        try:
+            parsed = tomllib.loads(str(item))
+        except tomllib.TOMLDecodeError:
+            continue
+        provider_id = parsed.get("model_provider", provider_id)
+        for name, table in (parsed.get("model_providers") or {}).items():
+            if isinstance(table, dict):
+                tables.setdefault(name, {}).update(table)
+    if not isinstance(provider_id, str) or provider_id not in tables:
+        return None
+    return {"id": provider_id, **tables[provider_id]}
+
+
 def describe_route(cfg: AgentConfig) -> dict[str, Any] | None:
     """The gateway ``cfg`` pins for a worker, or None when it talks to its vendor."""
-    if cfg.protocol == "codex" and cfg.model_provider:
-        provider = cfg.model_provider
+    provider = _codex_provider(cfg.config_overrides) if cfg.protocol == "codex" else None
+    if provider:
         route: dict[str, Any] | None = {
-            "via": re.sub(r"\s+", " ", str(provider.get("name") or provider.get("id") or "")).strip(),
+            "via": re.sub(r"\s+", " ", str(provider.get("name") or provider["id"])).strip(),
             "base_url": _url(provider.get("base_url")),
         }
     elif cfg.name == "opencode" and cfg.env.get("OPENCODE_CONFIG"):

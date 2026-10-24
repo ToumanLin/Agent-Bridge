@@ -29,9 +29,20 @@ def test_codex_route_names_the_provider_and_drops_credentials_from_the_url():
     cfg = _agent(
         "codex",
         "codex",
-        model_provider={"id": "magpie", "name": "magpie", "base_url": "http://user:pw@127.0.0.1:3425/v1"},
+        config_overrides=[
+            'model_provider="magpie"',
+            'model_providers.magpie.name="magpie"',
+            'model_providers.magpie.base_url="http://user:pw@127.0.0.1:3425/v1"',
+        ],
     )
     assert describe_route(cfg) == {"via": "magpie", "base_url": "http://***@127.0.0.1:3425"}
+
+
+def test_codex_overrides_without_a_custom_provider_have_no_route():
+    cfg = _agent("codex", "codex", config_overrides=['model_reasoning_effort="high"', "not toml"])
+    assert describe_route(cfg) is None
+    cfg = _agent("codex", "codex", config_overrides=['model_provider="missing"'])
+    assert describe_route(cfg) is None
 
 
 def test_claude_route_is_its_base_url():

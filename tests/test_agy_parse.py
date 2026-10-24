@@ -2,6 +2,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -14,6 +15,7 @@ from agent_bridge.adapters.antigravity import (
     classify_event,
     collect_tool_paths,
     conversation_id_of,
+    find_agy_project,
     is_agy_tool_schema_error,
     is_result_event,
     recovered_agy_tool_error,
@@ -146,6 +148,9 @@ def test_agy_model_and_effort_precede_print(tmp_path, monkeypatch):
         "agent_bridge.adapters.antigravity.resolve_command",
         lambda command, fallbacks=None: ["agy"],
     )
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    monkeypatch.setattr("agent_bridge.adapters.antigravity.agy_projects_dir", lambda: projects)
     adapter = AgyAdapter(
         AgentConfig(name="antigravity", protocol="agy", command=["agy"]),
         tmp_path,
@@ -185,6 +190,10 @@ def test_agy_follow_up_uses_conversation_not_new_project(tmp_path, monkeypatch):
         "agent_bridge.adapters.antigravity.resolve_command",
         lambda command, fallbacks=None: ["agy"],
     )
+    monkeypatch.setattr(
+        "agent_bridge.adapters.antigravity.agy_projects_dir",
+        lambda: tmp_path / "projects",
+    )
     adapter = AgyAdapter(
         AgentConfig(name="antigravity", protocol="agy", command=["agy"]),
         tmp_path,
@@ -206,15 +215,137 @@ def test_agy_follow_up_uses_conversation_not_new_project(tmp_path, monkeypatch):
     assert cmd.index("--conversation") < cmd.index("-p")
     assert cmd[cmd.index("--conversation") + 1] == "conv-1"
     assert "--new-project" not in cmd
+    assert "--project" not in cmd
     assert "--input-format" in cmd
     assert cmd[cmd.index("-p") + 1] == ""
     assert task.message not in cmd
+
+
+def test_find_agy_project_matches_cwd_folder_uri(tmp_path):
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    (projects / "z-nonmatch.json").write_text(
+        json.dumps(
+            {
+                "id": "other-id",
+                "projectResources": {"resources": [{"folderUri": "file:///somewhere/else"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (projects / "corrupt.json").write_text("{not json", encoding="utf-8")
+    (projects / "m-b.json").write_text(
+        json.dumps(
+            {
+                "id": "b-id",
+                "projectResources": {"resources": [{"folderUri": "file://" + cwd.as_posix()}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (projects / "a-a.json").write_text(
+        json.dumps(
+            {
+                "id": "a-id",
+                "projectResources": {
+                    "resources": [
+                        {"gitFolder": {"folderUri": "file:///" + quote(str(cwd), safe=""), "defaultBranch": "main"}}
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert find_agy_project(str(cwd), projects) == "a-id"
+    assert find_agy_project(str(tmp_path / "elsewhere"), projects) is None
+    assert find_agy_project(str(cwd), tmp_path / "missing") is None
+
+
+def test_agy_new_session_reuses_existing_project(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "agent_bridge.adapters.antigravity.resolve_command",
+        lambda command, fallbacks=None: ["agy"],
+    )
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    (projects / "p.json").write_text(
+        json.dumps(
+            {
+                "id": "proj-1",
+                "projectResources": {"resources": [{"folderUri": "file://" + cwd.as_posix()}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("agent_bridge.adapters.antigravity.agy_projects_dir", lambda: projects)
+    adapter = AgyAdapter(
+        AgentConfig(name="antigravity", protocol="agy", command=["agy"]),
+        tmp_path,
+    )
+    session = Session(session_id="sess_p", agent="antigravity", cwd=str(cwd))
+    task = Task(
+        task_id="task_p",
+        session_id=session.session_id,
+        agent="antigravity",
+        message="do it",
+        cwd=str(cwd),
+    )
+    cmd = adapter._build_cmd(session, task)
+    assert cmd.index("--project") < cmd.index("-p")
+    assert cmd[cmd.index("--project") + 1] == "proj-1"
+    assert "--new-project" not in cmd
+    assert "--conversation" not in cmd
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="drive-letter URI normalization is Windows-specific")
+def test_find_agy_project_windows_drive_uris(tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "p.json").write_text(
+        json.dumps(
+            {
+                "id": "plain-id",
+                "projectResources": {"resources": [{"folderUri": "file://E:/inkcraft-next"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    encoded = tmp_path / "encoded"
+    encoded.mkdir()
+    (encoded / "p.json").write_text(
+        json.dumps(
+            {
+                "id": "encoded-id",
+                "projectResources": {
+                    "resources": [
+                        {
+                            "gitFolder": {
+                                "folderUri": "file:///e%3A%5Cinkcraft-next",
+                                "defaultBranch": "main",
+                            }
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert find_agy_project("E:\\inkcraft-next", plain) == "plain-id"
+    assert find_agy_project("E:\\inkcraft-next", encoded) == "encoded-id"
 
 
 def _agy_cmd(tmp_path, monkeypatch, model, effort):
     monkeypatch.setattr(
         "agent_bridge.adapters.antigravity.resolve_command",
         lambda command, fallbacks=None: ["agy"],
+    )
+    monkeypatch.setattr(
+        "agent_bridge.adapters.antigravity.agy_projects_dir",
+        lambda: tmp_path / "projects",
     )
     adapter = AgyAdapter(
         AgentConfig(name="antigravity", protocol="agy", command=["agy"]),
@@ -281,6 +412,10 @@ def _agy_adapter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AgyAdapter:
     monkeypatch.setattr(
         "agent_bridge.adapters.antigravity.resolve_command",
         lambda command, fallbacks=None: [sys.executable, str(FAKE_AGY)],
+    )
+    monkeypatch.setattr(
+        "agent_bridge.adapters.antigravity.agy_projects_dir",
+        lambda: tmp_path / "projects",
     )
     return AgyAdapter(
         AgentConfig(name="antigravity", protocol="agy", command=["agy"]),

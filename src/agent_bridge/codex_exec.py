@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
-import re
 import subprocess
 import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from agent_bridge.diagnostics import redact_diagnostic
 from agent_bridge.processes import resolve_command
 
 log = logging.getLogger(__name__)
@@ -214,50 +213,6 @@ def yolo_requested(session_meta: Mapping[str, Any] | None) -> bool:
     return value is True or value == "true" or value == 1
 
 
-_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
-
-
-def _toml_key(key: str) -> str:
-    return key if _BARE_KEY.fullmatch(key) else json.dumps(key)
-
-
-def _toml_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False)
-    if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
-    if isinstance(value, Mapping):
-        body = ", ".join(f"{_toml_key(str(k))} = {_toml_value(v)}" for k, v in value.items())
-        return "{ " + body + " }" if body else "{}"
-    raise ValueError(f"cannot write {type(value).__name__} as a Codex -c value")
-
-
-def model_provider_overrides(provider: Mapping[str, Any] | None) -> list[str]:
-    """``-c`` arguments that select a custom Codex model provider.
-
-    ``--ignore-user-config`` hides the provider tables in ``config.toml``, so a
-    gateway has to arrive as ``-c`` overrides. ``id`` names the provider; every
-    other key becomes ``model_providers.<id>.<key>``. Put the credential in the
-    worker env and name it with ``env_key``: argv is visible to other processes.
-    """
-    if not provider:
-        return []
-    raw_id = provider.get("id")
-    provider_id = raw_id if isinstance(raw_id, str) else ""
-    if not _BARE_KEY.fullmatch(provider_id):
-        raise ValueError("[agents.codex] model_provider needs an id of letters, digits, '_' or '-'")
-    args = ["-c", f"model_provider={_toml_value(provider_id)}"]
-    for key, value in provider.items():
-        if key == "id":
-            continue
-        args += ["-c", f"model_providers.{provider_id}.{_toml_key(str(key))}={_toml_value(value)}"]
-    return args
-
-
 def build_codex_exec_argv(
     command: list[str],
     *,
@@ -266,7 +221,7 @@ def build_codex_exec_argv(
     effort: str | None = None,
     resume_id: str | None = None,
     yolo: bool = False,
-    model_provider: Mapping[str, Any] | None = None,
+    config_overrides: Sequence[str] = (),
 ) -> list[str]:
     cmd = [
         *command,
@@ -275,7 +230,6 @@ def build_codex_exec_argv(
         "--ignore-user-config",
         "-c",
         AUTH_STORE_OVERRIDE,
-        *model_provider_overrides(model_provider),
     ]
     if yolo:
         cmd.append("--yolo")
@@ -288,6 +242,9 @@ def build_codex_exec_argv(
         "-C",
         cwd,
     ]
+    for item in config_overrides:
+        # Earlier than the task's -m / effort -c so per-dispatch values win.
+        cmd += ["-c", item]
     if model:
         cmd += ["-m", model]
     mapped = codex_effort(effort)
@@ -337,13 +294,15 @@ def finalize_codex_turn(
     if returncode not in (0, None):
         warnings.append(f"codex exited with code {returncode}")
     if state.turn_failed:
-        return "error", state.error or "codex turn failed", warnings
+        return "error", redact_diagnostic(state.error or "codex turn failed"), warnings
     if state.turn_completed:
-        warnings.extend(state.errors)
+        warnings.extend(redact_diagnostic(err) for err in state.errors)
         return "end_turn", None, warnings
     if state.errors:
-        return "error", state.error or "codex turn failed", warnings
-    stderr_error = (stderr or "").strip()
+        return "error", redact_diagnostic(state.error or "codex turn failed"), warnings
+    # Codex stderr is raw worker output (may echo env secrets it read);
+    # sanitize before it becomes the task's error text.
+    stderr_error = redact_diagnostic((stderr or "").strip())
     if stderr_error:
         return "error", stderr_error, warnings
     error = (

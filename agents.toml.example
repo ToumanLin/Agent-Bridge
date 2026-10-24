@@ -30,8 +30,17 @@
 # This is the worker-silence limit — separate from wait_task's timeout_sec
 # (per call) and the host MCP tool timeout. A task keeps running whether or
 # not anyone is waiting; see "Waiting and timeouts" in SETUP.md.
+# turn_timeout_sec instead caps a turn's wall-clock regardless of output
+# (default 0 = off; timeout ends failed / "timed_out").
 # [agents.grok]
 # stall_timeout_sec = 3600
+# turn_timeout_sec = 7200
+
+# How Bridge answers ACP permission prompts: allow_once (default, least
+# privilege), allow_always, or deny. Under allow_once a prompt that offers
+# only allow-always is denied.
+# [agents.grok]
+# permission_policy = "allow_always"
 
 # Dispatch policy: mode = manual | auto | eager (default auto).
 # instructions is free text the coordinator reads via list_agents; it
@@ -59,6 +68,11 @@
 # [env.set]
 # DEEPSEEK_API_KEY = "do-not-commit"
 
+# Remove worker env keys matching these globs. Keys set via [env.set] or
+# the agent's own env always survive; there is no built-in denylist.
+# [env]
+# deny = ["AWS_*", "DATABASE_URL"]
+
 # [agents.grok.env]
 # HTTPS_PROXY = "http://127.0.0.1:7897"
 
@@ -83,6 +97,18 @@
 # CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1"
 # OPENROUTER_API_KEY is also inherited; if ANTHROPIC_AUTH_TOKEN is unset,
 # Bridge copies it and defaults the base URL to OpenRouter.
+
+# ZCode: product `zcode` is not ACP. Install the adapter and sign in via the app:
+#   npm install -g zcode-acp-server
+# Optional when the CLI is not on PATH:
+# [env.set]
+# ZCODE_BIN = "C:/Program Files/ZCode/resources/glm/zcode.cjs"
+# ZCODE_HOME = "D:/zcode-home"
+
+# MiniMax Code: `mcode acp`. Auth is `mcode login` under ~/.minimax.
+#   npm install -g @minimax-ai/code
+# [env.set]
+# MINIMAX_DATA_DIR = "D:/minimax"
 
 # DSH: do not put a personal checkout path in the repo agents.toml.
 # Optional overrides live here or in the process environment:

@@ -147,6 +147,14 @@ def usage_view(usage: Any) -> dict[str, Any] | None:
     return view
 
 
+def failure_view(failure: Any) -> dict[str, Any] | None:
+    """ACP failure diagnostics. prompt_may_have_been_sent stays even when false:
+    it tells the coordinator whether the prompt could already have run."""
+    if not isinstance(failure, Mapping):
+        return None
+    return compact(failure, keep=("prompt_may_have_been_sent",)) or None
+
+
 def _resumable(row: Mapping[str, Any]) -> bool:
     """A row already continued by another task is not offered for resuming again."""
     return bool(row.get("resumable")) and not row.get("resumed_by")
@@ -188,6 +196,7 @@ def task_view(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             "owner": owner,
             "error": snapshot.get("error") if failed else None,
             "error_kind": snapshot.get("error_kind") if failed else None,
+            "failure": failure_view(snapshot.get("failure")) if failed else None,
             "resumable": _resumable(snapshot),
             "model": snapshot.get("observed_model") or snapshot.get("model"),
             "effort": snapshot.get("observed_effort") or snapshot.get("effort"),

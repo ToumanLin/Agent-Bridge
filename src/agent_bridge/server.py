@@ -44,13 +44,13 @@ async def lifespan(_server: MCPServer[Registry]) -> AsyncIterator[Registry]:
 # the tool descriptions it is the whole contract: no skill file is installed.
 INSTRUCTIONS = (
     "Agent Bridge runs local worker CLIs (Grok, Kimi Code, Antigravity, OpenCode, "
-    "Claude Code, Codex CLI, Devin CLI, DeepSeek Harness) as your subagents. "
+    "Claude Code, Codex CLI, Devin CLI, DeepSeek Harness, ZCode, MiniMax Code) for you. "
     "Reach workers only through these tools, never by running their CLIs. "
     "Call list_agents first; if dispatch_enabled is false you are inside a "
     "worker: do not dispatch, cancel, or set preferences. dispatch_task.cwd is "
     "this project's absolute path. Never loop on wait_task: after dispatching, "
-    "end your turn (start background_wait first when given). Verify workers' "
-    "work with your own git diff and tests. Tasks owned by a sibling Bridge "
+    "end your turn (start background_wait first when given). Verify results "
+    "with your own git diff and tests. Tasks owned by a sibling Bridge "
     "are read-only."
 )
 
@@ -107,10 +107,10 @@ def _failure(exc: Exception) -> RuntimeError:
     return RuntimeError(str(text) or type(exc).__name__)
 
 
-def _with_first_page(registry: Registry, view: dict[str, Any]) -> dict[str, Any]:
+async def _with_first_page(registry: Registry, view: dict[str, Any]) -> dict[str, Any]:
     if view.get("status") in public.RUNNING:
         return view
-    page = registry.get_result(view["task_id"], cursor=0, max_chars=FIRST_PAGE_CHARS)
+    page = await registry.get_result(view["task_id"], cursor=0, max_chars=FIRST_PAGE_CHARS)
     return public.with_result(view, page)
 
 
@@ -206,7 +206,7 @@ async def wait_task(ctx: Context, task_id: str) -> dict[str, Any]:
     """A task's state now; never blocks. Running: progress only, so end your turn rather than calling again. Finished: status, files_changed, usage and the first page of result; next_cursor means get_result has more."""
     try:
         registry = _registry(ctx)
-        return _with_first_page(registry, public.task_view(registry.check_task(task_id)))
+        return await _with_first_page(registry, public.task_view(await registry.check_task(task_id)))
     except Exception as exc:
         raise _failure(exc) from exc
 
@@ -220,7 +220,7 @@ async def get_result(
 ) -> dict[str, Any]:
     """A page of a finished task's result text from cursor (max_chars up to 60000). Continue with next_cursor until it is absent."""
     try:
-        return public.result_view(_registry(ctx).get_result(task_id, cursor=cursor, max_chars=max_chars))
+        return public.result_view(await _registry(ctx).get_result(task_id, cursor=cursor, max_chars=max_chars))
     except Exception as exc:
         raise _failure(exc) from exc
 
@@ -230,7 +230,7 @@ async def cancel_task(ctx: Context, task_id: str) -> dict[str, Any]:
     """End a running task gracefully: partial result and conversation are kept, and dispatch_task(continue_task=task_id) can resume it. A finished task is returned unchanged."""
     try:
         registry = _registry(ctx)
-        return _with_first_page(registry, public.task_view(await registry.stop_task(task_id)))
+        return await _with_first_page(registry, public.task_view(await registry.stop_task(task_id)))
     except Exception as exc:
         raise _failure(exc) from exc
 
